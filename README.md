@@ -67,7 +67,7 @@ Four shapes, matching what CLI wrapper libraries actually need:
 | Mode | API | Use |
 |---|---|---|
 | Bounded run | `Forcola.run/2` | One-shot command with mandatory timeout |
-| Line stream | `Forcola.stream/2` | NDJSON/line output consumed as an `Enumerable` |
+| Line stream | `Forcola.Stream.lines/2` | NDJSON/line output consumed as an `Enumerable` |
 | Daemon | `Forcola.Daemon` | Long-running server under a supervision tree |
 | Duplex | `Forcola.Duplex` | Bidirectional stdin/stdout session |
 

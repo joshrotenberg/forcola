@@ -23,15 +23,13 @@ defmodule ForcolaTest do
     end
   end
 
-  describe "scaffold stubs" do
-    test "Stream.lines/2 requires :timeout_ms and raises" do
+  describe "Stream.lines/2" do
+    test "requires :timeout_ms" do
       assert_raise KeyError, fn -> Forcola.Stream.lines(["true"], []) end
-
-      assert_raise Forcola.NotImplementedError, fn ->
-        Forcola.Stream.lines(["true"], timeout_ms: 1_000)
-      end
     end
+  end
 
+  describe "scaffold stubs" do
     test "Duplex.open/2 raises" do
       assert_raise Forcola.NotImplementedError, fn ->
         Forcola.Duplex.open(["cat"], [])
