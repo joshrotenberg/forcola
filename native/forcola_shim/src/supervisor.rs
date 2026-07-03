@@ -1,0 +1,325 @@
+//! The supervising event loop: spawns the child, forwards its output,
+//! and applies the kill sequence on timeout, KILL frame, or stdin EOF.
+
+use crate::frame::{
+    self, Frame, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_KILL, TAG_SPAWN, TAG_STDERR, TAG_STDIN,
+    TAG_STDOUT,
+};
+use crate::protocol::{ErrorReport, ExitReport, SpawnRequest};
+
+use rustix::process::{self, Pid, Signal};
+use std::io::{self, Read, Write};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Events fed into the supervising loop from stdin, the child waiter, and
+/// the timeout timer.
+enum Event {
+    Stdin(Frame),
+    /// Clean EOF on the shim's own stdin: the BEAM is gone.
+    StdinClosed,
+    StdinError(io::Error),
+    ChildExited(ChildOutcome),
+    TimedOut,
+}
+
+/// How the child ended, in a form ready to become an EXIT frame.
+struct ChildOutcome {
+    status: Option<i32>,
+    signal: Option<i32>,
+}
+
+/// Runs the shim: read one SPAWN frame, supervise the child, and keep
+/// handling protocol frames until the child has exited.
+pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
+    mut stdin: R,
+    stdout: W,
+) -> io::Result<()> {
+    let out = Arc::new(Mutex::new(stdout));
+
+    // The first frame must be SPAWN; anything else is a protocol error we
+    // report and exit on, since there is nothing else useful to do without
+    // a child to supervise.
+    let spawn_frame = match frame::read_frame(&mut stdin)? {
+        Some(f) if f.tag == TAG_SPAWN => f,
+        Some(_) => {
+            write_error(&out, "expected SPAWN as the first frame");
+            return Ok(());
+        }
+        None => return Ok(()), // BEAM closed stdin before spawning anything.
+    };
+
+    let request: SpawnRequest = match serde_json::from_slice(&spawn_frame.payload) {
+        Ok(r) => r,
+        Err(e) => {
+            write_error(&out, &format!("invalid SPAWN payload: {e}"));
+            return Ok(());
+        }
+    };
+
+    let mut child = match spawn_child(&request) {
+        Ok(c) => c,
+        Err(e) => {
+            write_error(&out, &format!("spawn failed: {e}"));
+            return Ok(());
+        }
+    };
+
+    let pgid = Pid::from_child(&child);
+    let kill_grace = Duration::from_millis(request.kill_grace_ms);
+
+    let (tx, rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
+
+    // Child stdin: take ownership so we can forward STDIN frames and close
+    // it on EOF frames. Duplex mode is exercised by tests; not all callers
+    // will use it.
+    let mut child_stdin = child.stdin.take();
+
+    spawn_output_pump(child.stdout.take(), TAG_STDOUT, Arc::clone(&out));
+    if request.merge_stderr {
+        spawn_output_pump(child.stderr.take(), TAG_STDOUT, Arc::clone(&out));
+    } else {
+        spawn_output_pump(child.stderr.take(), TAG_STDERR, Arc::clone(&out));
+    }
+
+    spawn_stdin_reader(stdin, tx.clone());
+    // The waiter thread takes ownership of `child` entirely: it is the
+    // single, sole caller of `Child::wait`, so there is never a double
+    // reap race. The supervising loop only ever learns the child's exit
+    // through `Event::ChildExited`.
+    spawn_waiter(child, tx.clone());
+
+    if let Some(timeout_ms) = request.timeout_ms {
+        spawn_timeout_timer(timeout_ms, tx.clone());
+    }
+
+    supervise(rx, pgid, kill_grace, &mut child_stdin, &out);
+
+    Ok(())
+}
+
+/// Builds and spawns the child process, calling `setsid()` in the child
+/// before exec so it leads its own process group.
+fn spawn_child(request: &SpawnRequest) -> io::Result<Child> {
+    let (program, args) = request
+        .argv
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "argv must not be empty"))?;
+
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(cd) = &request.cd {
+        cmd.current_dir(cd);
+    }
+    if !request.env.is_empty() {
+        cmd.envs(&request.env);
+    }
+
+    // Safety: the closure only calls setsid(), which is async-signal-safe
+    // and does not allocate or touch the parent's memory. It runs in the
+    // forked child between fork and exec, per `pre_exec`'s contract.
+    unsafe {
+        cmd.pre_exec(|| {
+            process::setsid()
+                .map(|_| ())
+                .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+        });
+    }
+
+    cmd.spawn()
+}
+
+/// Pumps bytes from a child pipe into framed messages on `out`. No-op if
+/// the pipe wasn't captured (shouldn't happen given `Stdio::piped()`).
+fn spawn_output_pump<P: Read + Send + 'static, W: Write + Send + 'static>(
+    pipe: Option<P>,
+    tag: u8,
+    out: Arc<Mutex<W>>,
+) {
+    let Some(mut pipe) = pipe else { return };
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut w = out.lock().unwrap();
+                    if frame::write_frame(&mut *w, tag, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Reads protocol frames off the shim's stdin and forwards them as
+/// `Event`s. Clean EOF is reported as `Event::StdinClosed`.
+fn spawn_stdin_reader<R: Read + Send + 'static>(mut stdin: R, tx: Sender<Event>) {
+    thread::spawn(move || loop {
+        match frame::read_frame(&mut stdin) {
+            Ok(Some(f)) => {
+                if tx.send(Event::Stdin(f)).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(Event::StdinClosed);
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(Event::StdinError(e));
+                return;
+            }
+        }
+    });
+}
+
+/// Owns `child` for the rest of its life: blocks on its exit and reports
+/// the outcome as an `Event`. This is the sole caller of `Child::wait`
+/// for this child.
+fn spawn_waiter(mut child: Child, tx: Sender<Event>) {
+    thread::spawn(move || {
+        let outcome = match child.wait() {
+            Ok(status) => ChildOutcome {
+                status: status.code(),
+                signal: status.signal(),
+            },
+            Err(_) => ChildOutcome {
+                status: None,
+                signal: None,
+            },
+        };
+        let _ = tx.send(Event::ChildExited(outcome));
+    });
+}
+
+/// Sends `Event::TimedOut` after `timeout_ms` elapses.
+fn spawn_timeout_timer(timeout_ms: u64, tx: Sender<Event>) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(timeout_ms));
+        let _ = tx.send(Event::TimedOut);
+    });
+}
+
+/// The main supervising loop: consumes events until the child has exited,
+/// then writes the EXIT frame.
+fn supervise<W: Write>(
+    rx: Receiver<Event>,
+    pgid: Pid,
+    kill_grace: Duration,
+    child_stdin: &mut Option<impl Write>,
+    out: &Arc<Mutex<W>>,
+) {
+    let mut timed_out = false;
+    let mut beam_gone = false;
+
+    let outcome = loop {
+        match rx.recv() {
+            Ok(Event::Stdin(f)) if f.tag == TAG_STDIN => {
+                if let Some(w) = child_stdin.as_mut() {
+                    let _ = w.write_all(&f.payload);
+                }
+            }
+            Ok(Event::Stdin(f)) if f.tag == TAG_EOF => {
+                *child_stdin = None; // drop closes the pipe
+            }
+            Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
+                kill_group(pgid, kill_grace);
+            }
+            Ok(Event::Stdin(_)) => {
+                // Unknown/unexpected tag mid-session; ignore rather than
+                // tearing down a running child over a protocol wrinkle.
+            }
+            Ok(Event::StdinClosed) => {
+                // The BEAM is gone. Kill the group; keep waiting for the
+                // real exit event from the waiter thread so we reap the
+                // child properly, but there's no one left to report to.
+                beam_gone = true;
+                kill_group(pgid, kill_grace);
+            }
+            Ok(Event::StdinError(e)) => {
+                eprintln!("forcola_shim: stdin read error, treating as BEAM death: {e}");
+                beam_gone = true;
+                kill_group(pgid, kill_grace);
+            }
+            Ok(Event::TimedOut) => {
+                timed_out = true;
+                kill_group(pgid, kill_grace);
+            }
+            Ok(Event::ChildExited(outcome)) => break Some(outcome),
+            Err(_) => break None,
+        }
+    };
+
+    let outcome = outcome.unwrap_or(ChildOutcome {
+        status: None,
+        signal: None,
+    });
+
+    if beam_gone {
+        // Nothing to report to: the reader/writer on the other end of
+        // stdout is the same dead BEAM that closed stdin. Attempting to
+        // write would either block on a full pipe with no reader or
+        // error out; either way there is no value in trying.
+        return;
+    }
+
+    let report = ExitReport {
+        status: outcome.status,
+        signal: outcome.signal,
+        timed_out,
+    };
+    if let Ok(payload) = serde_json::to_vec(&report) {
+        let mut w = out.lock().unwrap();
+        let _ = frame::write_frame(&mut *w, TAG_EXIT, &payload);
+    }
+}
+
+/// SIGTERM the whole process group, then SIGKILL after `grace` if it
+/// hasn't died. Confirms death via a signal-0 liveness probe before
+/// returning.
+fn kill_group(pgid: Pid, grace: Duration) {
+    let _ = process::kill_process_group(pgid, Signal::TERM);
+
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !group_alive(pgid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    if group_alive(pgid) {
+        let _ = process::kill_process_group(pgid, Signal::KILL);
+        // Give the kernel a moment to finish tearing the group down.
+        let hard_deadline = Instant::now() + Duration::from_millis(500);
+        while group_alive(pgid) && Instant::now() < hard_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Signal-0 liveness probe: `kill(-pgid, 0)` succeeds iff at least one
+/// process in the group still exists and is signalable.
+fn group_alive(pgid: Pid) -> bool {
+    process::test_kill_process_group(pgid).is_ok()
+}
+
+fn write_error<W: Write>(out: &Arc<Mutex<W>>, reason: &str) {
+    let report = ErrorReport { reason };
+    if let Ok(payload) = serde_json::to_vec(&report) {
+        let mut w = out.lock().unwrap();
+        let _ = frame::write_frame(&mut *w, TAG_ERROR, &payload);
+    }
+}
