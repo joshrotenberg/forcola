@@ -21,6 +21,10 @@ defmodule Forcola do
     * `Forcola.Stream` - line-by-line output as an `Enumerable`
     * `Forcola.Daemon` - long-running server under a supervision tree
     * `Forcola.Duplex` - bidirectional stdin/stdout session
+
+  Maintainers of CLI wrapper libraries who want to offer Forcola-backed
+  execution without a mandatory dependency: see the [adoption
+  guide](adopting_forcola.html).
   """
 
   alias Forcola.{Result, Shim}
