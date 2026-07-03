@@ -1,0 +1,14 @@
+[package]
+name = "forcola_shim"
+version = "0.1.0"
+edition = "2021"
+description = "Process-group supervisor shim for the forcola Elixir package"
+license = "MIT"
+
+[[bin]]
+name = "forcola_shim"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
