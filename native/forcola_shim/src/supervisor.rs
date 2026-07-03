@@ -370,10 +370,35 @@ fn kill_group(pgid: Pid, grace: Duration) {
     }
 }
 
-/// Signal-0 liveness probe: `kill(-pgid, 0)` succeeds iff at least one
-/// process in the group still exists and is signalable.
+/// Signal-0 liveness probe: does at least one process in the group still
+/// exist?
+///
+/// Limitation: once the group is dead, its pgid can be recycled by the
+/// kernel, in which case the probe would match an unrelated new group and
+/// report it alive. The window between group death and the probe is
+/// narrow, and the failure mode is a spurious extra SIGKILL to a group we
+/// no longer own (which EPERM would usually block anyway), so we accept
+/// it rather than track individual members.
 fn group_alive(pgid: Pid) -> bool {
-    process::test_kill_process_group(pgid).is_ok()
+    probe_says_alive(process::test_kill_process_group(pgid))
+}
+
+/// Maps the result of the `kill(-pgid, 0)` probe to group liveness.
+///
+/// `kill(2)` on a process group returns EPERM if any member could not be
+/// signaled, even when the signal was (or would have been) delivered to
+/// the other members; macOS exhibits this readily. So EPERM means the
+/// group still exists and must be treated as alive, or the caller would
+/// skip SIGKILL escalation while members survive. Only ESRCH proves the
+/// group is gone. Any other error is treated as alive so escalation
+/// proceeds; the safe failure mode is an unnecessary SIGKILL, not a
+/// leaked process group.
+fn probe_says_alive(probe: rustix::io::Result<()>) -> bool {
+    match probe {
+        Ok(()) => true,
+        Err(rustix::io::Errno::SRCH) => false,
+        Err(_) => true,
+    }
 }
 
 fn write_error<W: Write>(out: &Arc<Mutex<W>>, reason: &str) {
@@ -381,5 +406,33 @@ fn write_error<W: Write>(out: &Arc<Mutex<W>>, reason: &str) {
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();
         let _ = frame::write_frame(&mut *w, TAG_ERROR, &payload);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_says_alive;
+    use rustix::io::Errno;
+
+    #[test]
+    fn probe_ok_means_alive() {
+        assert!(probe_says_alive(Ok(())));
+    }
+
+    #[test]
+    fn probe_esrch_means_dead() {
+        assert!(!probe_says_alive(Err(Errno::SRCH)));
+    }
+
+    #[test]
+    fn probe_eperm_means_alive() {
+        // macOS returns EPERM from kill(-pgid, ...) when any single group
+        // member is unsignalable, even though the group still exists.
+        assert!(probe_says_alive(Err(Errno::PERM)));
+    }
+
+    #[test]
+    fn probe_other_errors_mean_alive() {
+        assert!(probe_says_alive(Err(Errno::INVAL)));
     }
 }
