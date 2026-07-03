@@ -22,3 +22,6 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 git_wrapper_ex-*.tar
 
+# Locally built forcola_shim binary (dev/test convenience copy; release
+# builds fetch a precompiled binary instead).
+/priv/

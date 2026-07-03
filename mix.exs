@@ -6,6 +6,7 @@ defmodule Forcola.MixProject do
       app: :forcola,
       version: "0.1.0",
       elixir: "~> 1.18",
+      compilers: Mix.compilers() ++ [:forcola_shim],
       start_permanent: Mix.env() == :prod,
       description:
         "Leak-free external process execution: process-group kill on timeout or BEAM death via a precompiled Rust shim",
