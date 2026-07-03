@@ -44,6 +44,7 @@ defmodule Forcola.MixProject do
       # so FORCOLA_BUILD=1 can build from source on unsupported targets.
       files: ~w(
         lib
+        guides
         native/forcola_shim/src
         native/forcola_shim/Cargo.toml
         native/forcola_shim/Cargo.lock
@@ -60,7 +61,7 @@ defmodule Forcola.MixProject do
     [
       main: "Forcola",
       source_url: "https://github.com/joshrotenberg/forcola",
-      extras: ["README.md"],
+      extras: ["README.md", "guides/adopting_forcola.md"],
       groups_for_modules: [
         "Execution modes": [Forcola, Forcola.Stream, Forcola.Daemon, Forcola.Duplex],
         "Data structures": [Forcola.Result],

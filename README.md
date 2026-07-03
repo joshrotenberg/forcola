@@ -61,6 +61,33 @@ BEAM <--stdin/stdout pipes--> forcola_shim <--forks--> child (own process group)
   GitHub Releases with SHA256 verification. Consumers need no Rust, C, or
   C++ toolchain.
 
+## What group kill cannot reach
+
+A process-group escape audit (#9) tested the target CLI set on macOS: agent
+CLIs with stdio MCP servers, git with hooks and the fsmonitor daemon, make,
+cargo, npm, aws, gcloud, ffmpeg, redis-server in foreground mode, and shell
+constructs like `nohup` and `disown`. All of them keep their entire tree in
+the child's process group and die to the group kill. The escapes fall into
+three classes, and no client-side mechanism closes them:
+
+- A child that deliberately daemonizes, by double-forking plus `setsid` or
+  via a flag like `redis-server --daemonize yes`, leaves the process group
+  and survives the kill. Run servers in foreground mode under
+  `Forcola.Daemon`; foreground operation is the same contract every process
+  supervisor (systemd, runit, foreman) imposes.
+- Client/daemon CLIs such as docker: the CLI is only a control channel.
+  Killing the client never stops the container or build running under the
+  daemon, and no client-side mechanism, process group or cgroup, can. Use
+  the tool's own teardown semantics (`docker run --rm`, `docker kill`) on
+  top of Forcola.
+- Work handed to system schedulers (`git maintenance` background jobs,
+  launchd or systemd timers) was never a child of the CLI at all and is out
+  of scope.
+
+On Linux, a future opt-in cgroup v2 layer (#15) could contain deliberate
+daemonizers. On macOS nothing can, which is equally true of erlexec and
+MuonTrap.
+
 ## Execution modes
 
 Four shapes, matching what CLI wrapper libraries actually need:
@@ -71,6 +98,16 @@ Four shapes, matching what CLI wrapper libraries actually need:
 | Line stream | `Forcola.Stream.lines/2` | NDJSON/line output consumed as an `Enumerable` |
 | Daemon | `Forcola.Daemon` | Long-running server under a supervision tree |
 | Duplex | `Forcola.Duplex` | Bidirectional stdin/stdout session |
+
+## Adopting in a wrapper library
+
+Forcola is designed to slot into existing CLI wrapper libraries without
+becoming a mandatory dependency: the wrapper defines a small runner
+behaviour, keeps its `System.cmd/3` path as the default implementation, and
+accepts a Forcola-backed one via config, with Forcola as an optional dep.
+The [adoption guide](guides/adopting_forcola.md) covers the pattern, a
+worked example against a real wrapper, the mode mapping for common wrapper
+shapes, and migration notes for erlexec-based predecessors.
 
 ## Prior art
 
