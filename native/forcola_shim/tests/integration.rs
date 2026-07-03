@@ -152,6 +152,36 @@ fn stdout_is_forwarded() {
 }
 
 #[test]
+fn output_is_drained_before_exit_frame() {
+    // A fast-exiting child races its own output pump: the waiter can reap
+    // the child before the pump has read the pipe. The shim must drain
+    // output before writing EXIT, or the frames it does write arrive
+    // after the terminator and are dropped by the consumer. Repeat to
+    // give the race room to show up.
+    for _ in 0..20 {
+        let mut child = start_shim();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+
+        write_frame(
+            &mut stdin,
+            TAG_SPAWN,
+            &spawn_payload(&["sh", "-c", "echo raced"], None, None, false),
+        );
+
+        let (out, exit_frame) = drain_until_exit(&mut stdout);
+        assert!(exit_frame.is_some(), "expected an EXIT frame");
+        assert_eq!(
+            String::from_utf8_lossy(&out).trim(),
+            "raced",
+            "stdout written just before exit was lost to the EXIT frame race"
+        );
+
+        let _ = child.wait();
+    }
+}
+
+#[test]
 fn group_kill_reaches_grandchild() {
     // The direct child forks a grandchild ("sleep 60 &") and then sleeps
     // forever itself. A correct group kill takes down both; a kill that

@@ -33,6 +33,14 @@ struct ChildOutcome {
     signal: Option<i32>,
 }
 
+/// How long to wait, after the child has been reaped, for the output pump
+/// threads to hit EOF on the child's pipes before writing the EXIT frame.
+/// In the normal case the writers are already dead and EOF is immediate;
+/// the bound exists so a surviving process that inherited the pipe (e.g.
+/// a backgrounded grandchild the kill path never ran against) cannot
+/// delay the EXIT report forever.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
 /// Runs the shim: read one SPAWN frame, supervise the child, and keep
 /// handling protocol frames until the child has exited.
 pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
@@ -79,12 +87,28 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
     // will use it.
     let mut child_stdin = child.stdin.take();
 
-    spawn_output_pump(child.stdout.take(), TAG_STDOUT, Arc::clone(&out));
-    if request.merge_stderr {
-        spawn_output_pump(child.stderr.take(), TAG_STDOUT, Arc::clone(&out));
+    // Pump completion channel: each pump sends one () when its pipe hits
+    // EOF, so the supervising loop can drain output before reporting EXIT.
+    let (pump_done_tx, pump_done_rx) = mpsc::channel();
+
+    let mut pumps = 0;
+    pumps += spawn_output_pump(
+        child.stdout.take(),
+        TAG_STDOUT,
+        Arc::clone(&out),
+        pump_done_tx.clone(),
+    );
+    let stderr_tag = if request.merge_stderr {
+        TAG_STDOUT
     } else {
-        spawn_output_pump(child.stderr.take(), TAG_STDERR, Arc::clone(&out));
-    }
+        TAG_STDERR
+    };
+    pumps += spawn_output_pump(
+        child.stderr.take(),
+        stderr_tag,
+        Arc::clone(&out),
+        pump_done_tx,
+    );
 
     spawn_stdin_reader(stdin, tx.clone());
     // The waiter thread takes ownership of `child` entirely: it is the
@@ -97,7 +121,15 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         spawn_timeout_timer(timeout_ms, tx.clone());
     }
 
-    supervise(rx, pgid, kill_grace, &mut child_stdin, &out);
+    supervise(
+        rx,
+        pgid,
+        kill_grace,
+        &mut child_stdin,
+        &out,
+        pumps,
+        &pump_done_rx,
+    );
 
     Ok(())
 }
@@ -137,14 +169,17 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<Child> {
     cmd.spawn()
 }
 
-/// Pumps bytes from a child pipe into framed messages on `out`. No-op if
-/// the pipe wasn't captured (shouldn't happen given `Stdio::piped()`).
+/// Pumps bytes from a child pipe into framed messages on `out`, sending
+/// one `()` on `done` when the pipe is exhausted. Returns the number of
+/// pumps spawned (0 or 1); 0 only if the pipe wasn't captured, which
+/// shouldn't happen given `Stdio::piped()`.
 fn spawn_output_pump<P: Read + Send + 'static, W: Write + Send + 'static>(
     pipe: Option<P>,
     tag: u8,
     out: Arc<Mutex<W>>,
-) {
-    let Some(mut pipe) = pipe else { return };
+    done: Sender<()>,
+) -> usize {
+    let Some(mut pipe) = pipe else { return 0 };
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
@@ -160,7 +195,9 @@ fn spawn_output_pump<P: Read + Send + 'static, W: Write + Send + 'static>(
                 Err(_) => break,
             }
         }
+        let _ = done.send(());
     });
+    1
 }
 
 /// Reads protocol frames off the shim's stdin and forwards them as
@@ -213,13 +250,15 @@ fn spawn_timeout_timer(timeout_ms: u64, tx: Sender<Event>) {
 }
 
 /// The main supervising loop: consumes events until the child has exited,
-/// then writes the EXIT frame.
+/// drains the output pumps, then writes the EXIT frame.
 fn supervise<W: Write>(
     rx: Receiver<Event>,
     pgid: Pid,
     kill_grace: Duration,
     child_stdin: &mut Option<impl Write>,
     out: &Arc<Mutex<W>>,
+    pumps: usize,
+    pump_done: &Receiver<()>,
 ) {
     let mut timed_out = false;
     let mut beam_gone = false;
@@ -275,6 +314,12 @@ fn supervise<W: Write>(
         return;
     }
 
+    // The child has been reaped, but the output pumps may not have hit
+    // EOF on its pipes yet; without this the EXIT frame can overtake
+    // output the child wrote just before dying, and the BEAM (which
+    // treats EXIT as the terminator) would drop it.
+    drain_pumps(pumps, pump_done);
+
     let report = ExitReport {
         status: outcome.status,
         signal: outcome.signal,
@@ -283,6 +328,21 @@ fn supervise<W: Write>(
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();
         let _ = frame::write_frame(&mut *w, TAG_EXIT, &payload);
+    }
+}
+
+/// Waits (bounded by `OUTPUT_DRAIN_GRACE`) for `pumps` output pump
+/// threads to report EOF on the child's pipes.
+fn drain_pumps(pumps: usize, pump_done: &Receiver<()>) {
+    let deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+    for _ in 0..pumps {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        if pump_done.recv_timeout(deadline - now).is_err() {
+            return;
+        }
     }
 }
 
