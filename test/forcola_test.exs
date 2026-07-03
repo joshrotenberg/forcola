@@ -7,12 +7,6 @@ defmodule ForcolaTest do
         Forcola.run(["true"], [])
       end
     end
-
-    test "raises NotImplementedError while scaffold" do
-      assert_raise Forcola.NotImplementedError, ~r/Forcola\.run\/2/, fn ->
-        Forcola.run(["true"], timeout_ms: 1_000)
-      end
-    end
   end
 
   describe "Result" do
@@ -46,8 +40,9 @@ defmodule ForcolaTest do
   end
 
   describe "Shim" do
-    test "path/1 reports not_found until a binary is built" do
-      assert Forcola.Shim.path() == {:error, :not_found}
+    test "path/0 finds the built binary" do
+      assert {:ok, path} = Forcola.Shim.path()
+      assert File.exists?(path)
     end
   end
 end
