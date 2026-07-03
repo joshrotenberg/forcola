@@ -21,12 +21,6 @@ defmodule Forcola do
     * `Forcola.Stream` - line-by-line output as an `Enumerable`
     * `Forcola.Daemon` - long-running server under a supervision tree
     * `Forcola.Duplex` - bidirectional stdin/stdout session
-
-  ## Status
-
-  `Forcola.run/2`, `Forcola.Stream.lines/2`, and `Forcola.Daemon` are
-  implemented. `Forcola.Duplex` still raises `Forcola.NotImplementedError`
-  until it lands.
   """
 
   alias Forcola.{Result, Shim}

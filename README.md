@@ -12,8 +12,9 @@ small piece everything passes through, keeping the oar attached to the boat.
 
 ## Status
 
-Scaffold. The API surface is defined and documented; calls raise
-`Forcola.NotImplementedError` until the shim lands. Do not use yet.
+All four execution modes are implemented against the Rust shim:
+`Forcola.run/2`, `Forcola.Stream.lines/2`, `Forcola.Daemon`, and
+`Forcola.Duplex`. Not yet published to Hex.
 
 ## The problem
 
