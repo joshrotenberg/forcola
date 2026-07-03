@@ -258,16 +258,34 @@ fn sigterm_ignoring_child_is_sigkilled_after_grace() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
 
-    // trap SIGTERM and ignore it; only SIGKILL can end this one.
-    let script = "trap '' TERM; sleep 60";
+    // trap SIGTERM and ignore it; only SIGKILL can end this one. The
+    // child prints READY after installing the trap so the test can wait
+    // for the handler to actually be in place; a fixed sleep races shell
+    // startup and loses often enough to flake (issue #19). Processes the
+    // shell forks after the trap inherit SIG_IGN, so `sleep` ignores
+    // SIGTERM too.
+    let script = "trap '' TERM; echo READY; sleep 60";
     write_frame(
         &mut stdin,
         TAG_SPAWN,
         &spawn_payload(&["sh", "-c", script], None, Some(300), false),
     );
 
-    // Give the trap a moment to install, then request a kill.
-    std::thread::sleep(Duration::from_millis(200));
+    // Wait for the readiness marker before starting the kill sequence.
+    let mut stdout_bytes = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&stdout_bytes).contains("READY") {
+        assert!(
+            Instant::now() < deadline,
+            "child never signaled readiness after installing the trap"
+        );
+        match read_frame(&mut stdout) {
+            Some(f) if f.tag == TAG_STDOUT => stdout_bytes.extend_from_slice(&f.payload),
+            Some(_) => {}
+            None => panic!("shim stdout closed before the readiness marker"),
+        }
+    }
+
     let start = Instant::now();
     write_frame(&mut stdin, TAG_KILL, &[]);
 
