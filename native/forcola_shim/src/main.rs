@@ -28,13 +28,23 @@
 //!   0x12 STDERR  payload: bytes from the child's stderr
 //!   0x13 EXIT    payload: JSON {status | signal, timed_out}
 //!   0x14 ERROR   payload: JSON {reason} (spawn failure etc.)
-//!
-//! Not implemented yet: this is the scaffold. The binary exits non-zero so
-//! that any accidental wiring fails loudly.
 
+mod frame;
+mod protocol;
+mod supervisor;
+
+use std::io;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    eprintln!("forcola_shim: not implemented yet (scaffold)");
-    ExitCode::from(64)
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+
+    match supervisor::run(stdin, stdout) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("forcola_shim: fatal: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
