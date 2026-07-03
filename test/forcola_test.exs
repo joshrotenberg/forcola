@@ -29,14 +29,6 @@ defmodule ForcolaTest do
     end
   end
 
-  describe "scaffold stubs" do
-    test "Duplex.open/2 raises" do
-      assert_raise Forcola.NotImplementedError, fn ->
-        Forcola.Duplex.open(["cat"], [])
-      end
-    end
-  end
-
   describe "Shim" do
     test "path/0 finds the built binary" do
       assert {:ok, path} = Forcola.Shim.path()
