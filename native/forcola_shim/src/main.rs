@@ -1,0 +1,40 @@
+//! forcola_shim: the process-group supervisor between the BEAM and a child.
+//!
+//! The BEAM opens this binary as a port. The shim forks the real command,
+//! calls `setsid` in the child before exec so the child leads a new process
+//! group, and then supervises it:
+//!
+//! - stdout/stderr from the child are framed back to the BEAM over the
+//!   shim's stdout
+//! - a timeout (or an explicit kill frame) triggers SIGTERM to the whole
+//!   group (`kill(-pgid, SIGTERM)`), escalating to SIGKILL after the grace
+//! - EOF on the shim's stdin means the BEAM died; the shim kills the group
+//!   and exits
+//!
+//! Wire protocol (BEAM <-> shim), v0 draft:
+//!
+//! Frames are `{:packet, 4}`-style: a 4-byte big-endian length prefix, then
+//! a 1-byte tag, then the payload.
+//!
+//! BEAM -> shim:
+//!   0x01 SPAWN   payload: JSON {argv, cd, env, merge_stderr, timeout_ms,
+//!                               kill_grace_ms}
+//!   0x02 STDIN   payload: bytes for the child's stdin (duplex mode)
+//!   0x03 EOF     close the child's stdin
+//!   0x04 KILL    kill the group now
+//!
+//! shim -> BEAM:
+//!   0x11 STDOUT  payload: bytes from the child's stdout
+//!   0x12 STDERR  payload: bytes from the child's stderr
+//!   0x13 EXIT    payload: JSON {status | signal, timed_out}
+//!   0x14 ERROR   payload: JSON {reason} (spawn failure etc.)
+//!
+//! Not implemented yet: this is the scaffold. The binary exits non-zero so
+//! that any accidental wiring fails loudly.
+
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    eprintln!("forcola_shim: not implemented yet (scaffold)");
+    ExitCode::from(64)
+}
