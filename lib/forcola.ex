@@ -24,8 +24,9 @@ defmodule Forcola do
 
   ## Status
 
-  `Forcola.run/2` and `Forcola.Stream.lines/2` are implemented. Other
-  modes still raise `Forcola.NotImplementedError` until they land.
+  `Forcola.run/2`, `Forcola.Stream.lines/2`, and `Forcola.Daemon` are
+  implemented. `Forcola.Duplex` still raises `Forcola.NotImplementedError`
+  until it lands.
   """
 
   alias Forcola.{Result, Shim}
