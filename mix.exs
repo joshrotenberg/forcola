@@ -65,7 +65,21 @@ defmodule Forcola.MixProject do
       main: "Forcola",
       source_url: @source_url,
       source_ref: "v#{@version}",
-      extras: ["README.md", "guides/adopting_forcola.md"],
+      extras: [
+        "README.md",
+        "guides/getting_started.md",
+        "guides/process_groups.md",
+        "guides/adopting_forcola.md",
+        "guides/alternatives.md"
+      ],
+      groups_for_extras: [
+        Guides: [
+          "guides/getting_started.md",
+          "guides/process_groups.md",
+          "guides/adopting_forcola.md",
+          "guides/alternatives.md"
+        ]
+      ],
       groups_for_modules: [
         "Execution modes": [Forcola, Forcola.Stream, Forcola.Daemon, Forcola.Duplex],
         "Data structures": [Forcola.Result, Forcola.Stream.Error],

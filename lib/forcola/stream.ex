@@ -88,7 +88,8 @@ defmodule Forcola.Stream do
 
   Takes the same options as `Forcola.run/2`; `:timeout_ms` is required
   and bounds the whole run, not the gap between lines (an idle-timeout
-  option may come later).
+  option is tracked in
+  [#33](https://github.com/joshrotenberg/forcola/issues/33)).
 
   Lines are emitted without their trailing newline. A partial line held
   across frame boundaries is emitted once its newline arrives; a final

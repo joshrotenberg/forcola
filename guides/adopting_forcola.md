@@ -20,10 +20,10 @@ end
 
 `Task.shutdown/1` kills the BEAM task, which closes the Erlang port. Closing
 a port closes pipes; it sends no signal. The external process keeps running,
-and any children it spawned are never signaled at all. The README describes
-the full mechanism. Forcola closes the leak by running the command in its own
-process group and killing the whole group, SIGTERM then SIGKILL, on timeout
-or BEAM death.
+and any children it spawned are never signaled at all. The [process groups
+guide](process_groups.html) describes the full mechanism. Forcola closes the
+leak by running the command in its own process group and killing the whole
+group, SIGTERM then SIGKILL, on timeout or BEAM death.
 
 ## The Runner behaviour pattern
 
@@ -226,7 +226,7 @@ Per-mode notes:
   `start_link` blocks until the server accepts connections, and `:output`
   routing for logs. Run the server in foreground mode; a daemonize flag
   escapes the process group (see "What group kill cannot reach" in the
-  README).
+  [process groups guide](process_groups.html)).
 - `Forcola.Duplex`: no `:timeout_ms` (passing one raises `ArgumentError`);
   the session is bounded by its owner process and `close/1`. Lines go in
   with `send_line/2`, arrive as `{:forcola_line, session, line}` messages,
@@ -235,65 +235,13 @@ Per-mode notes:
 One caveat for docker-shaped wrappers: the docker CLI is a control channel
 for a daemon. Forcola kills the client reliably, but that never stops the
 container or build running under the daemon; pair Forcola with the tool's
-own teardown (`docker run --rm`, `docker kill`). The README section "What
-group kill cannot reach" covers this class.
+own teardown (`docker run --rm`, `docker kill`). The [process groups
+guide](process_groups.html) section "What group kill cannot reach" covers
+this class.
 
-## Alternatives and tradeoffs
-
-Forcola is not the only way to run external processes from the BEAM. The
-table below reflects each option's published source and tracker as of
-mid-2026; rows marked "tested" were verified empirically on macOS with
-Elixir 1.20 / OTP 29.
-
-| Option | Architecture | BEAM-death cleanup | Grandchild kill | Install footprint | Maintenance (mid-2026) |
-|---|---|---|---|---|---|
-| System.cmd / Port / :os.cmd | BEAM port | None; no signal on port close (tested) | No | None | OTP/Elixir stdlib |
-| [erlexec](https://github.com/saleyn/erlexec) | One C++ port program for all commands | Yes, incl. kill -9: SIGTERM then SIGKILL in 6 s | Opt-in (`{group, GID}` + `kill_group`) | C++ toolchain + rebar3 at dep compile, source-only package | Active (2.3.4, June 2026) |
-| [MuonTrap](https://github.com/fhunleth/muontrap) | C wrapper per command | Yes, incl. kill -9 (tested) | Linux cgroups: full tree; macOS: direct child only (tested) | C compiler (elixir_make) | Active (1.8.0 May 2026, 2.0 rc June 2026) |
-| [Porcelain](https://github.com/alco/porcelain) + goon | Go middleman, manual download | Closes child stdin and waits; never kills | No | goon fetched by hand; last goon release 2014 | Unmaintained (last release 2016, last commit 2020) |
-| [Rambo](https://github.com/jayjun/rambo) | Rust shim per call | SIGKILLs direct child on stdin EOF | No | Bundled x86-64 binaries only; broken out of the box on Apple Silicon (tested) | Dormant (last release March 2021) |
-| [exile](https://github.com/akash-akya/exile) | NIF IO + spawner that execs into the command | Normal exits yes; kill -9 of BEAM orphans the child (tested) | No | C compiler (elixir_make) | Maintained, single author (0.14.0, Feb 2026) |
-| forcola | Rust shim per command | stdin EOF kills the process group, covers kill -9; death confirmed before EXIT | Yes (setsid + kill(-pgid), TERM then KILL) | None on 5 precompiled targets; cargo elsewhere | New (v0.1.0) |
-
-erlexec is the most capable and most mature option: a single C++ port
-program with pty support, user switching, and opt-in process-group kill,
-actively maintained since 2003. Its costs are a C++ toolchain at dependency
-compile time and a larger API surface. If you need a pty or run-as-user,
-choose erlexec; forcola does not do either.
-
-MuonTrap solves the same core problem as forcola with a per-command C
-wrapper, and on Linux adds cgroup containment that kills entire process
-trees, including deliberate daemonizers. Without cgroups it kills the direct
-child only, so grandchildren escape; forcola's group kill covers ordinary
-grandchildren everywhere but cannot contain a deliberate daemonizer on
-macOS either. On Nerves or embedded Linux, MuonTrap is the native choice.
-
-exile takes a different shape: NIF-based demand-driven IO with real
-backpressure, ideal when a slow consumer must stream huge output without
-buffering. The tradeoff is cleanup: with no middleman process, a kill -9 of
-the BEAM orphans the child (in testing on macOS, exile's child survived
-where forcola's and MuonTrap's shims cleaned up).
-
-Porcelain and Rambo are effectively frozen. Porcelain has had no release
-since 2016 and its goon driver's last release is from 2014; the released
-goon never kills the child, it only closes stdin and waits. Rambo is a tidy
-one-shot design but has had no release since March 2021, ships x86-64-only
-binaries, and in testing on an Apple Silicon Mac it failed out of the box.
-
-Choose something else when:
-
-- You need a pty or run-as-user: erlexec.
-- You need Linux cgroup containment of daemonizers today: MuonTrap (or
-  systemd-run). forcola tracks an optional cgroup layer in
-  [#15](https://github.com/joshrotenberg/forcola/issues/15).
-- You need backpressure-first streaming and accept the kill -9 orphan risk:
-  exile.
-- You need Windows: Rambo's bundled binary or plain System.cmd.
-- You cannot ship native binaries at all: System.cmd/ports, with the
-  orphan-on-death leak documented and accepted.
-- forcola is new (v0.1.0). If that is a blocker, erlexec and MuonTrap are
-  the mature, actively maintained alternatives that cover the closest
-  ground.
+The [alternatives guide](alternatives.html) compares Forcola with erlexec,
+MuonTrap, exile, Porcelain, Rambo, and plain `System.cmd/3`, and lists when
+to choose each.
 
 ## Migrating from erlexec
 
