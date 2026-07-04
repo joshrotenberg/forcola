@@ -148,6 +148,114 @@ defmodule Forcola.StreamTest do
     end
   end
 
+  describe "the idle timeout" do
+    test "fires when the producer stalls and kills the whole group", %{tmp_dir: tmp_dir} do
+      pid_file = Path.join(tmp_dir, "pids")
+
+      # Emit one line, record the forked grandchild, then stall well past
+      # the idle interval with the whole-run bound left generous so only
+      # the idle bound can fire.
+      script =
+        ~S(sleep 60 & echo "$$ $!" > "$PID_FILE"; echo tick; sleep 5)
+
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", script]
+          |> Forcola.Stream.lines(
+            timeout_ms: 60_000,
+            idle_timeout_ms: 300,
+            kill_grace_ms: 1_000,
+            env: [{"PID_FILE", pid_file}]
+          )
+          |> Enum.to_list()
+        end
+
+      assert error.idle_timed_out
+      refute error.timed_out
+
+      [parent, child] = pid_file |> File.read!() |> String.split()
+      refute alive?(parent), "parent survived the idle-timeout kill"
+      refute alive?(child), "grandchild survived the idle-timeout kill (group kill failed)"
+    end
+
+    test "does not fire while the producer keeps emitting within the interval" do
+      # A line every ~50ms for several iterations, each well under the
+      # 500ms idle interval, then a clean exit. The idle bound must never
+      # trip because output keeps resetting it.
+      script = ~S(for i in 1 2 3 4 5 6; do echo "line $i"; sleep 0.05; done)
+
+      lines =
+        ["/bin/sh", "-c", script]
+        |> Forcola.Stream.lines(timeout_ms: 60_000, idle_timeout_ms: 500)
+        |> Enum.to_list()
+
+      assert lines == ["line 1", "line 2", "line 3", "line 4", "line 5", "line 6"]
+    end
+
+    test "composes with the whole-run bound: whole-run wins when it is sooner", %{
+      tmp_dir: tmp_dir
+    } do
+      pid_file = Path.join(tmp_dir, "pids")
+      # No output at all, so the idle bound would trip; but the whole-run
+      # bound is much sooner, so the error must be attributed to it.
+      script = ~S(sleep 60 & echo "$$ $!" > "$PID_FILE"; wait)
+
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", script]
+          |> Forcola.Stream.lines(
+            timeout_ms: 300,
+            idle_timeout_ms: 30_000,
+            kill_grace_ms: 1_000,
+            env: [{"PID_FILE", pid_file}]
+          )
+          |> Enum.to_list()
+        end
+
+      assert error.timed_out
+      refute error.idle_timed_out
+
+      [parent, child] = pid_file |> File.read!() |> String.split()
+      refute alive?(parent), "parent survived the whole-run timeout kill"
+      refute alive?(child), "grandchild survived the whole-run timeout kill"
+    end
+
+    test "composes with the whole-run bound: idle wins when it is sooner", %{tmp_dir: tmp_dir} do
+      pid_file = Path.join(tmp_dir, "pids")
+      # One line, then a stall. The idle bound is much sooner than the
+      # whole-run bound, so the error must be attributed to the idle bound.
+      script = ~S(sleep 60 & echo "$$ $!" > "$PID_FILE"; echo tick; sleep 5)
+
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", script]
+          |> Forcola.Stream.lines(
+            timeout_ms: 30_000,
+            idle_timeout_ms: 300,
+            kill_grace_ms: 1_000,
+            env: [{"PID_FILE", pid_file}]
+          )
+          |> Enum.to_list()
+        end
+
+      assert error.idle_timed_out
+      refute error.timed_out
+
+      [parent, child] = pid_file |> File.read!() |> String.split()
+      refute alive?(parent), "parent survived the idle-timeout kill"
+      refute alive?(child), "grandchild survived the idle-timeout kill"
+    end
+
+    test "default (no :idle_timeout_ms) leaves a plain run unchanged" do
+      lines =
+        ["/bin/sh", "-c", "printf 'a\\nb\\nc\\n'"]
+        |> Forcola.Stream.lines(timeout_ms: 5_000)
+        |> Enum.to_list()
+
+      assert lines == ["a", "b", "c"]
+    end
+  end
+
   # kill -0: probes existence without signalling.
   defp alive?(pid) do
     {_out, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)

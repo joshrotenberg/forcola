@@ -104,8 +104,16 @@ Forcola.Stream.lines(["claude", "-p", prompt], timeout_ms: 300_000)
 ```
 
 Options: the same as `Forcola.run/2`. `:timeout_ms` is required and bounds the
-whole run, not the gap between lines (an idle-timeout option is tracked in
-[#33](https://github.com/joshrotenberg/forcola/issues/33)).
+whole run, not the gap between lines.
+
+`:idle_timeout_ms` (optional) bounds the gap between output frames instead: if no
+STDOUT or STDERR data arrives within the interval the producer is treated as
+stalled, the group is killed, and `Forcola.Stream.Error` is raised with
+`idle_timed_out: true`. It is independent of and composable with `:timeout_ms`;
+whichever bound fires first wins. The idle deadline resets on any output (stdout
+or stderr), not only newline-terminated lines. This suits a long-lived follow
+(agent stream-json, `docker events`) that may legitimately run for hours but
+should die if the producer hangs.
 
 Termination:
 
