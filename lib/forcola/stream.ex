@@ -26,6 +26,25 @@ defmodule Forcola.Stream do
       shim confirms the group is dead.
     * If the consuming process dies, the port closes, the shim sees stdin
       EOF, and the group is killed.
+
+  ## Idle timeout
+
+  `:timeout_ms` bounds the whole run. `:idle_timeout_ms` (optional) bounds
+  the gap between output frames instead, detecting a stalled producer
+  without capping total runtime. The two are independent and composable:
+  whichever bound is reached first fires, and the raised
+  `Forcola.Stream.Error` marks which one (`:idle_timed_out` vs
+  `:timed_out`).
+
+  The idle deadline resets on any child liveness signal: every STDOUT or
+  STDERR data frame resets it, not only newline-terminated lines. A child
+  that writes bytes without a newline, or writes only to stderr, still
+  counts as alive. On idle expiry the same early-halt kill-and-confirm
+  path runs (KILL the group, wait for the shim to confirm death, close the
+  port) and `Forcola.Stream.Error` is raised with `idle_timed_out: true`
+  after any lines already produced have been emitted. Omitting the option
+  (the default) leaves behavior identical to a run bounded only by
+  `:timeout_ms`.
   """
 
   alias Forcola.Shim
@@ -38,19 +57,23 @@ defmodule Forcola.Stream do
 
       * `:status` - exit code, `{:signal, n}` for death by signal, or
         `{:signal, :unconfirmed}` when the shim never confirmed death
-      * `:timed_out` - whether the run hit `:timeout_ms`
+      * `:timed_out` - whether the run hit the whole-run `:timeout_ms`
+      * `:idle_timed_out` - whether the run hit `:idle_timeout_ms` (no
+        output arrived within the idle interval); mutually exclusive with
+        `:timed_out`
       * `:stderr` - stderr captured before termination (empty when
         `merge_stderr: true` routed it into the line stream)
       * `:reason` - spawn failure reason, `nil` for a run that started
     """
 
-    defexception [:status, :reason, stderr: "", timed_out: false]
+    defexception [:status, :reason, stderr: "", timed_out: false, idle_timed_out: false]
 
     @type t :: %__MODULE__{
             status: non_neg_integer() | {:signal, atom() | non_neg_integer()} | nil,
             reason: String.t() | atom() | nil,
             stderr: binary(),
-            timed_out: boolean()
+            timed_out: boolean(),
+            idle_timed_out: boolean()
           }
 
     @impl true
@@ -58,12 +81,22 @@ defmodule Forcola.Stream do
       "stream spawn failed: #{inspect(reason)}"
     end
 
-    def message(%__MODULE__{status: status, timed_out: timed_out, stderr: stderr}) do
+    def message(%__MODULE__{
+          status: status,
+          timed_out: timed_out,
+          idle_timed_out: idle_timed_out,
+          stderr: stderr
+        }) do
       base =
-        if timed_out do
-          "stream timed out; process group killed (#{format_status(status)})"
-        else
-          "streamed process exited with #{format_status(status)}"
+        cond do
+          idle_timed_out ->
+            "stream idle timed out; process group killed (#{format_status(status)})"
+
+          timed_out ->
+            "stream timed out; process group killed (#{format_status(status)})"
+
+          true ->
+            "streamed process exited with #{format_status(status)}"
         end
 
       case stderr do
@@ -87,9 +120,15 @@ defmodule Forcola.Stream do
   Run `argv` and return its stdout as a lazy stream of lines.
 
   Takes the same options as `Forcola.run/2`; `:timeout_ms` is required
-  and bounds the whole run, not the gap between lines (an idle-timeout
-  option is tracked in
-  [#33](https://github.com/joshrotenberg/forcola/issues/33)).
+  and bounds the whole run, not the gap between lines.
+
+  `:idle_timeout_ms` (optional, milliseconds; default `nil` = disabled)
+  bounds the gap between output frames: if no STDOUT or STDERR data
+  arrives within the interval the producer is treated as stalled, the
+  process group is killed, and `Forcola.Stream.Error` is raised with
+  `idle_timed_out: true`. It is independent of and composable with
+  `:timeout_ms`; whichever bound fires first wins. See the module docs for
+  the exact reset semantic.
 
   Lines are emitted without their trailing newline. A partial line held
   across frame boundaries is emitted once its newline arrives; a final
@@ -101,28 +140,31 @@ defmodule Forcola.Stream do
   def lines([_binary | _] = argv, opts) do
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
+    idle_timeout_ms = Keyword.get(opts, :idle_timeout_ms)
 
     Stream.resource(
-      fn -> start(argv, opts, timeout_ms, kill_grace_ms) end,
+      fn -> start(argv, opts, timeout_ms, kill_grace_ms, idle_timeout_ms) end,
       &next/1,
       &cleanup/1
     )
   end
 
-  defp start(argv, opts, timeout_ms, kill_grace_ms) do
+  defp start(argv, opts, timeout_ms, kill_grace_ms, idle_timeout_ms) do
     case Shim.open() do
       {:ok, port} ->
         payload = Shim.encode_spawn(argv, Keyword.put(opts, :kill_grace_ms, kill_grace_ms))
         Shim.send_frame(port, Shim.tag_spawn(), payload)
 
-        deadline =
-          System.monotonic_time(:millisecond) + timeout_ms + kill_grace_ms + @backstop_margin_ms
+        now = System.monotonic_time(:millisecond)
+        deadline = now + timeout_ms + kill_grace_ms + @backstop_margin_ms
 
         %{
           port: port,
           buffer: "",
           stderr: [],
           deadline: deadline,
+          idle_timeout_ms: idle_timeout_ms,
+          idle_deadline: idle_deadline(idle_timeout_ms, now),
           kill_grace_ms: kill_grace_ms,
           exit: nil
         }
@@ -132,12 +174,27 @@ defmodule Forcola.Stream do
     end
   end
 
+  # nil idle_timeout_ms leaves the idle deadline nil (disabled). Otherwise
+  # the deadline is now + interval and is reset on every liveness frame.
+  defp idle_deadline(nil, _now), do: nil
+  defp idle_deadline(idle_timeout_ms, now), do: now + idle_timeout_ms
+
   # Terminal conditions never raise directly out of the receive: they set
   # `:exit` in the state and raise on the next call, so cleanup/1 always
   # sees a state that says whether the shim already accounted for the
   # child (and can skip the KILL/confirm handshake when it has).
-  defp next(%{exit: nil, port: port, deadline: deadline} = state) do
-    remaining = deadline - System.monotonic_time(:millisecond)
+  defp next(%{exit: nil, port: port, deadline: deadline, idle_deadline: idle_deadline} = state) do
+    now = System.monotonic_time(:millisecond)
+    run_remaining = deadline - now
+
+    # With idle disabled the wait is just the whole-run backstop. With it
+    # enabled the wait is the sooner of the two, and on expiry we attribute
+    # to whichever deadline actually elapsed.
+    wait =
+      case idle_deadline do
+        nil -> run_remaining
+        _ -> min(run_remaining, idle_deadline - now)
+      end
 
     receive do
       {^port, {:data, <<tag, payload::binary>>}} ->
@@ -148,26 +205,50 @@ defmodule Forcola.Stream do
         error = %Error{status: {:signal, :unconfirmed}, stderr: stderr(state)}
         {[], %{state | exit: {:error, error}}}
     after
-      max(remaining, 0) ->
-        # Backstop: the shim never reported back within its own timeout
-        # plus grace. Closing the port in cleanup/1 is the remaining
-        # kill lever (the shim treats stdin EOF as BEAM death).
-        error = %Error{status: {:signal, :unconfirmed}, timed_out: true, stderr: stderr(state)}
-        {[], %{state | exit: {:error, error}}}
+      max(wait, 0) ->
+        {[], %{state | exit: {:error, timeout_error(state)}}}
     end
   end
 
   defp next(%{exit: :ok} = state), do: {:halt, state}
   defp next(%{exit: {:error, error}}), do: raise(error)
 
+  # Attribute an expired wait. When the idle deadline is the one that
+  # elapsed it is an idle timeout: the shim is not timing out on its own
+  # (the whole-run bound has not been reached), so we must actively KILL
+  # the group and wait for the shim to confirm death before the port is
+  # closed in cleanup/1. The whole-run backstop keeps its old behavior:
+  # the shim already hit its own timeout plus grace, so closing the port
+  # (stdin EOF) in cleanup/1 is the remaining kill lever.
+  defp timeout_error(%{idle_deadline: idle_deadline, deadline: deadline} = state)
+       when not is_nil(idle_deadline) and idle_deadline <= deadline do
+    kill_and_confirm(state)
+    %Error{status: {:signal, :unconfirmed}, idle_timed_out: true, stderr: stderr(state)}
+  end
+
+  defp timeout_error(state) do
+    %Error{status: {:signal, :unconfirmed}, timed_out: true, stderr: stderr(state)}
+  end
+
+  # KILL the group and block until the shim confirms death, mirroring the
+  # early-halt path in cleanup/1. cleanup/1 will still close and flush the
+  # port afterward; the exit is already set, so it takes the non-handshake
+  # clause and does not KILL again.
+  defp kill_and_confirm(%{port: port, kill_grace_ms: kill_grace_ms}) do
+    Shim.send_frame(port, Shim.tag_kill())
+    await_exit(port, kill_grace_ms + @backstop_margin_ms)
+  catch
+    :error, :badarg -> :ok
+  end
+
   defp handle_frame(tag, payload, state) do
     cond do
       tag == Shim.tag_stdout() ->
         {lines, rest} = split_lines(state.buffer <> payload)
-        {lines, %{state | buffer: rest}}
+        {lines, %{reset_idle(state) | buffer: rest}}
 
       tag == Shim.tag_stderr() ->
-        {[], %{state | stderr: [state.stderr | payload]}}
+        {[], %{reset_idle(state) | stderr: [state.stderr | payload]}}
 
       tag == Shim.tag_exit() ->
         handle_exit(payload, state)
@@ -193,6 +274,14 @@ defmodule Forcola.Stream do
       end
 
     {final, %{state | buffer: "", exit: outcome}}
+  end
+
+  # A liveness frame (any STDOUT or STDERR data) pushes the idle deadline
+  # forward by the full interval. A no-op when idle timeout is disabled.
+  defp reset_idle(%{idle_timeout_ms: nil} = state), do: state
+
+  defp reset_idle(%{idle_timeout_ms: idle_timeout_ms} = state) do
+    %{state | idle_deadline: System.monotonic_time(:millisecond) + idle_timeout_ms}
   end
 
   defp split_lines(data) do

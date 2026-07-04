@@ -37,9 +37,12 @@ library exists to close. On expiry the group is killed and the caller receives
 `{:error, {:timeout, partial_result}}` (or, for a stream, a raised
 `Forcola.Stream.Error`) carrying output captured so far.
 
-`:timeout_ms` bounds the whole run, not the gap between lines. An idle-timeout
-option for `Forcola.Stream.lines/2` is tracked in
-[#33](https://github.com/joshrotenberg/forcola/issues/33).
+`:timeout_ms` bounds the whole run, not the gap between lines.
+`Forcola.Stream.lines/2` also takes an optional `:idle_timeout_ms` that bounds
+the gap between output frames: if no output (stdout or stderr) arrives within
+the interval the producer is treated as stalled, the group is killed, and
+`Forcola.Stream.Error` is raised with `idle_timed_out: true`. It is independent
+of and composable with `:timeout_ms`; whichever bound fires first wins.
 
 `Forcola.Daemon` and `Forcola.Duplex` take no `:timeout_ms`; passing one raises
 `ArgumentError`. Their bound is the supervisor and the owner process
