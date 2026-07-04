@@ -114,8 +114,9 @@ shapes, and migration notes for erlexec-based predecessors.
 - [ordito's `Ordito.OsProc`](https://github.com/joshrotenberg/ordito) proved
   this contract against erlexec; Forcola ports its API and test suite
   (including the SIGTERM-ignoring child).
-- [erlexec](https://github.com/saleyn/erlexec) has first-class process-group
-  kill but compiles C++ on the consumer's machine.
+- [erlexec](https://github.com/saleyn/erlexec) has process-group kill
+  (opt-in per command via `kill_group`) but compiles C++ on the consumer's
+  machine.
 - [MuonTrap](https://github.com/fhunleth/muontrap) has the right port-program
   architecture, but full process-tree kill requires Linux cgroups; on macOS
   only the direct child is signaled.
