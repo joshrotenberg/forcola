@@ -105,10 +105,21 @@ fn resolve_credentials(
     }
 }
 
-/// Diffs `creds` against the shim's current uid, gid, and supplementary group
-/// set, producing a [`DropPlan`] that omits any syscall the process already
-/// satisfies. This runs in the parent (it calls the non-signal-safe
-/// `getgroups`), so the child only ever runs the numeric setters.
+/// Diffs `creds` against the shim's current uid and gid, producing a
+/// [`DropPlan`] that omits any syscall the process already satisfies. This runs
+/// in the parent so the child only ever runs the numeric setters.
+///
+/// The key case is a no-op drop to the current user: when the request changes
+/// neither the uid nor the gid, there is nothing to drop, so all three setters
+/// (including `setgroups`) are skipped. This matters because `setgroups`
+/// requires privilege even to install the *same* set, and because the group
+/// list resolved from the passwd/group database can legitimately differ from
+/// the process's live `getgroups()` set (notably on macOS, where directory
+/// membership is broader than the kernel's capped supplementary set): forcing
+/// it on a no-op would fail closed for no reason.
+///
+/// When the request *does* change the uid or gid, a real drop was asked for, so
+/// `setgroups` is kept; it runs and fails closed if the shim is unprivileged.
 fn plan_from_current(creds: Credentials) -> DropPlan {
     let cur_uid = unsafe { libc::getuid() } as u32;
     let cur_gid = unsafe { libc::getgid() } as u32;
@@ -116,49 +127,15 @@ fn plan_from_current(creds: Credentials) -> DropPlan {
     let uid = creds.uid.filter(|u| *u != cur_uid);
     let gid = Some(creds.gid).filter(|g| *g != cur_gid);
 
-    // If the current group set matches the target, skip setgroups. Otherwise
-    // (including when we could not read the current set) keep it so it runs and
-    // fails closed if unprivileged.
-    let matches_current = current_groups()
-        .map(|current| same_group_set(current, &creds.groups))
-        .unwrap_or(false);
-    let groups = if matches_current {
-        None
-    } else {
+    // A genuine drop changes the uid or the gid. If neither changes, the whole
+    // request is a no-op: skip setgroups too.
+    let groups = if uid.is_some() || gid.is_some() {
         Some(creds.groups)
+    } else {
+        None
     };
 
     DropPlan { groups, gid, uid }
-}
-
-/// Reads the current supplementary group set via `getgroups`. Parent-side
-/// only. `None` on error, which the caller treats as "cannot prove it matches"
-/// and keeps the setgroups call.
-fn current_groups() -> Option<Vec<u32>> {
-    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if n < 0 {
-        return None;
-    }
-    // libc::gid_t is u32 on every target we build for, so the buffer element
-    // type is already the u32 this function returns.
-    let mut buf: Vec<u32> = vec![0; n as usize];
-    let got = unsafe { libc::getgroups(buf.len() as _, buf.as_mut_ptr() as *mut libc::gid_t) };
-    if got < 0 {
-        return None;
-    }
-    buf.truncate(got as usize);
-    Some(buf)
-}
-
-/// Order-insensitive set comparison of two gid lists.
-fn same_group_set(mut current: Vec<u32>, wanted: &[u32]) -> bool {
-    if current.len() != wanted.len() {
-        return false;
-    }
-    let mut wanted: Vec<u32> = wanted.to_vec();
-    current.sort_unstable();
-    wanted.sort_unstable();
-    current == wanted
 }
 
 /// A user resolved from the passwd database, plus the supplementary group
@@ -519,38 +496,62 @@ mod tests {
     }
 
     #[test]
-    fn plan_skips_syscalls_that_match_current_identity() {
-        // Diffing the current uid/gid against itself yields a plan with the
-        // uid and gid omitted; a no-op drop touches no privileged setter for
-        // those. groups may or may not match, but uid/gid must be skipped.
+    fn plan_is_a_full_noop_for_the_current_identity() {
+        // Requesting the current uid and gid changes nothing, so every setter
+        // (including setgroups) is skipped: a no-op drop must succeed even as
+        // a non-root process, where setgroups to the same set would EPERM.
         let cur_uid = unsafe { libc::getuid() } as u32;
         let cur_gid = unsafe { libc::getgid() } as u32;
         let plan = plan_from_current(Credentials {
             uid: Some(cur_uid),
             gid: cur_gid,
-            groups: current_groups().unwrap_or_default(),
+            groups: vec![cur_gid, 999_999],
         });
         assert_eq!(plan.uid, None, "uid to the current user must be skipped");
         assert_eq!(plan.gid, None, "gid to the current group must be skipped");
         assert_eq!(
             plan.groups, None,
-            "an identical group set must skip setgroups"
+            "a no-op drop must skip setgroups entirely, whatever the resolved set"
         );
     }
 
     #[test]
-    fn plan_keeps_a_genuinely_different_uid() {
+    fn plan_keeps_all_setters_for_a_genuinely_different_uid() {
+        // A different uid is a real drop: setuid is kept, and so is setgroups
+        // so the supplementary set is actually installed. Both run and fail
+        // closed when unprivileged.
         let cur_uid = unsafe { libc::getuid() } as u32;
         let other = cur_uid.wrapping_add(1);
         let plan = plan_from_current(Credentials {
             uid: Some(other),
             gid: unsafe { libc::getgid() } as u32,
-            groups: current_groups().unwrap_or_default(),
+            groups: vec![10, 20],
         });
         assert_eq!(
             plan.uid,
             Some(other),
             "a different uid must be kept so setuid runs and fails closed"
         );
+        assert_eq!(
+            plan.groups,
+            Some(vec![10, 20]),
+            "a real drop must keep setgroups so the supplementary set is installed"
+        );
+    }
+
+    #[test]
+    fn plan_keeps_setgroups_when_only_the_gid_changes() {
+        // A group-only change (uid unchanged) is still a real drop, so
+        // setgroups and setgid are kept.
+        let cur_gid = unsafe { libc::getgid() } as u32;
+        let other_gid = cur_gid.wrapping_add(1);
+        let plan = plan_from_current(Credentials {
+            uid: None,
+            gid: other_gid,
+            groups: vec![other_gid],
+        });
+        assert_eq!(plan.uid, None);
+        assert_eq!(plan.gid, Some(other_gid));
+        assert_eq!(plan.groups, Some(vec![other_gid]));
     }
 }
