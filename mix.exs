@@ -64,8 +64,8 @@ defmodule Forcola.MixProject do
       extras: ["README.md", "guides/adopting_forcola.md"],
       groups_for_modules: [
         "Execution modes": [Forcola, Forcola.Stream, Forcola.Daemon, Forcola.Duplex],
-        "Data structures": [Forcola.Result],
-        Internals: [Forcola.Shim]
+        "Data structures": [Forcola.Result, Forcola.Stream.Error],
+        Internals: [Forcola.Shim, Forcola.Precompiled]
       ]
     ]
   end

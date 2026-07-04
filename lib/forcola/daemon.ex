@@ -61,6 +61,11 @@ defmodule Forcola.Daemon do
   exits first, the group is killed and `start_link` returns
   `{:error, :ready_timeout}` or `{:error, {:exited_before_ready, reason}}`.
 
+  Without `:ready`, `start_link` returns as soon as the spawn request is
+  written to the shim: it succeeds without any proof that the shim or the
+  child is alive, and a failed spawn only surfaces later as a daemon
+  exit. Use `:ready` for any daemon whose availability matters.
+
   ## Exit and restart behavior
 
   When the child exits on its own, the daemon stops: status 0 stops

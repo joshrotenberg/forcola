@@ -29,7 +29,12 @@ defmodule Forcola do
 
   alias Forcola.{Result, Shim}
 
-  @typedoc "Errors a bounded run can return."
+  @typedoc """
+  Errors a bounded run can return.
+
+  The spawn reason is one of `:shim_not_found`, a reason string reported
+  by the shim, or `{:shim_exited, %Forcola.Result{}}`; see `run/2`.
+  """
   @type run_error :: {:timeout, Result.t()} | {:spawn, term()}
 
   # Margin added on top of the shim's own kill_grace_ms when computing
@@ -49,13 +54,33 @@ defmodule Forcola do
       killed (SIGTERM, then SIGKILL after the kill grace) and
       `{:error, {:timeout, partial_result}}` is returned with output
       captured so far. The group is confirmed dead before the call
-      returns.
+      returns, with one exception: if the shim itself never reports back,
+      an Elixir-side backstop returns a result whose status is
+      `{:signal, :unconfirmed}`, meaning death was not confirmed (see
+      `Forcola.Result`). A child that exits exactly at the timeout
+      boundary can be reported as a timeout whose result carries the
+      normal exit status, including `status: 0`.
+    * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace in milliseconds,
+      default `5_000`. Also accepted by `Forcola.Stream.lines/2`.
     * `:cd` - working directory.
     * `:env` - list of `{name, value}` strings.
     * `:merge_stderr` - route stderr into stdout; default `false`.
 
   Any exit status is `{:ok, %Forcola.Result{}}`; callers branch on
   `:status`. A non-zero exit is a result, not an error.
+
+  ## Spawn errors
+
+    * `{:error, {:spawn, :shim_not_found}}` - no shim binary exists for
+      this target (neither downloaded nor built).
+    * `{:error, {:spawn, reason}}` where `reason` is a string - the shim
+      reported the spawn failure, for example a missing or
+      non-executable command.
+    * `{:error, {:spawn, {:shim_exited, %Forcola.Result{}}}}` - the shim
+      exited without reporting an exit or error, for example because it
+      was SIGKILLed. The result's status is `{:signal, :unconfirmed}`. A
+      SIGKILLed shim gets no chance to kill the group, so the child may
+      survive, reparented to pid 1.
   """
   @spec run([String.t(), ...], keyword()) :: {:ok, Result.t()} | {:error, run_error()}
   def run([_binary | _] = argv, opts) do
