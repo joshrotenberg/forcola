@@ -1,6 +1,7 @@
 //! The supervising event loop: spawns the child, forwards its output,
 //! and applies the kill sequence on timeout, KILL frame, or stdin EOF.
 
+use crate::cgroup::{self, Cgroup};
 use crate::frame::{
     self, Frame, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_KILL, TAG_SPAWN, TAG_STDERR, TAG_STDIN,
     TAG_STDOUT,
@@ -72,7 +73,7 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         }
     };
 
-    let (mut child, pty_master) = match spawn_child(&request) {
+    let (mut child, pty_master, cgroup) = match spawn_child(&request) {
         Ok(c) => c,
         Err(e) => {
             write_error(&out, &format!("spawn failed: {e}"));
@@ -160,6 +161,7 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         &out,
         pumps,
         &pump_done_rx,
+        cgroup.as_ref(),
     );
 
     Ok(())
@@ -168,11 +170,13 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
 /// Builds and spawns the child process, calling `setsid()` in the child
 /// before exec so it leads its own process group.
 ///
-/// Returns the child and, in pty mode, the master side of the pty pair; the
-/// caller reads child output from the master and writes STDIN frames to it.
-/// In pipe mode the second element is `None` and the child's stdio is the
-/// usual set of pipes on the `Child`.
-fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>)> {
+/// Returns the child, the master side of the pty pair (pty mode only), and the
+/// prepared cgroup (when `cgroup: true` was requested and a delegated cgroup v2
+/// subtree was available). The caller reads child output from the master and
+/// writes STDIN frames to it. In pipe mode the second element is `None` and the
+/// child's stdio is the usual set of pipes on the `Child`. The third element is
+/// `None` on the default path, on fallback, and on non-Linux.
+fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>, Option<Cgroup>)> {
     let (program, args) = request
         .argv
         .split_first()
@@ -195,23 +199,43 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>)> {
     // the child cannot run as the wrong (current) user.
     let plan = privdrop::resolve(request.user.as_ref(), request.group.as_ref())?;
 
+    // Prepare the cgroup in the PARENT, before fork: detect cgroup v2, create a
+    // delegated child cgroup, and open its cgroup.procs fd. Never fails: a
+    // missing/undelegated cgroup returns None and the child runs with
+    // process-group kill only. The child moves ITSELF into the cgroup in
+    // pre_exec (see below), so a fast double-fork cannot escape a
+    // move-after-spawn window.
+    let cgroup = if request.cgroup {
+        cgroup::prepare()
+    } else {
+        None
+    };
+    let placement = cgroup.as_ref().map(|cg| cg.placement());
+
     if request.pty {
-        spawn_child_pty(cmd, request, plan)
+        spawn_child_pty(cmd, request, plan, placement).map(|(c, m)| (c, m, cgroup))
     } else {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Safety: the closure calls setsid() (async-signal-safe) and, when a
+        // Safety: the closure calls setsid() (async-signal-safe), then joins the
+        // cgroup by writing its own pid to the parent-opened fd (a single
+        // allocation-free write, see Placement::join_in_child), then, when a
         // drop was requested, the numeric setgroups/setgid/setuid syscalls via
-        // DropPlan::apply. All names were resolved in the parent; the closure
-        // allocates nothing beyond reading the moved `plan`. It runs in the
-        // forked child between fork and exec, per `pre_exec`'s contract.
+        // DropPlan::apply. All names/fds were resolved/opened in the parent; the
+        // closure allocates nothing beyond reading the moved `plan`/`placement`.
+        // It runs in the forked child between fork and exec, per `pre_exec`'s
+        // contract. Joining the cgroup right after setsid, before any user code
+        // runs, means every descendant the child forks inherits the cgroup.
         unsafe {
             cmd.pre_exec(move || {
                 process::setsid()
                     .map(|_| ())
                     .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+                if let Some(placement) = &placement {
+                    placement.join_in_child()?;
+                }
                 if let Some(plan) = &plan {
                     plan.apply()?;
                 }
@@ -219,7 +243,7 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>)> {
             });
         }
 
-        cmd.spawn().map(|child| (child, None))
+        cmd.spawn().map(|child| (child, None, cgroup))
     }
 }
 
@@ -232,6 +256,7 @@ fn spawn_child_pty(
     mut cmd: Command,
     request: &SpawnRequest,
     plan: Option<DropPlan>,
+    placement: Option<cgroup::Placement>,
 ) -> io::Result<(Child, Option<OwnedFd>)> {
     use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 
@@ -260,13 +285,17 @@ fn spawn_child_pty(
     let winsize = window_size(request);
 
     // Safety: the closure runs between fork and exec. It calls only
-    // async-signal-safe operations (setsid, ioctl, and the numeric
+    // async-signal-safe operations (setsid, ioctl, the single allocation-free
+    // cgroup.procs write in Placement::join_in_child, and the numeric
     // setgroups/setgid/setuid in DropPlan::apply) and touches no parent memory
-    // beyond the copied `winsize` and moved `plan` values. fd 0 is the child's
-    // slave side after std has wired up stdio, so TIOCSCTTY on it makes the pty
-    // the controlling terminal. The credential drop runs last, after the
-    // terminal is claimed, so setting the controlling terminal still has the
-    // privilege it needs; after setuid that privilege may be gone.
+    // beyond the copied `winsize` and moved `plan`/`placement` values. fd 0 is
+    // the child's slave side after std has wired up stdio, so TIOCSCTTY on it
+    // makes the pty the controlling terminal. The cgroup join runs before the
+    // credential drop, since after setuid the child may lose write access to
+    // cgroup.procs (delegation is tied to the shim's uid). The credential drop
+    // runs last, after the terminal is claimed, so setting the controlling
+    // terminal still has the privilege it needs; after setuid that privilege
+    // may be gone.
     unsafe {
         cmd.pre_exec(move || {
             process::setsid().map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
@@ -278,6 +307,10 @@ fn spawn_child_pty(
             if let Some(ws) = winsize {
                 rustix::termios::tcsetwinsize(stdin, ws)
                     .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+            }
+
+            if let Some(placement) = &placement {
+                placement.join_in_child()?;
             }
 
             if let Some(plan) = &plan {
@@ -393,6 +426,7 @@ fn spawn_timeout_timer(timeout_ms: u64, tx: Sender<Event>) {
 
 /// The main supervising loop: consumes events until the child has exited,
 /// drains the output pumps, then writes the EXIT frame.
+#[allow(clippy::too_many_arguments)]
 fn supervise<W: Write>(
     rx: Receiver<Event>,
     pgid: Pid,
@@ -401,6 +435,7 @@ fn supervise<W: Write>(
     out: &Arc<Mutex<W>>,
     pumps: usize,
     pump_done: &Receiver<()>,
+    cgroup: Option<&Cgroup>,
 ) {
     let mut timed_out = false;
     let mut beam_gone = false;
@@ -416,7 +451,7 @@ fn supervise<W: Write>(
                 *child_stdin = None; // drop closes the pipe
             }
             Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
-                kill_group(pgid, kill_grace);
+                kill_group(pgid, kill_grace, cgroup);
             }
             Ok(Event::Stdin(_)) => {
                 // Unknown/unexpected tag mid-session; ignore rather than
@@ -427,16 +462,16 @@ fn supervise<W: Write>(
                 // real exit event from the waiter thread so we reap the
                 // child properly, but there's no one left to report to.
                 beam_gone = true;
-                kill_group(pgid, kill_grace);
+                kill_group(pgid, kill_grace, cgroup);
             }
             Ok(Event::StdinError(e)) => {
                 eprintln!("forcola_shim: stdin read error, treating as BEAM death: {e}");
                 beam_gone = true;
-                kill_group(pgid, kill_grace);
+                kill_group(pgid, kill_grace, cgroup);
             }
             Ok(Event::TimedOut) => {
                 timed_out = true;
-                kill_group(pgid, kill_grace);
+                kill_group(pgid, kill_grace, cgroup);
             }
             Ok(Event::ChildExited(outcome)) => break Some(outcome),
             Err(_) => break None,
@@ -447,6 +482,15 @@ fn supervise<W: Write>(
         status: None,
         signal: None,
     });
+
+    // Tear the contained subtree down after the child is reaped, whether it
+    // was killed or exited on its own. `finish_cgroup` writes cgroup.kill (in
+    // case a daemonizer escaped the process group and is still alive),
+    // confirms the cgroup drained, and rmdirs it. Runs even on beam_gone so a
+    // vanished BEAM does not leak the cgroup directory.
+    if let Some(cg) = cgroup {
+        finish_cgroup(cg, kill_grace);
+    }
 
     if beam_gone {
         // Nothing to report to: the reader/writer on the other end of
@@ -466,11 +510,38 @@ fn supervise<W: Write>(
         status: outcome.status,
         signal: outcome.signal,
         timed_out,
+        contained: cgroup.is_some(),
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();
         let _ = frame::write_frame(&mut *w, TAG_EXIT, &payload);
     }
+}
+
+/// Final cgroup teardown after the child is reaped: SIGKILL any escapee still
+/// in the subtree via `cgroup.kill`, confirm the cgroup drained (bounded by the
+/// kill grace), then rmdir it. Layered on top of the process-group kill, which
+/// has already run; this only matters for a descendant that left the process
+/// group by daemonizing.
+fn finish_cgroup(cg: &Cgroup, grace: Duration) {
+    // SIGKILL the whole subtree. This is the backstop that reaches a
+    // deliberate daemonizer the process-group kill could not.
+    cg.kill();
+
+    // Wait for the cgroup to drain, in addition to the process-group death
+    // probe the kill path already did. Bound the wait so a wedged cgroup
+    // cannot delay the EXIT report forever.
+    let deadline = Instant::now() + grace + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if cg.drained() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // rmdir the now-empty cgroup. Best-effort: if it is somehow non-empty the
+    // delegation owner reaps it later.
+    cg.remove();
 }
 
 /// Waits (bounded by `OUTPUT_DRAIN_GRACE`) for `pumps` output pump
@@ -491,13 +562,20 @@ fn drain_pumps(pumps: usize, pump_done: &Receiver<()>) {
 /// SIGTERM the whole process group, then SIGKILL after `grace` if it
 /// hasn't died. Confirms death via a signal-0 liveness probe before
 /// returning.
-fn kill_group(pgid: Pid, grace: Duration) {
+///
+/// When a cgroup is present, `cgroup.kill` is written after the group kill so a
+/// descendant that escaped the process group by daemonizing is SIGKILLed too.
+/// This is layered on top of the process-group kill, never in place of it: the
+/// SIGTERM/SIGKILL group sequence is unchanged; the cgroup write is added at
+/// the end. The final drain-and-rmdir happens once, after the child is reaped,
+/// in `finish_cgroup`.
+fn kill_group(pgid: Pid, grace: Duration, cgroup: Option<&Cgroup>) {
     let _ = process::kill_process_group(pgid, Signal::TERM);
 
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
         if !group_alive(pgid) {
-            return;
+            break;
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -509,6 +587,13 @@ fn kill_group(pgid: Pid, grace: Duration) {
         while group_alive(pgid) && Instant::now() < hard_deadline {
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    // Backstop for a deliberate daemonizer that left the process group: the
+    // group kill above never reached it, but cgroup.kill SIGKILLs everything
+    // still in the subtree at once.
+    if let Some(cg) = cgroup {
+        cg.kill();
     }
 }
 

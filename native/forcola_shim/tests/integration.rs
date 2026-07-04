@@ -81,6 +81,18 @@ fn user_spawn_payload(argv: &[&str], user: &str) -> Vec<u8> {
     serde_json::to_vec(&obj).unwrap()
 }
 
+/// SPAWN payload carrying `cgroup: true`, plus an optional kill grace.
+fn cgroup_spawn_payload(argv: &[&str], kill_grace_ms: Option<u64>) -> Vec<u8> {
+    let mut obj = serde_json::json!({
+        "argv": argv,
+        "cgroup": true,
+    });
+    if let Some(g) = kill_grace_ms {
+        obj["kill_grace_ms"] = serde_json::json!(g);
+    }
+    serde_json::to_vec(&obj).unwrap()
+}
+
 fn pty_spawn_payload(argv: &[&str], kill_grace_ms: Option<u64>) -> Vec<u8> {
     let mut obj = serde_json::json!({
         "argv": argv,
@@ -675,4 +687,163 @@ fn unknown_user_is_a_clean_error() {
     );
 
     let _ = child.wait();
+}
+
+/// Runs a short `cgroup: true` command and returns the EXIT report's
+/// `contained` flag. Used as a probe: if it is `false`, this host has no
+/// delegated cgroup v2 subtree and the real-containment test skips loudly.
+fn probe_cgroup_contained() -> bool {
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &cgroup_spawn_payload(&["true"], Some(200)),
+    );
+
+    let (_out, exit_frame) = drain_until_exit(&mut stdout);
+    let _ = child.wait();
+
+    match exit_frame {
+        Some(f) if f.tag == TAG_EXIT => {
+            let report: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+            report["contained"].as_bool().unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn cgroup_reports_contained_flag() {
+    // The EXIT report always carries a `contained` boolean when cgroup was
+    // requested: true under a delegated cgroup v2 subtree, false on fallback
+    // (macOS, no cgroup v2, or no delegation). Either way the flag is present
+    // and the run completes normally -- cgroup: true is never an error.
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &cgroup_spawn_payload(&["echo", "hi"], Some(200)),
+    );
+
+    let (out, exit_frame) = drain_until_exit(&mut stdout);
+    let exit_frame = exit_frame.expect("expected an EXIT frame for a cgroup run");
+    assert_eq!(
+        exit_frame.tag, TAG_EXIT,
+        "cgroup: true must never turn into an ERROR frame"
+    );
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "hi");
+
+    let report: serde_json::Value = serde_json::from_slice(&exit_frame.payload).unwrap();
+    assert!(
+        report["contained"].is_boolean(),
+        "EXIT report must carry a boolean `contained` flag, got {report}"
+    );
+
+    let _ = child.wait();
+}
+
+#[test]
+fn cgroup_reaps_daemonizer_that_escaped_the_process_group() {
+    // The load-bearing containment proof. The child uses `setsid` to launch a
+    // `sleep` in a brand-new session, so that sleep leaves the child's process
+    // group entirely: a `kill(-pgid, ...)` can never reach it. Only the cgroup
+    // backstop (cgroup.kill over the whole subtree) can reap it.
+    //
+    // This needs a delegated cgroup v2 subtree, which GitHub runners may not
+    // provide. Probe first; if containment is not actually active, SKIP LOUDLY
+    // rather than passing silently or failing red.
+    if !probe_cgroup_contained() {
+        eprintln!(
+            "SKIP cgroup_reaps_daemonizer_that_escaped_the_process_group: \
+             no delegated cgroup v2 subtree on this host (cgroup fell back to \
+             process-group kill). Run under `systemd-run --user --scope` or a \
+             delegated cgroup to exercise real containment."
+        );
+        return;
+    }
+
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    // `setsid sleep 120 & ...` puts the sleep in its own session/pgroup, so it
+    // escapes the child's process group. Print its pid, then the child sleeps.
+    // `command -v setsid` guards hosts without setsid (should not happen on a
+    // delegated-cgroup Linux runner, but keeps the failure legible).
+    let script = "command -v setsid >/dev/null || { echo NO_SETSID; exit 3; }; \
+                  setsid sleep 120 & echo ESCAPEE_PID=$!; sleep 120";
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &cgroup_spawn_payload(&["sh", "-c", script], Some(200)),
+    );
+
+    // Read the escapee pid line.
+    let mut stdout_bytes = Vec::new();
+    let mut escapee_pid: Option<i32> = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while escapee_pid.is_none() && Instant::now() < deadline {
+        match read_frame(&mut stdout) {
+            Some(f) if f.tag == TAG_STDOUT => {
+                stdout_bytes.extend_from_slice(&f.payload);
+                let text = String::from_utf8_lossy(&stdout_bytes);
+                assert!(
+                    !text.contains("NO_SETSID"),
+                    "host lacks setsid; cannot construct a process-group escapee"
+                );
+                if let Some(line) = text.lines().find(|l| l.starts_with("ESCAPEE_PID=")) {
+                    escapee_pid = line.trim_start_matches("ESCAPEE_PID=").trim().parse().ok();
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    let escapee_pid = escapee_pid.expect("did not observe the escapee pid");
+
+    // Confirm the escapee really left the child's process group. After
+    // `setsid` it becomes its own session and group leader, so its pgid equals
+    // its own pid and is therefore distinct from the shim child's group. If it
+    // had stayed in the child's group the process-group kill alone would reach
+    // it and the test would not exercise cgroup containment.
+    let escapee_pgid = unsafe { getpgid(escapee_pid) };
+    assert_eq!(
+        escapee_pgid, escapee_pid,
+        "escapee did not lead its own group; it never left the child's process group"
+    );
+
+    // Kill the group. The process-group kill cannot reach the escapee; the
+    // cgroup.kill backstop must.
+    write_frame(&mut stdin, TAG_KILL, &[]);
+
+    let (_out, exit_frame) = drain_until_exit(&mut stdout);
+    assert!(exit_frame.is_some(), "expected an EXIT frame after KILL");
+
+    // The escapee must be dead: only cgroup.kill could have reaped it.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut alive = true;
+    while Instant::now() < deadline {
+        alive = unsafe { libc_kill(escapee_pid, 0) == 0 };
+        if !alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !alive,
+        "daemonized escapee pid {escapee_pid} survived: cgroup.kill did not reap it"
+    );
+
+    let _ = child.wait();
+}
+
+// getpgid, used only to prove the escapee led its own process group.
+extern "C" {
+    fn getpgid(pid: i32) -> i32;
 }

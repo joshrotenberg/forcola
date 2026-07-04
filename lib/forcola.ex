@@ -27,6 +27,8 @@ defmodule Forcola do
   guide](adopting_forcola.html).
   """
 
+  require Logger
+
   alias Forcola.{Result, Shim}
 
   @typedoc """
@@ -74,6 +76,34 @@ defmodule Forcola do
       the gid (and clears supplementary groups to just that gid) without
       changing the uid; given with `:user` it overrides the user's
       primary gid.
+    * `:cgroup` - opt in to Linux cgroup v2 containment, default `false`.
+      When `true` on a Linux host with a delegated cgroup v2 subtree, the
+      child runs in a dedicated cgroup so descendants that escape the
+      process group by deliberately daemonizing are still reaped. Linux
+      only, requires cgroup delegation, and falls back with a warning
+      otherwise. See ["cgroup containment"](#run/2-cgroup-containment).
+
+  ## cgroup containment
+
+  The process-group kill reaches every descendant that stays in the
+  child's process group, but a target that deliberately daemonizes
+  (double-fork plus `setsid`, or a `--daemon` flag) leaves the group and
+  survives. `cgroup: true` adds a Linux-only backstop: the child is
+  placed in a dedicated cgroup v2 cgroup before exec, so every descendant
+  it forks inherits the cgroup regardless of process-group games, and on
+  kill the shim writes `cgroup.kill` to SIGKILL the whole subtree at once.
+  It is layered on top of the process-group kill, never in place of it.
+
+  It requires a delegated cgroup v2 subtree, which means the BEAM must run
+  inside a delegatable unit: under systemd, `Delegate=yes` on the service,
+  or wrapping the run in `systemd-run --user --scope`. See the [process
+  groups guide](process_groups.html#deliberate-daemonizers).
+
+  It never turns into an error. On macOS, on non-cgroup-v2 systems, or
+  when the subtree is not writable/delegated, `cgroup: true` degrades to
+  the ordinary process-group kill and logs a warning from the shim; the
+  group-kill guarantee (ordinary grandchildren still die) is unchanged. A
+  `Logger.debug` line is emitted when containment was actually active.
 
   ## Running as a different user
 
@@ -169,6 +199,7 @@ defmodule Forcola do
 
       tag == Shim.tag_exit() ->
         {status, timed_out} = Shim.decode_exit(payload)
+        if Shim.decode_contained(payload), do: log_contained()
         res = result(acc, status)
         if timed_out, do: {:error, {:timeout, res}}, else: {:ok, res}
 
@@ -179,6 +210,10 @@ defmodule Forcola do
       true ->
         collect(port, acc, deadline)
     end
+  end
+
+  defp log_contained do
+    Logger.debug("forcola: run completed under Linux cgroup v2 containment")
   end
 
   defp result(acc, status) do

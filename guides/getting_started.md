@@ -85,6 +85,8 @@ Options:
 - `:user`: run the child as this user, a string username or an integer uid.
 - `:group`: run the child with this group as its primary gid, a string group
   name or an integer gid.
+- `:cgroup`: opt in to Linux cgroup v2 containment, default `false`. See
+  "cgroup containment" below.
 
 Return shapes:
 
@@ -120,6 +122,36 @@ order. Key properties:
   mode's normal spawn error (`{:error, {:spawn, reason}}` for `run/2`,
   `{:forcola_exit, session, {:spawn_error, reason}}` for `Forcola.Duplex`). The
   command never runs as the shim's own user when a different user was requested.
+
+#### cgroup containment
+
+The process-group kill reaches every descendant that stays in the child's
+process group, but a target that deliberately daemonizes (double-fork plus
+`setsid`, or a `--daemon` flag) leaves the group and survives. On Linux,
+`cgroup: true` adds a backstop: the child runs in a dedicated cgroup v2 cgroup,
+so descendants it forks inherit the cgroup, and on kill the shim writes
+`cgroup.kill` to SIGKILL the whole subtree at once. It is layered on top of the
+process-group kill, never in place of it, and works the same in every mode.
+
+```elixir
+Forcola.run(["some-daemonizing-tool"], timeout_ms: 5_000, cgroup: true)
+```
+
+Key properties:
+
+- Linux only. On macOS and other platforms `cgroup: true` is a no-op that falls
+  back to the process-group kill.
+- Requires cgroup delegation. The BEAM must run inside a delegatable unit: under
+  systemd, `Delegate=yes` on the service, or wrapping the run in
+  `systemd-run --user --scope`. Without a delegated, writable cgroup v2 subtree
+  the shim cannot create a child cgroup.
+- Graceful fallback, never an error. On macOS, on non-cgroup-v2 systems, or when
+  the subtree is not delegated, it degrades to the process-group kill and logs a
+  warning; ordinary in-group grandchildren still die exactly as before. A
+  `Logger.debug` line is emitted when containment was actually active.
+
+See the [process groups guide](process_groups.html#deliberate-daemonizers) for
+the mechanism.
 
 ### Line stream: `Forcola.Stream.lines/2`
 
@@ -176,7 +208,7 @@ Options:
 
 - `:argv` (required): `[binary | args]` as in `Forcola.run/2`.
 - `:name`: optional GenServer registration name.
-- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`: as in `Forcola.run/2`.
+- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`, `:cgroup`: as in `Forcola.run/2`.
 - `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
 - `:output`: where child output goes, default `:logger`.
 - `:log_output`: `Logger` level for `output: :logger`, default `:info`.
@@ -229,7 +261,7 @@ There is no `:timeout_ms`; the session is bounded by its owner process and
 
 Options:
 
-- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`: as in `Forcola.run/2`.
+- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`, `:cgroup`: as in `Forcola.run/2`.
 - `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
 - `:pty`: run the child under a pseudo-terminal (default `false`), for CLIs
   that behave differently when they detect a tty. See

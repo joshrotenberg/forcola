@@ -29,6 +29,13 @@ defmodule Forcola.Daemon do
       `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
       privileged shim; failures fail closed and surface as the daemon's
       normal spawn-error exit.
+    * `:cgroup` - opt in to Linux cgroup v2 containment, as in
+      `Forcola.run/2`. Linux only, requires a delegated cgroup v2 subtree
+      (systemd `Delegate=yes` or `systemd-run --scope`), and falls back to
+      the process-group kill with a warning elsewhere. A daemon is the
+      typical place to want this: a long-running server that might spawn a
+      helper which daemonizes away from the process group is reaped anyway
+      on shutdown. Default `false`.
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace, default `5_000`.
     * `:output` - where child output goes; see below. Default `:logger`.
     * `:log_output` - `Logger` level for `output: :logger`, default `:info`.
@@ -304,10 +311,18 @@ defmodule Forcola.Daemon do
     cond do
       tag == Shim.tag_stdout() -> emit(state, :stdout, payload)
       tag == Shim.tag_stderr() -> emit(state, :stderr, payload)
-      tag == Shim.tag_exit() -> %{state | exit: {:exit, Shim.decode_exit(payload)}}
+      tag == Shim.tag_exit() -> handle_exit(state, payload)
       tag == Shim.tag_error() -> %{state | exit: {:spawn_error, Shim.decode_error(payload)}}
       true -> state
     end
+  end
+
+  defp handle_exit(state, payload) do
+    if Shim.decode_contained(payload) do
+      Logger.debug("forcola: daemon ran under Linux cgroup v2 containment")
+    end
+
+    %{state | exit: {:exit, Shim.decode_exit(payload)}}
   end
 
   defp stop_reason({:exit, {0, _timed_out}}), do: :normal
