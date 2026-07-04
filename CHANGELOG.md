@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0](https://github.com/joshrotenberg/forcola/compare/v0.1.0...v0.2.0) (2026-07-04)
+
+
+### Features
+
+* idle timeout for Forcola.Stream.lines/2 (closes [#33](https://github.com/joshrotenberg/forcola/issues/33)) ([#37](https://github.com/joshrotenberg/forcola/issues/37)) ([8d84fcd](https://github.com/joshrotenberg/forcola/commit/8d84fcdf5f925b4f2ccfa4720d360c236ccf4480))
+* pty support for Forcola.Duplex (closes [#30](https://github.com/joshrotenberg/forcola/issues/30)) ([#39](https://github.com/joshrotenberg/forcola/issues/39)) ([9a284f7](https://github.com/joshrotenberg/forcola/commit/9a284f7f274b8b86c7f862bd4f7bc7648b9d11f6))
+* run the child as a different user or group (closes [#31](https://github.com/joshrotenberg/forcola/issues/31)) ([#40](https://github.com/joshrotenberg/forcola/issues/40)) ([9662c6c](https://github.com/joshrotenberg/forcola/commit/9662c6cf62a4ba4b85b24e79c18a86a85888af5e))
+
 ## 0.1.0 (2026-07-04)
 
 
