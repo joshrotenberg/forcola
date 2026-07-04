@@ -90,7 +90,14 @@ defmodule Forcola.Shim do
     Port.command(port, [tag, payload])
   end
 
-  @doc "Encodes a SPAWN frame payload from `Forcola.run/2` options."
+  @doc """
+  Encodes a SPAWN frame payload from `Forcola.run/2` options.
+
+  Shared by all four modes. Besides `:cd`/`:env`/`:merge_stderr`/`:timeout_ms`/
+  `:kill_grace_ms` and the pty options, it threads `:user` and `:group` (each a
+  string name or an integer id) through to the shim so the child can be run as a
+  different user; see `Forcola.run/2` for the semantics.
+  """
   @spec encode_spawn(term(), keyword()) :: binary()
   def encode_spawn(argv, opts) do
     base = %{
@@ -103,6 +110,8 @@ defmodule Forcola.Shim do
     |> maybe_put("env", encode_env(Keyword.get(opts, :env)))
     |> maybe_put("timeout_ms", Keyword.get(opts, :timeout_ms))
     |> maybe_put("kill_grace_ms", Keyword.get(opts, :kill_grace_ms))
+    |> maybe_put("user", Keyword.get(opts, :user))
+    |> maybe_put("group", Keyword.get(opts, :group))
     |> put_pty(opts)
     |> :json.encode()
     |> IO.iodata_to_binary()

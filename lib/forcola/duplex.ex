@@ -80,6 +80,10 @@ defmodule Forcola.Duplex do
   ## Options
 
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
+    * `:user`, `:group` - run the child as a different user/group, as in
+      `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
+      privileged shim; failures fail closed and arrive as
+      `{:forcola_exit, session, {:spawn_error, reason}}`.
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace, default `5_000`.
     * `:pty` - run the child under a pseudo-terminal (default `false`). In
       pty mode stderr is merged into `:forcola_line` and no `:forcola_stderr`

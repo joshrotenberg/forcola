@@ -82,6 +82,9 @@ Options:
 - `:cd`: working directory.
 - `:env`: list of `{name, value}` strings.
 - `:merge_stderr`: route stderr into stdout, default `false`.
+- `:user`: run the child as this user, a string username or an integer uid.
+- `:group`: run the child with this group as its primary gid, a string group
+  name or an integer gid.
 
 Return shapes:
 
@@ -91,6 +94,32 @@ Return shapes:
   captured so far.
 - `{:error, {:spawn, reason}}` where `reason` is `:shim_not_found`, a string
   reported by the shim, or `{:shim_exited, %Forcola.Result{}}`.
+
+#### Running as a different user
+
+`:user` and `:group` make the shim drop privileges before executing the child.
+They work the same way in every mode (`run/2`, `Forcola.Stream`,
+`Forcola.Daemon`, `Forcola.Duplex`).
+
+```elixir
+Forcola.run(["id", "-un"], timeout_ms: 5_000, user: "nobody")
+Forcola.run(["some-tool"], timeout_ms: 5_000, user: 1001, group: "builders")
+```
+
+The shim resolves the user/group in the parent process, then in the child
+(after `setsid`, before exec) calls `setgroups`, `setgid`, and `setuid` in that
+order. Key properties:
+
+- POSIX-only. Windows is out of scope; a `:user`/`:group` on a platform without
+  these semantics fails with a clear error.
+- One-way drop. The shim process must already run with enough privilege to drop
+  (root, or `CAP_SETUID`/`CAP_SETGID` on Linux). Requesting the user the shim
+  already runs as is a no-op and always succeeds.
+- Fail-closed. If the user/group cannot be resolved, or the shim lacks the
+  privilege to drop, the child is never executed. The failure surfaces as the
+  mode's normal spawn error (`{:error, {:spawn, reason}}` for `run/2`,
+  `{:forcola_exit, session, {:spawn_error, reason}}` for `Forcola.Duplex`). The
+  command never runs as the shim's own user when a different user was requested.
 
 ### Line stream: `Forcola.Stream.lines/2`
 
@@ -147,7 +176,7 @@ Options:
 
 - `:argv` (required): `[binary | args]` as in `Forcola.run/2`.
 - `:name`: optional GenServer registration name.
-- `:cd`, `:env`, `:merge_stderr`: as in `Forcola.run/2`.
+- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`: as in `Forcola.run/2`.
 - `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
 - `:output`: where child output goes, default `:logger`.
 - `:log_output`: `Logger` level for `output: :logger`, default `:info`.
@@ -200,7 +229,7 @@ There is no `:timeout_ms`; the session is bounded by its owner process and
 
 Options:
 
-- `:cd`, `:env`, `:merge_stderr`: as in `Forcola.run/2`.
+- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`: as in `Forcola.run/2`.
 - `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
 - `:pty`: run the child under a pseudo-terminal (default `false`), for CLIs
   that behave differently when they detect a tty. See

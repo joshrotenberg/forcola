@@ -5,6 +5,7 @@ use crate::frame::{
     self, Frame, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_KILL, TAG_SPAWN, TAG_STDERR, TAG_STDIN,
     TAG_STDOUT,
 };
+use crate::privdrop::{self, DropPlan};
 use crate::protocol::{ErrorReport, ExitReport, SpawnRequest};
 
 use rustix::process::{self, Pid, Signal};
@@ -187,21 +188,34 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>)> {
         cmd.envs(&request.env);
     }
 
+    // Resolve user/group names to numeric ids in the PARENT, before fork, and
+    // diff them against the shim's current identity. getpwnam/getgrnam/
+    // getgrouplist/getgroups are not async-signal-safe and must never run
+    // inside pre_exec. A resolution failure fails closed: we never spawn, so
+    // the child cannot run as the wrong (current) user.
+    let plan = privdrop::resolve(request.user.as_ref(), request.group.as_ref())?;
+
     if request.pty {
-        spawn_child_pty(cmd, request)
+        spawn_child_pty(cmd, request, plan)
     } else {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Safety: the closure only calls setsid(), which is async-signal-safe
-        // and does not allocate or touch the parent's memory. It runs in the
+        // Safety: the closure calls setsid() (async-signal-safe) and, when a
+        // drop was requested, the numeric setgroups/setgid/setuid syscalls via
+        // DropPlan::apply. All names were resolved in the parent; the closure
+        // allocates nothing beyond reading the moved `plan`. It runs in the
         // forked child between fork and exec, per `pre_exec`'s contract.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 process::setsid()
                     .map(|_| ())
-                    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+                    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+                if let Some(plan) = &plan {
+                    plan.apply()?;
+                }
+                Ok(())
             });
         }
 
@@ -217,6 +231,7 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>)> {
 fn spawn_child_pty(
     mut cmd: Command,
     request: &SpawnRequest,
+    plan: Option<DropPlan>,
 ) -> io::Result<(Child, Option<OwnedFd>)> {
     use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 
@@ -245,10 +260,13 @@ fn spawn_child_pty(
     let winsize = window_size(request);
 
     // Safety: the closure runs between fork and exec. It calls only
-    // async-signal-safe operations (setsid, ioctl) and touches no parent
-    // memory beyond the copied `winsize` value. fd 0 is the child's slave
-    // side after std has wired up stdio, so TIOCSCTTY on it makes the pty
-    // the controlling terminal.
+    // async-signal-safe operations (setsid, ioctl, and the numeric
+    // setgroups/setgid/setuid in DropPlan::apply) and touches no parent memory
+    // beyond the copied `winsize` and moved `plan` values. fd 0 is the child's
+    // slave side after std has wired up stdio, so TIOCSCTTY on it makes the pty
+    // the controlling terminal. The credential drop runs last, after the
+    // terminal is claimed, so setting the controlling terminal still has the
+    // privilege it needs; after setuid that privilege may be gone.
     unsafe {
         cmd.pre_exec(move || {
             process::setsid().map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
@@ -260,6 +278,10 @@ fn spawn_child_pty(
             if let Some(ws) = winsize {
                 rustix::termios::tcsetwinsize(stdin, ws)
                     .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+            }
+
+            if let Some(plan) = &plan {
+                plan.apply()?;
             }
             Ok(())
         });
