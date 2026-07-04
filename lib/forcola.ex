@@ -12,8 +12,8 @@ defmodule Forcola do
 
   `Task.shutdown` closes the Erlang port, and closing a port closes pipes;
   it sends no signal. The external process runs on until it next touches a
-  closed pipe, and its children are never signaled at all. See the README
-  for the full mechanism.
+  closed pipe, and its children are never signaled at all. See the [process
+  groups guide](process_groups.html) for the full mechanism.
 
   ## Modes
 
