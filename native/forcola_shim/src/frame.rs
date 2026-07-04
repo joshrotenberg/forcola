@@ -15,6 +15,16 @@ pub const TAG_STDERR: u8 = 0x12;
 pub const TAG_EXIT: u8 = 0x13;
 pub const TAG_ERROR: u8 = 0x14;
 
+/// Upper bound on a single frame's length (tag byte + payload).
+///
+/// In practice frames never come close: the BEAM writes with `{:packet, 4}`
+/// discipline, SPAWN/KILL/EOF payloads are small, and STDIN chunks are
+/// bounded by what one `Port.command` carries. The cap exists so a corrupt
+/// or malicious length prefix cannot trigger a multi-gigabyte allocation
+/// in `read_frame`; it is a robustness bound, not a protocol limit anyone
+/// should ever hit.
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 /// A single framed message: a tag byte plus its payload.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -45,6 +55,13 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Frame>> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame length must include at least the tag byte",
+        ));
+    }
+
+    if len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds the {MAX_FRAME_LEN}-byte cap"),
         ));
     }
 
@@ -134,6 +151,56 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let err = read_frame(&mut cursor).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn zero_length_frame_is_rejected() {
+        // A frame must contain at least the tag byte.
+        let buf = vec![0u8, 0, 0, 0];
+        let mut cursor = Cursor::new(buf);
+        let err = read_frame(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn oversized_length_prefix_is_rejected_before_allocating() {
+        // A corrupt prefix one byte over the cap must be rejected as
+        // InvalidData, not attempted as an allocation-then-EOF.
+        let len = (MAX_FRAME_LEN + 1) as u32;
+        let mut buf = len.to_be_bytes().to_vec();
+        buf.push(TAG_STDOUT);
+        let mut cursor = Cursor::new(buf);
+        let err = read_frame(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("cap"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn length_at_the_cap_is_not_rejected_by_the_cap() {
+        // Exactly MAX_FRAME_LEN passes the cap check and proceeds to the
+        // body read, which then fails as a truncation (UnexpectedEof, not
+        // InvalidData) because no body follows.
+        let len = MAX_FRAME_LEN as u32;
+        let buf = len.to_be_bytes().to_vec();
+        let mut cursor = Cursor::new(buf);
+        let err = read_frame(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn truncation_mid_length_prefix_is_an_error() {
+        // EOF after 1..3 bytes of the 4-byte length prefix is a truncated
+        // stream, not the clean-EOF-at-a-boundary case.
+        for prefix_len in 1..4 {
+            let buf = vec![0u8; prefix_len];
+            let mut cursor = Cursor::new(buf);
+            let err = read_frame(&mut cursor).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "prefix of {prefix_len} bytes"
+            );
+        }
     }
 
     #[test]
