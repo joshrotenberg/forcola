@@ -107,7 +107,7 @@ jobs:
 
       - name: Check tag matches mix.exs version
         run: |
-          version="$(grep -o 'version: "[^"]*"' mix.exs | head -1 | cut -d '"' -f 2)"
+          version="$(grep -o '@version "[^"]*"' mix.exs | head -1 | cut -d '"' -f 2)"
           if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
             echo "::error::mix.exs version ${version} does not match tag ${GITHUB_REF_NAME}"
             exit 1
