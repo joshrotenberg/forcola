@@ -1,0 +1,230 @@
+# Getting started
+
+Forcola runs OS processes through a small Rust shim that puts each child in
+its own process group and kills the whole group, SIGTERM then SIGKILL, when
+the run times out or the BEAM dies. This guide covers installation and the
+four execution modes.
+
+## Installation
+
+Add `forcola` to your dependencies:
+
+```elixir
+def deps do
+  [
+    {:forcola, "~> 0.1"}
+  ]
+end
+```
+
+Requires Elixir 1.18+ and OTP 27+. No Rust toolchain is needed on the five
+precompiled targets (macOS arm64 and x86-64, Linux x86-64 and arm64 glibc,
+x86-64 musl): the shim binary is downloaded from the matching GitHub Release
+and verified against a SHA256 checksum at compile time. On other targets, or
+to opt out of the download, set `FORCOLA_BUILD=1` to build the shim from
+source with cargo.
+
+## A first run
+
+`Forcola.run/2` runs a command to completion under the shim. The argument is
+`[binary | args]`, and `:timeout_ms` is required.
+
+```elixir
+{:ok, %Forcola.Result{status: 0, stdout: out}} =
+  Forcola.run(["echo", "hello"], timeout_ms: 5_000)
+```
+
+Any exit status is `{:ok, %Forcola.Result{}}`; callers branch on `:status`. A
+non-zero exit is a result, not an error:
+
+```elixir
+{:ok, %Forcola.Result{status: 1}} =
+  Forcola.run(["false"], timeout_ms: 5_000)
+```
+
+`:status` is the exit code for a normal exit, or `{:signal, number}` when the
+process died from a signal (for example `{:signal, 15}` for SIGTERM). See
+`Forcola.Result`.
+
+## Execution modes
+
+Four shapes, matching what CLI wrapper libraries need:
+
+| Mode | API | Use |
+|---|---|---|
+| Bounded run | `Forcola.run/2` | One-shot command with mandatory timeout |
+| Line stream | `Forcola.Stream.lines/2` | Line output consumed as an `Enumerable` |
+| Daemon | `Forcola.Daemon` | Long-running server under a supervision tree |
+| Duplex | `Forcola.Duplex` | Bidirectional stdin/stdout session |
+
+### Bounded run: `Forcola.run/2`
+
+A one-shot command with a mandatory timeout.
+
+```elixir
+case Forcola.run(["git", "clone", url, dir], timeout_ms: 60_000) do
+  {:ok, %Forcola.Result{status: 0}} -> :ok
+  {:ok, %Forcola.Result{status: code}} -> {:error, {:exit, code}}
+  {:error, {:timeout, %Forcola.Result{stdout: partial}}} -> {:error, :timeout}
+  {:error, {:spawn, reason}} -> {:error, {:spawn, reason}}
+end
+```
+
+Options:
+
+- `:timeout_ms` (required): on expiry the child's process group is killed
+  (SIGTERM, then SIGKILL after the kill grace) and
+  `{:error, {:timeout, partial_result}}` is returned with output captured so
+  far. The group is confirmed dead before the call returns, with one
+  exception described in the [process groups guide](process_groups.html).
+- `:kill_grace_ms`: SIGTERM-to-SIGKILL grace in milliseconds, default
+  `5_000`.
+- `:cd`: working directory.
+- `:env`: list of `{name, value}` strings.
+- `:merge_stderr`: route stderr into stdout, default `false`.
+
+Return shapes:
+
+- `{:ok, %Forcola.Result{status: status, stdout: out, stderr: err}}` for any
+  completed run. `status` is an exit code or `{:signal, n}`.
+- `{:error, {:timeout, %Forcola.Result{}}}` on timeout, carrying output
+  captured so far.
+- `{:error, {:spawn, reason}}` where `reason` is `:shim_not_found`, a string
+  reported by the shim, or `{:shim_exited, %Forcola.Result{}}`.
+
+### Line stream: `Forcola.Stream.lines/2`
+
+Stdout as a lazy stream of lines, for CLIs that emit NDJSON or line-oriented
+progress. Lines arrive without their trailing newline.
+
+```elixir
+Forcola.Stream.lines(["claude", "-p", prompt], timeout_ms: 300_000)
+|> Stream.map(&:json.decode/1)
+|> Enum.to_list()
+```
+
+Options: the same as `Forcola.run/2`. `:timeout_ms` is required and bounds the
+whole run, not the gap between lines (an idle-timeout option is tracked in
+[#33](https://github.com/joshrotenberg/forcola/issues/33)).
+
+Termination:
+
+- A zero exit ends the stream cleanly.
+- A non-zero exit, death by signal, timeout, or spawn failure raises
+  `Forcola.Stream.Error` after every line produced before death has been
+  emitted. Stderr captured during the run rides in the exception.
+- Halting the stream early (`Enum.take/2`, `Stream.take_while/2`, an exception
+  downstream) kills the process group and blocks until the shim confirms the
+  group is dead.
+
+### Daemon: `Forcola.Daemon`
+
+A long-running server under a supervision tree. When the GenServer terminates
+for any reason, including supervisor shutdown and owner crash, the shim kills
+the group and the terminate blocks until the group is confirmed dead.
+
+```elixir
+children = [
+  {Forcola.Daemon,
+   argv: ["redis-server", "--port", "6399"],
+   name: MyApp.Redis,
+   ready: fn -> match?({:ok, _}, :gen_tcp.connect(~c"localhost", 6399, [])) end}
+]
+```
+
+A daemon has no `:timeout_ms`; its bound is its supervisor. Passing
+`:timeout_ms` raises `ArgumentError`.
+
+Options:
+
+- `:argv` (required): `[binary | args]` as in `Forcola.run/2`.
+- `:name`: optional GenServer registration name.
+- `:cd`, `:env`, `:merge_stderr`: as in `Forcola.run/2`.
+- `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
+- `:output`: where child output goes, default `:logger`.
+- `:log_output`: `Logger` level for `output: :logger`, default `:info`.
+- `:log_prefix`: string prepended to each logged line, default `""`.
+- `:ready`: optional zero-arity readiness check.
+- `:ready_timeout_ms`: readiness deadline, default `5_000`.
+- `:ready_poll_ms`: readiness poll interval, default `100`.
+
+Output routing:
+
+- `output: :logger` (default): stdout and stderr are logged line by line at
+  `:log_output`, prefixed with `:log_prefix`.
+- `output: fun`: a 2-arity function called as `fun.(:stdout | :stderr, chunk)`
+  with raw chunks, from the daemon process.
+- `output: {:send, pid}`: `pid` receives
+  `{Forcola.Daemon, daemon_pid, {:stdout | :stderr, chunk}}` messages.
+
+Readiness: with `ready: fun`, `init` polls `fun.()` (every `:ready_poll_ms`)
+until it returns a truthy value, so `start_link` and supervisor startup block
+until the server accepts connections. If the check does not pass within
+`:ready_timeout_ms`, or the child exits first, the group is killed and
+`start_link` returns `{:error, :ready_timeout}` or
+`{:error, {:exited_before_ready, reason}}`.
+
+Exit and restart: when the child exits on its own the daemon stops. Status 0
+stops `:normal`, a non-zero status stops `{:exit_status, n}`, and death by
+signal stops `{:exit_signal, n}`. Under `restart: :permanent` any of these
+restarts the daemon; under `:transient` only the abnormal ones do.
+
+### Duplex: `Forcola.Duplex`
+
+A bidirectional stdin/stdout session, for interactive CLIs driven over stdin.
+The caller that opens the session is its owner and receives its messages.
+
+```elixir
+{:ok, session} =
+  Forcola.Duplex.open(["claude", "--input-format", "stream-json"], [])
+
+:ok = Forcola.Duplex.send_line(session, json)
+
+receive do
+  {:forcola_line, ^session, line} -> line
+end
+
+:ok = Forcola.Duplex.close(session)
+```
+
+There is no `:timeout_ms`; the session is bounded by its owner process and
+`close/1`. Passing `:timeout_ms` raises `ArgumentError`.
+
+Options:
+
+- `:cd`, `:env`, `:merge_stderr`: as in `Forcola.run/2`.
+- `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
+
+API:
+
+- `send_line/2`: writes a line to the child's stdin (a newline is appended).
+  Returns `{:error, :closed}` once the session is over or stdin was closed
+  with `send_eof/1`.
+- `send_eof/1`: closes the child's stdin without killing the group, for CLIs
+  that exit when input ends. The child's own exit then arrives as a
+  `:forcola_exit` message.
+- `close/1`: kills the child's process group and blocks until the shim
+  confirms the group is dead. Idempotent.
+
+Messages to the owner:
+
+- `{:forcola_line, session, line}`: a stdout line, without its trailing
+  newline.
+- `{:forcola_stderr, session, line}`: a stderr line, unless `merge_stderr:
+  true` routed stderr into `:forcola_line`.
+- `{:forcola_exit, session, status}`: the child exited on its own. `status`
+  is the exit code, `{:signal, n}` for death by signal,
+  `{:spawn_error, reason}` if it never started, or `:shim_exited` if the shim
+  died without reporting. The session is over; `close/1` is not required.
+
+A spawn failure is asynchronous: `open/2` still returns `{:ok, session}` and
+the failure arrives as `{:forcola_exit, session, {:spawn_error, reason}}`.
+
+## Next steps
+
+- The [process groups guide](process_groups.html) covers the kill mechanism
+  and its guarantees in depth.
+- The [adoption guide](adopting_forcola.html) covers slotting Forcola into an
+  existing CLI wrapper library.
+- The [alternatives guide](alternatives.html) compares Forcola with other
+  external-process libraries for the BEAM.
