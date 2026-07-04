@@ -12,7 +12,7 @@ marked "tested" were verified empirically on macOS with Elixir 1.20 / OTP 29.
 | [Porcelain](https://github.com/alco/porcelain) + goon | Go middleman, manual download | Closes child stdin and waits; never kills | No | goon fetched by hand; last goon release 2014 | Unmaintained (last release 2016, last commit 2020) |
 | [Rambo](https://github.com/jayjun/rambo) | Rust shim per call | SIGKILLs direct child on stdin EOF | No | Bundled x86-64 binaries only; broken out of the box on Apple Silicon (tested) | Dormant (last release March 2021) |
 | [exile](https://github.com/akash-akya/exile) | NIF IO + spawner that execs into the command | Normal exits yes; kill -9 of BEAM orphans the child (tested) | No | C compiler (elixir_make) | Maintained, single author (0.14.0, Feb 2026) |
-| forcola | Rust shim per command | stdin EOF kills the process group, covers kill -9; death confirmed before EXIT | Yes (setsid + kill(-pgid), TERM then KILL) | None on 5 precompiled targets; cargo elsewhere | New (v0.1.0) |
+| forcola | Rust shim per command | stdin EOF kills the process group, covers kill -9; death confirmed before EXIT | Yes (setsid + kill(-pgid), TERM then KILL); opt-in Linux cgroup v2 also contains daemonizers | None on 5 precompiled targets; cargo elsewhere | New (v0.1.0) |
 
 ## erlexec
 
@@ -35,8 +35,12 @@ Solves the same core problem as forcola with a per-command C wrapper, and on
 Linux adds cgroup containment that kills entire process trees, including
 deliberate daemonizers. Without cgroups it kills the direct child only, so
 grandchildren escape; forcola's group kill covers ordinary grandchildren
-everywhere but cannot contain a deliberate daemonizer on macOS either. On
-Nerves or embedded Linux, MuonTrap is the native choice.
+everywhere. forcola now has its own opt-in Linux cgroup v2 layer (`cgroup:
+true`, [#15](https://github.com/joshrotenberg/forcola/issues/15)) that contains
+deliberate daemonizers under a delegated subtree; MuonTrap's cgroup support is
+Nerves-native and more mature here, where forcola's is new and requires cgroup
+delegation. On macOS neither can contain a deliberate daemonizer. On Nerves or
+embedded Linux, MuonTrap is the native choice.
 
 ## exile
 
@@ -64,9 +68,13 @@ forcola's release workflow is designed around.
   ([#31](https://github.com/joshrotenberg/forcola/issues/31)): a straight
   `setgroups`/`setgid`/`setuid` from a privileged shim, not sudo/SUID or
   capabilities.
-- You need Linux cgroup containment of daemonizers today: MuonTrap (or
-  systemd-run). forcola tracks an optional cgroup layer in
-  [#15](https://github.com/joshrotenberg/forcola/issues/15).
+- You need Linux cgroup containment of daemonizers: forcola now has an opt-in
+  cgroup v2 layer (`cgroup: true`,
+  [#15](https://github.com/joshrotenberg/forcola/issues/15)) that contains
+  daemonizers under a delegated cgroup v2 subtree (systemd `Delegate=yes` or
+  `systemd-run --scope`). MuonTrap's Nerves-native cgroup support is more mature
+  and does not require you to arrange delegation; on Nerves or embedded Linux it
+  is the native choice.
 - You need backpressure-first streaming and accept the kill -9 orphan risk:
   exile. forcola tracks a backpressure mode in
   [#32](https://github.com/joshrotenberg/forcola/issues/32).

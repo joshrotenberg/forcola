@@ -23,7 +23,7 @@
 //! BEAM -> shim:
 //!   0x01 SPAWN   payload: JSON {argv, cd, env, merge_stderr, timeout_ms,
 //!                               kill_grace_ms, pty, pty_rows, pty_cols,
-//!                               user, group}
+//!                               user, group, cgroup}
 //!   0x02 STDIN   payload: bytes for the child's stdin (duplex mode)
 //!   0x03 EOF     close the child's stdin
 //!   0x04 KILL    kill the group now
@@ -31,9 +31,10 @@
 //! shim -> BEAM:
 //!   0x11 STDOUT  payload: bytes from the child's stdout
 //!   0x12 STDERR  payload: bytes from the child's stderr
-//!   0x13 EXIT    payload: JSON {status | signal, timed_out}
+//!   0x13 EXIT    payload: JSON {status | signal, timed_out, contained}
 //!   0x14 ERROR   payload: JSON {reason} (spawn failure etc.)
 
+mod cgroup;
 mod frame;
 mod privdrop;
 mod protocol;

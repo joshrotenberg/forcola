@@ -47,6 +47,16 @@ pub struct SpawnRequest {
     /// gid. Absent leaves the gid derived from `user`, or unchanged.
     #[serde(default)]
     pub group: Option<GroupSpec>,
+    /// Opt in to Linux cgroup v2 containment. When true and a delegated cgroup
+    /// v2 subtree is available, the child is placed in a dedicated child cgroup
+    /// before exec so descendants that escape the process group (deliberate
+    /// daemonizers) are still reaped via `cgroup.kill`. Linux-only; on other
+    /// platforms, on non-cgroup-v2 systems, or when the subtree is not
+    /// delegated, it degrades to process-group kill with a warning. The EXIT
+    /// report's `contained` field says which mechanism was used. Default false
+    /// leaves the kill path unchanged.
+    #[serde(default)]
+    pub cgroup: bool,
 }
 
 /// A user identity in a SPAWN payload: either a name to resolve or a raw
@@ -83,6 +93,11 @@ pub struct ExitReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
     pub timed_out: bool,
+    /// Whether Linux cgroup v2 containment was actually active for this run.
+    /// `true` only when `cgroup: true` was requested and a delegated cgroup v2
+    /// subtree was available; `false` on the default path, on fallback, and on
+    /// non-Linux platforms. Reports which kill mechanism was used.
+    pub contained: bool,
 }
 
 /// Payload of an outbound ERROR frame.
@@ -110,6 +125,14 @@ mod tests {
         assert_eq!(req.pty_cols, None);
         assert_eq!(req.user, None);
         assert_eq!(req.group, None);
+        assert!(!req.cgroup);
+    }
+
+    #[test]
+    fn spawn_request_cgroup_opt_in() {
+        let json = r#"{"argv": ["sleep", "1"], "cgroup": true}"#;
+        let req: SpawnRequest = serde_json::from_str(json).unwrap();
+        assert!(req.cgroup);
     }
 
     #[test]
@@ -161,9 +184,11 @@ mod tests {
             status: Some(0),
             signal: None,
             timed_out: false,
+            contained: false,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"status\":0"));
         assert!(!json.contains("signal"));
+        assert!(json.contains("\"contained\":false"));
     }
 }
