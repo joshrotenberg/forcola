@@ -19,10 +19,11 @@ marked "tested" were verified empirically on macOS with Elixir 1.20 / OTP 29.
 The most capable and most mature option: a single C++ port program with pty
 support, user switching, and opt-in process-group kill, actively maintained
 since 2003. Its costs are a C++ toolchain at dependency compile time and a
-larger API surface. If you need a pty
-([#30](https://github.com/joshrotenberg/forcola/issues/30)) or run-as-user
-([#31](https://github.com/joshrotenberg/forcola/issues/31)), choose erlexec;
-forcola does neither today.
+larger API surface. forcola now supports a pty in `Forcola.Duplex`
+(`pty: true`), so a pty alone is no longer a reason to reach for erlexec;
+forcola's pty is Duplex-only and does no RFC 4254 option negotiation. If you
+need run-as-user ([#31](https://github.com/joshrotenberg/forcola/issues/31)),
+choose erlexec; forcola does not switch users today.
 
 ## MuonTrap
 
@@ -54,8 +55,9 @@ forcola's release workflow is designed around.
 
 ## Choosing something else
 
-- You need a pty or run-as-user: erlexec ([#30](https://github.com/joshrotenberg/forcola/issues/30),
-  [#31](https://github.com/joshrotenberg/forcola/issues/31)).
+- You need run-as-user: erlexec
+  ([#31](https://github.com/joshrotenberg/forcola/issues/31)). forcola
+  supports a pty in `Forcola.Duplex` (`pty: true`) but does not switch users.
 - You need Linux cgroup containment of daemonizers today: MuonTrap (or
   systemd-run). forcola tracks an optional cgroup layer in
   [#15](https://github.com/joshrotenberg/forcola/issues/15).

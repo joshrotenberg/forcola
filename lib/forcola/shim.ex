@@ -103,8 +103,23 @@ defmodule Forcola.Shim do
     |> maybe_put("env", encode_env(Keyword.get(opts, :env)))
     |> maybe_put("timeout_ms", Keyword.get(opts, :timeout_ms))
     |> maybe_put("kill_grace_ms", Keyword.get(opts, :kill_grace_ms))
+    |> put_pty(opts)
     |> :json.encode()
     |> IO.iodata_to_binary()
+  end
+
+  # pty fields are added only when a pty is requested, so the SPAWN payload
+  # for non-pty callers is unchanged. The shim defaults pty to false when
+  # the key is absent.
+  defp put_pty(map, opts) do
+    if Keyword.get(opts, :pty, false) do
+      map
+      |> Map.put("pty", true)
+      |> maybe_put("pty_rows", Keyword.get(opts, :pty_rows))
+      |> maybe_put("pty_cols", Keyword.get(opts, :pty_cols))
+    else
+      map
+    end
   end
 
   defp encode_env(nil), do: nil

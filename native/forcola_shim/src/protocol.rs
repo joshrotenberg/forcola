@@ -20,6 +20,19 @@ pub struct SpawnRequest {
     /// Milliseconds to wait after SIGTERM before escalating to SIGKILL.
     #[serde(default = "default_kill_grace_ms")]
     pub kill_grace_ms: u64,
+    /// Run the child under a pseudo-terminal. When true, the child's
+    /// stdin/stdout/stderr all connect to the pty slave and its output is
+    /// framed back as STDOUT (0x11); a pty merges stderr into the terminal,
+    /// so there is no separate STDERR stream in pty mode. Default false
+    /// leaves the pipe path unchanged.
+    #[serde(default)]
+    pub pty: bool,
+    /// Initial pty window height in rows. Applied only in pty mode.
+    #[serde(default)]
+    pub pty_rows: Option<u16>,
+    /// Initial pty window width in columns. Applied only in pty mode.
+    #[serde(default)]
+    pub pty_cols: Option<u16>,
 }
 
 fn default_kill_grace_ms() -> u64 {
@@ -56,6 +69,18 @@ mod tests {
         assert!(!req.merge_stderr);
         assert_eq!(req.timeout_ms, None);
         assert_eq!(req.kill_grace_ms, 5_000);
+        assert!(!req.pty);
+        assert_eq!(req.pty_rows, None);
+        assert_eq!(req.pty_cols, None);
+    }
+
+    #[test]
+    fn spawn_request_pty_fields() {
+        let json = r#"{"argv": ["sh"], "pty": true, "pty_rows": 24, "pty_cols": 80}"#;
+        let req: SpawnRequest = serde_json::from_str(json).unwrap();
+        assert!(req.pty);
+        assert_eq!(req.pty_rows, Some(24));
+        assert_eq!(req.pty_cols, Some(80));
     }
 
     #[test]

@@ -72,6 +72,17 @@ fn spawn_payload(
     serde_json::to_vec(&obj).unwrap()
 }
 
+fn pty_spawn_payload(argv: &[&str], kill_grace_ms: Option<u64>) -> Vec<u8> {
+    let mut obj = serde_json::json!({
+        "argv": argv,
+        "pty": true,
+    });
+    if let Some(g) = kill_grace_ms {
+        obj["kill_grace_ms"] = serde_json::json!(g);
+    }
+    serde_json::to_vec(&obj).unwrap()
+}
+
 /// Reads frames until an EXIT or ERROR frame is seen, collecting stdout
 /// bytes along the way. Returns (stdout_bytes, exit_frame).
 fn drain_until_exit<R: Read>(r: &mut R) -> (Vec<u8>, Option<Frame>) {
@@ -426,6 +437,131 @@ fn merge_stderr_routes_into_stdout_stream() {
 
     let (out, _exit) = drain_until_exit(&mut stdout);
     assert_eq!(String::from_utf8_lossy(&out).trim(), "to-stderr");
+
+    let _ = child.wait();
+}
+
+#[test]
+fn without_pty_child_sees_no_tty() {
+    // The baseline: over pipes, the child's stdin and stdout are not ttys.
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    let script = "test -t 0 && echo IN_TTY || echo IN_NOTTY; \
+                  test -t 1 && echo OUT_TTY || echo OUT_NOTTY";
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &spawn_payload(&["sh", "-c", script], None, None, false),
+    );
+
+    let (out, _exit) = drain_until_exit(&mut stdout);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("IN_NOTTY"),
+        "stdin was a tty over pipes: {text}"
+    );
+    assert!(
+        text.contains("OUT_NOTTY"),
+        "stdout was a tty over pipes: {text}"
+    );
+
+    let _ = child.wait();
+}
+
+#[test]
+fn pty_child_sees_a_tty() {
+    // The load-bearing proof: under a pty, the child's stdin and stdout are
+    // real ttys. A pty also merges stderr onto the terminal, so all lines
+    // arrive on the single STDOUT stream.
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    let script = "test -t 0 && echo IN_TTY || echo IN_NOTTY; \
+                  test -t 1 && echo OUT_TTY || echo OUT_NOTTY; \
+                  test -t 2 && echo ERR_TTY || echo ERR_NOTTY";
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &pty_spawn_payload(&["sh", "-c", script], None),
+    );
+
+    let (out, _exit) = drain_until_exit(&mut stdout);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("IN_TTY"),
+        "stdin was not a tty under pty: {text}"
+    );
+    assert!(
+        text.contains("OUT_TTY"),
+        "stdout was not a tty under pty: {text}"
+    );
+    assert!(
+        text.contains("ERR_TTY"),
+        "stderr was not a tty under pty: {text}"
+    );
+
+    let _ = child.wait();
+}
+
+#[test]
+fn pty_group_kill_reaches_grandchild() {
+    // Mirror of group_kill_reaches_grandchild, but with the child under a
+    // pty: the child still leads its own process group, so the group kill
+    // must still reach a forked grandchild.
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    let script = "sleep 60 & echo GRANDCHILD_PID=$!; sleep 60";
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &pty_spawn_payload(&["sh", "-c", script], Some(200)),
+    );
+
+    let mut stdout_bytes = Vec::new();
+    let mut grandchild_pid: Option<i32> = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while grandchild_pid.is_none() && Instant::now() < deadline {
+        match read_frame(&mut stdout) {
+            Some(f) if f.tag == TAG_STDOUT => {
+                stdout_bytes.extend_from_slice(&f.payload);
+                let text = String::from_utf8_lossy(&stdout_bytes);
+                if let Some(line) = text.lines().find(|l| l.starts_with("GRANDCHILD_PID=")) {
+                    grandchild_pid = line
+                        .trim_start_matches("GRANDCHILD_PID=")
+                        .trim()
+                        .parse()
+                        .ok();
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    let grandchild_pid = grandchild_pid.expect("did not observe grandchild pid under pty");
+
+    write_frame(&mut stdin, TAG_KILL, &[]);
+
+    let (_out, exit_frame) = drain_until_exit(&mut stdout);
+    assert!(exit_frame.is_some(), "expected an EXIT frame after KILL");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut alive = true;
+    while Instant::now() < deadline {
+        alive = unsafe { libc_kill(grandchild_pid, 0) == 0 };
+        if !alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !alive,
+        "grandchild pid {grandchild_pid} survived a pty group kill"
+    );
 
     let _ = child.wait();
 }

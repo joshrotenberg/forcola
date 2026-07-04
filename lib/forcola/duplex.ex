@@ -22,7 +22,9 @@ defmodule Forcola.Duplex do
       once its newline arrives; a final partial line is delivered before
       the exit message.
     * `{:forcola_stderr, session, line}` - a stderr line, unless
-      `merge_stderr: true` routed stderr into `:forcola_line`.
+      `merge_stderr: true` routed stderr into `:forcola_line`. Under
+      `pty: true` a terminal carries a single stream, so stderr is always
+      merged into `:forcola_line` and no `:forcola_stderr` messages arrive.
     * `{:forcola_exit, session, status}` - the child exited on its own;
       `status` is the exit code, `{:signal, n}` for death by signal,
       `{:spawn_error, reason}` if it never started, or `:shim_exited` if
@@ -41,6 +43,19 @@ defmodule Forcola.Duplex do
   For CLIs that exit when their stdin closes, `send_eof/1` closes the
   child's stdin without killing anything; the child's own exit then
   arrives as a `:forcola_exit` message.
+
+  ## Pseudo-terminal
+
+  `open/2` with `pty: true` runs the child under a pseudo-terminal instead
+  of pipes. CLIs that detect a tty behave as they do in a real terminal:
+  line buffering rather than block buffering, color output, progress
+  rendering, and interactive prompts (password entry, pagers, REPLs, TUIs).
+
+  A terminal carries one bidirectional stream, so a pty merges the child's
+  stdout and stderr: all output arrives as `{:forcola_line, ...}` and no
+  `:forcola_stderr` messages are produced. `merge_stderr: false` contradicts
+  this and raises `ArgumentError`. An initial window size can be set with
+  `:pty_rows` and `:pty_cols`; there is no dynamic resize yet.
   """
 
   use GenServer
@@ -66,6 +81,11 @@ defmodule Forcola.Duplex do
 
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace, default `5_000`.
+    * `:pty` - run the child under a pseudo-terminal (default `false`). In
+      pty mode stderr is merged into `:forcola_line` and no `:forcola_stderr`
+      messages arrive; passing `merge_stderr: false` raises `ArgumentError`.
+    * `:pty_rows`, `:pty_cols` - initial pty window size, applied only when
+      `pty: true`.
 
   There is no `:timeout_ms`; the session is bounded by its owner process
   and `close/1`. Passing `:timeout_ms` raises `ArgumentError`.
@@ -226,6 +246,12 @@ defmodule Forcola.Duplex do
     if Keyword.has_key?(opts, :timeout_ms) do
       raise ArgumentError,
             "Forcola.Duplex takes no :timeout_ms; a session's bound is its owner and close/1"
+    end
+
+    if Keyword.get(opts, :pty, false) and Keyword.get(opts, :merge_stderr, true) == false do
+      raise ArgumentError,
+            "Forcola.Duplex :pty inherently merges stderr into the terminal; " <>
+              "merge_stderr: false is incompatible with pty: true"
     end
 
     unless Enum.all?(argv, &is_binary/1) do

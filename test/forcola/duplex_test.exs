@@ -17,6 +17,56 @@ defmodule Forcola.DuplexTest do
         Forcola.Duplex.open(["/bin/echo", :hi], [])
       end
     end
+
+    test "pty: true with merge_stderr: false is rejected" do
+      assert_raise ArgumentError, ~r/merge_stderr: false is incompatible/, fn ->
+        Forcola.Duplex.open(["/bin/cat"], pty: true, merge_stderr: false)
+      end
+    end
+  end
+
+  describe "pty" do
+    # A pty is a real terminal: by default it echoes typed input and
+    # translates the child's newlines to CRLF (ONLCR), so lines arrive with
+    # a trailing "\r". These tests put the terminal into a plain mode first
+    # (stty -echo -onlcr) so assertions match the child's own output rather
+    # than terminal artifacts; that this works at all is the proof the child
+    # is under a real tty.
+    test "a child under a pty detects a tty on stdin and stdout" do
+      script =
+        ~S(stty -echo -onlcr; ) <>
+          ~S(test -t 0 && echo IN_TTY || echo IN_NOTTY; ) <>
+          ~S(test -t 1 && echo OUT_TTY || echo OUT_NOTTY; ) <>
+          ~S(while read l; do echo "got-$l"; done)
+
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", script], pty: true, kill_grace_ms: 1_000)
+
+      assert_receive {:forcola_line, ^session, "IN_TTY"}, 10_000
+      assert_receive {:forcola_line, ^session, "OUT_TTY"}, 10_000
+
+      :ok = Forcola.Duplex.send_line(session, "hi")
+      assert_receive {:forcola_line, ^session, "got-hi"}, 10_000
+
+      :ok = Forcola.Duplex.close(session)
+    end
+
+    test "stderr is merged into :forcola_line and no :forcola_stderr arrives" do
+      # Write to stderr, then to stdout. Under a pty both land on the one
+      # terminal, so both arrive as :forcola_line in order and nothing
+      # arrives as :forcola_stderr.
+      script = ~S(stty -echo -onlcr; while read l; do echo "err-$l" >&2; echo "out-$l"; done)
+
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", script], pty: true, kill_grace_ms: 1_000)
+
+      :ok = Forcola.Duplex.send_line(session, "x")
+      assert_receive {:forcola_line, ^session, "err-x"}, 10_000
+      assert_receive {:forcola_line, ^session, "out-x"}, 10_000
+      refute_receive {:forcola_stderr, ^session, _}, 200
+
+      :ok = Forcola.Duplex.close(session)
+    end
   end
 
   describe "round-trip" do
