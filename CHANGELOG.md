@@ -1,0 +1,19 @@
+# Changelog
+
+## 0.1.0 (2026-07-04)
+
+
+### Features
+
+* Forcola.Daemon supervised long-running processes (closes [#5](https://github.com/joshrotenberg/forcola/issues/5)) ([#14](https://github.com/joshrotenberg/forcola/issues/14)) ([4768bde](https://github.com/joshrotenberg/forcola/commit/4768bde2fac36c1c3f160718b15c33c09c6e134f))
+* Forcola.Duplex bidirectional stdin/stdout sessions (closes [#6](https://github.com/joshrotenberg/forcola/issues/6)) ([#18](https://github.com/joshrotenberg/forcola/issues/18)) ([95a9277](https://github.com/joshrotenberg/forcola/commit/95a92774f5992f9ea71ebf035d4e0dc6a3617c7c))
+* Forcola.run/2 bounded one-shot execution (closes [#3](https://github.com/joshrotenberg/forcola/issues/3)) ([#12](https://github.com/joshrotenberg/forcola/issues/12)) ([ebdb25f](https://github.com/joshrotenberg/forcola/commit/ebdb25fa1a493358313a512a041408ccba69decc))
+* Forcola.Stream.lines/2 line streaming (closes [#4](https://github.com/joshrotenberg/forcola/issues/4)) ([#13](https://github.com/joshrotenberg/forcola/issues/13)) ([e44c39f](https://github.com/joshrotenberg/forcola/commit/e44c39f6ef9cc25f27e0980e707eb2ff2525c7e0))
+* implement forcola_shim (closes [#2](https://github.com/joshrotenberg/forcola/issues/2)) ([#11](https://github.com/joshrotenberg/forcola/issues/11)) ([0fe51fd](https://github.com/joshrotenberg/forcola/commit/0fe51fd86808026cde65c1ce3132a98cfa6c3268))
+* scaffold forcola ([#1](https://github.com/joshrotenberg/forcola/issues/1)) ([d9b28e6](https://github.com/joshrotenberg/forcola/commit/d9b28e635bd161a18a7b6f9a7016f67efe3d0092))
+
+
+### Bug Fixes
+
+* deflake sigterm_ignoring_child_is_sigkilled_after_grace (closes [#19](https://github.com/joshrotenberg/forcola/issues/19)) ([#20](https://github.com/joshrotenberg/forcola/issues/20)) ([9e23ca4](https://github.com/joshrotenberg/forcola/commit/9e23ca4ebe0f148e2f61590e5f4d92166e237b14))
+* distinguish ESRCH from EPERM in group_alive (closes [#16](https://github.com/joshrotenberg/forcola/issues/16)) ([#17](https://github.com/joshrotenberg/forcola/issues/17)) ([92b53e4](https://github.com/joshrotenberg/forcola/commit/92b53e4e70dd1c1ae1744d530ed55024adcb669d))
