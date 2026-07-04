@@ -21,9 +21,13 @@ support, user switching, and opt-in process-group kill, actively maintained
 since 2003. Its costs are a C++ toolchain at dependency compile time and a
 larger API surface. forcola now supports a pty in `Forcola.Duplex`
 (`pty: true`), so a pty alone is no longer a reason to reach for erlexec;
-forcola's pty is Duplex-only and does no RFC 4254 option negotiation. If you
-need run-as-user ([#31](https://github.com/joshrotenberg/forcola/issues/31)),
-choose erlexec; forcola does not switch users today.
+forcola's pty is Duplex-only and does no RFC 4254 option negotiation. forcola
+also does a basic run-as-user drop now
+([#31](https://github.com/joshrotenberg/forcola/issues/31)): `:user`/`:group`
+options do a straight `setgroups`/`setgid`/`setuid` from a privileged shim.
+erlexec goes further, with a sudo/SUID helper for privilege escalation and
+Linux capability management; forcola does neither. Choose erlexec when you need
+those.
 
 ## MuonTrap
 
@@ -55,9 +59,11 @@ forcola's release workflow is designed around.
 
 ## Choosing something else
 
-- You need run-as-user: erlexec
-  ([#31](https://github.com/joshrotenberg/forcola/issues/31)). forcola
-  supports a pty in `Forcola.Duplex` (`pty: true`) but does not switch users.
+- You need privilege escalation via a sudo/SUID helper, or Linux capability
+  management: erlexec. forcola does a basic uid/gid drop with `:user`/`:group`
+  ([#31](https://github.com/joshrotenberg/forcola/issues/31)): a straight
+  `setgroups`/`setgid`/`setuid` from a privileged shim, not sudo/SUID or
+  capabilities.
 - You need Linux cgroup containment of daemonizers today: MuonTrap (or
   systemd-run). forcola tracks an optional cgroup layer in
   [#15](https://github.com/joshrotenberg/forcola/issues/15).

@@ -25,6 +25,10 @@ defmodule Forcola.Daemon do
     * `:argv` - required, `[binary | args]` as in `Forcola.run/2`.
     * `:name` - optional GenServer registration name.
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
+    * `:user`, `:group` - run the child as a different user/group, as in
+      `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
+      privileged shim; failures fail closed and surface as the daemon's
+      normal spawn-error exit.
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace, default `5_000`.
     * `:output` - where child output goes; see below. Default `:logger`.
     * `:log_output` - `Logger` level for `output: :logger`, default `:info`.

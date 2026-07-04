@@ -33,6 +33,42 @@ pub struct SpawnRequest {
     /// Initial pty window width in columns. Applied only in pty mode.
     #[serde(default)]
     pub pty_cols: Option<u16>,
+    /// Run the child as this user. A JSON string is a username to resolve
+    /// against the passwd database; a JSON number is a numeric uid used
+    /// directly. The user's primary gid and supplementary groups are taken
+    /// from the passwd/group database unless `group` overrides the gid.
+    /// Absent leaves the child running as the shim's own user.
+    #[serde(default)]
+    pub user: Option<UserSpec>,
+    /// Run the child with this group as its primary gid. A JSON string is a
+    /// group name to resolve; a JSON number is a numeric gid used directly.
+    /// When given without `user`, the supplementary group list is cleared to
+    /// just this gid. When given with `user`, it overrides the user's primary
+    /// gid. Absent leaves the gid derived from `user`, or unchanged.
+    #[serde(default)]
+    pub group: Option<GroupSpec>,
+}
+
+/// A user identity in a SPAWN payload: either a name to resolve or a raw
+/// numeric uid.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum UserSpec {
+    /// Numeric uid, used directly with no passwd lookup.
+    Id(u32),
+    /// Username, resolved against the passwd database in the parent.
+    Name(String),
+}
+
+/// A group identity in a SPAWN payload: either a name to resolve or a raw
+/// numeric gid.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum GroupSpec {
+    /// Numeric gid, used directly with no group lookup.
+    Id(u32),
+    /// Group name, resolved against the group database in the parent.
+    Name(String),
 }
 
 fn default_kill_grace_ms() -> u64 {
@@ -72,6 +108,24 @@ mod tests {
         assert!(!req.pty);
         assert_eq!(req.pty_rows, None);
         assert_eq!(req.pty_cols, None);
+        assert_eq!(req.user, None);
+        assert_eq!(req.group, None);
+    }
+
+    #[test]
+    fn spawn_request_user_and_group_names() {
+        let json = r#"{"argv": ["id"], "user": "nobody", "group": "staff"}"#;
+        let req: SpawnRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.user, Some(UserSpec::Name("nobody".to_string())));
+        assert_eq!(req.group, Some(GroupSpec::Name("staff".to_string())));
+    }
+
+    #[test]
+    fn spawn_request_user_and_group_ids() {
+        let json = r#"{"argv": ["id"], "user": 1000, "group": 20}"#;
+        let req: SpawnRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.user, Some(UserSpec::Id(1000)));
+        assert_eq!(req.group, Some(GroupSpec::Id(20)));
     }
 
     #[test]

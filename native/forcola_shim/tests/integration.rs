@@ -72,6 +72,15 @@ fn spawn_payload(
     serde_json::to_vec(&obj).unwrap()
 }
 
+/// SPAWN payload carrying a `user` (as a JSON string name).
+fn user_spawn_payload(argv: &[&str], user: &str) -> Vec<u8> {
+    let obj = serde_json::json!({
+        "argv": argv,
+        "user": user,
+    });
+    serde_json::to_vec(&obj).unwrap()
+}
+
 fn pty_spawn_payload(argv: &[&str], kill_grace_ms: Option<u64>) -> Vec<u8> {
     let mut obj = serde_json::json!({
         "argv": argv,
@@ -258,9 +267,16 @@ fn group_kill_reaches_grandchild() {
 // test suite: call the libc `kill` symbol directly via `extern "C"`.
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn getuid() -> u32;
 }
 unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
     kill(pid, sig)
+}
+
+/// The username the test process runs as, via `id -un`.
+fn current_username() -> String {
+    let out = Command::new("id").arg("-un").output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 #[test]
@@ -561,6 +577,101 @@ fn pty_group_kill_reaches_grandchild() {
     assert!(
         !alive,
         "grandchild pid {grandchild_pid} survived a pty group kill"
+    );
+
+    let _ = child.wait();
+}
+
+#[test]
+fn run_as_current_user_by_name_succeeds() {
+    // Requesting the user the shim already runs as is a no-op drop: it must
+    // succeed and the command must run. Prove it ran by matching `id -u`.
+    let me = current_username();
+    let my_uid = unsafe { getuid() };
+
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &user_spawn_payload(&["id", "-u"], &me),
+    );
+
+    let (out, exit_frame) = drain_until_exit(&mut stdout);
+    let exit_frame = exit_frame.expect("expected an EXIT frame");
+    assert_eq!(
+        exit_frame.tag, TAG_EXIT,
+        "no-op drop to the current user should run, not error"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out).trim(),
+        my_uid.to_string(),
+        "command did not run as the current user"
+    );
+
+    let _ = child.wait();
+}
+
+#[test]
+fn run_as_different_user_fails_closed() {
+    // As a non-root user, requesting a DIFFERENT user must fail closed: an
+    // ERROR frame, and the command must NOT have run. Skip under root, where
+    // the drop would actually succeed.
+    if unsafe { getuid() } == 0 {
+        eprintln!("skipping run_as_different_user_fails_closed: running as root");
+        return;
+    }
+
+    // A path the command would create if it ran; assert it stays absent.
+    let marker = std::env::temp_dir().join(format!("forcola-privdrop-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let marker_str = marker.to_str().unwrap();
+
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    // Target root/uid 0, which a non-root user cannot become.
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &user_spawn_payload(&["sh", "-c", &format!("touch {marker_str}")], "root"),
+    );
+
+    let (_out, frame) = drain_until_exit(&mut stdout);
+    let frame = frame.expect("expected a terminal frame");
+    assert_eq!(
+        frame.tag, TAG_ERROR,
+        "dropping to a different user should fail closed with ERROR, not run"
+    );
+    assert!(
+        !marker.exists(),
+        "the command ran despite the failed privilege drop (side effect present)"
+    );
+
+    let _ = std::fs::remove_file(&marker);
+    let _ = child.wait();
+}
+
+#[test]
+fn unknown_user_is_a_clean_error() {
+    // An unknown username resolves to an ERROR frame, with no exec.
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &user_spawn_payload(&["echo", "should-not-run"], "forcola-no-such-user-zzz"),
+    );
+
+    let frame = read_frame(&mut stdout).expect("expected a frame");
+    assert_eq!(
+        frame.tag, TAG_ERROR,
+        "unknown user should be an ERROR frame"
     );
 
     let _ = child.wait();

@@ -65,6 +65,32 @@ defmodule Forcola do
     * `:cd` - working directory.
     * `:env` - list of `{name, value}` strings.
     * `:merge_stderr` - route stderr into stdout; default `false`.
+    * `:user` - run the child as this user, a string username or an
+      integer uid. The user's primary gid and supplementary groups are
+      taken from the passwd/group database unless `:group` overrides the
+      gid. See ["Running as a different user"](#run/2-running-as-a-different-user).
+    * `:group` - run the child with this group as its primary gid, a
+      string group name or an integer gid. Given without `:user` it sets
+      the gid (and clears supplementary groups to just that gid) without
+      changing the uid; given with `:user` it overrides the user's
+      primary gid.
+
+  ## Running as a different user
+
+  `:user`/`:group` make the shim drop privileges (`setgroups`, then
+  `setgid`, then `setuid`, in that order) in the child before exec. This
+  is POSIX-only, a one-way drop, and requires the shim process itself to
+  run with enough privilege to drop: root, or `CAP_SETUID`/`CAP_SETGID`
+  on Linux. Requesting the user the shim already runs as is a no-op and
+  always succeeds.
+
+  It fails closed. If the user or group cannot be resolved, or the shim
+  lacks the privilege to drop, the child is never executed and the call
+  returns the mode's normal spawn error (`{:error, {:spawn, reason}}` for
+  `run/2`). The command never runs as the shim's own (possibly
+  privileged) user when a different user was requested. Names are
+  resolved in the parent before fork; only the numeric syscalls run in
+  the child.
 
   Any exit status is `{:ok, %Forcola.Result{}}`; callers branch on
   `:status`. A non-zero exit is a result, not an error.

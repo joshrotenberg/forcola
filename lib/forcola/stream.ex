@@ -119,8 +119,10 @@ defmodule Forcola.Stream do
   @doc """
   Run `argv` and return its stdout as a lazy stream of lines.
 
-  Takes the same options as `Forcola.run/2`; `:timeout_ms` is required
-  and bounds the whole run, not the gap between lines.
+  Takes the same options as `Forcola.run/2`, including `:user`/`:group`
+  for running the child as a different user (POSIX-only, fail-closed,
+  privileged shim required); `:timeout_ms` is required and bounds the
+  whole run, not the gap between lines.
 
   `:idle_timeout_ms` (optional, milliseconds; default `nil` = disabled)
   bounds the gap between output frames: if no STDOUT or STDERR data
