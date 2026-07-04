@@ -8,7 +8,9 @@ use crate::frame::{
 use crate::protocol::{ErrorReport, ExitReport, SpawnRequest};
 
 use rustix::process::{self, Pid, Signal};
+use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -69,7 +71,7 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         }
     };
 
-    let mut child = match spawn_child(&request) {
+    let (mut child, pty_master) = match spawn_child(&request) {
         Ok(c) => c,
         Err(e) => {
             write_error(&out, &format!("spawn failed: {e}"));
@@ -82,33 +84,61 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
 
     let (tx, rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
 
-    // Child stdin: take ownership so we can forward STDIN frames and close
-    // it on EOF frames. Duplex mode is exercised by tests; not all callers
-    // will use it.
-    let mut child_stdin = child.stdin.take();
-
-    // Pump completion channel: each pump sends one () when its pipe hits
+    // Pump completion channel: each pump sends one () when its source hits
     // EOF, so the supervising loop can drain output before reporting EXIT.
     let (pump_done_tx, pump_done_rx) = mpsc::channel();
 
+    // Child stdin: for the pipe path, take ownership of the write pipe so we
+    // can forward STDIN frames and close it on EOF frames. For the pty path,
+    // stdin and stdout share the master fd; we write STDIN frames to the
+    // master and read child output from it.
+    let mut child_stdin: Option<Box<dyn Write + Send>>;
     let mut pumps = 0;
-    pumps += spawn_output_pump(
-        child.stdout.take(),
-        TAG_STDOUT,
-        Arc::clone(&out),
-        pump_done_tx.clone(),
-    );
-    let stderr_tag = if request.merge_stderr {
-        TAG_STDOUT
-    } else {
-        TAG_STDERR
-    };
-    pumps += spawn_output_pump(
-        child.stderr.take(),
-        stderr_tag,
-        Arc::clone(&out),
-        pump_done_tx,
-    );
+
+    match pty_master {
+        Some(master) => {
+            // A pty merges stdout and stderr onto one terminal, so there is
+            // a single output stream. Reading and writing the same master fd
+            // from two threads is safe: read and write on a pty master are
+            // independent. Duplicate it so the pump thread and the stdin
+            // writer each own a handle.
+            let read_half = master;
+            let write_half = read_half.try_clone()?;
+            pumps += spawn_output_pump(
+                Some(File::from(read_half)),
+                TAG_STDOUT,
+                Arc::clone(&out),
+                pump_done_tx.clone(),
+            );
+            // Dropping the last pump_done_tx sender is what lets drain_pumps
+            // terminate; keep the count honest by dropping the spare here.
+            drop(pump_done_tx);
+            child_stdin = Some(Box::new(File::from(write_half)));
+        }
+        None => {
+            child_stdin = child
+                .stdin
+                .take()
+                .map(|s| Box::new(s) as Box<dyn Write + Send>);
+            pumps += spawn_output_pump(
+                child.stdout.take(),
+                TAG_STDOUT,
+                Arc::clone(&out),
+                pump_done_tx.clone(),
+            );
+            let stderr_tag = if request.merge_stderr {
+                TAG_STDOUT
+            } else {
+                TAG_STDERR
+            };
+            pumps += spawn_output_pump(
+                child.stderr.take(),
+                stderr_tag,
+                Arc::clone(&out),
+                pump_done_tx,
+            );
+        }
+    }
 
     spawn_stdin_reader(stdin, tx.clone());
     // The waiter thread takes ownership of `child` entirely: it is the
@@ -136,17 +166,19 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
 
 /// Builds and spawns the child process, calling `setsid()` in the child
 /// before exec so it leads its own process group.
-fn spawn_child(request: &SpawnRequest) -> io::Result<Child> {
+///
+/// Returns the child and, in pty mode, the master side of the pty pair; the
+/// caller reads child output from the master and writes STDIN frames to it.
+/// In pipe mode the second element is `None` and the child's stdio is the
+/// usual set of pipes on the `Child`.
+fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>)> {
     let (program, args) = request
         .argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "argv must not be empty"))?;
 
     let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args);
 
     if let Some(cd) = &request.cd {
         cmd.current_dir(cd);
@@ -155,18 +187,106 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<Child> {
         cmd.envs(&request.env);
     }
 
-    // Safety: the closure only calls setsid(), which is async-signal-safe
-    // and does not allocate or touch the parent's memory. It runs in the
-    // forked child between fork and exec, per `pre_exec`'s contract.
+    if request.pty {
+        spawn_child_pty(cmd, request)
+    } else {
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Safety: the closure only calls setsid(), which is async-signal-safe
+        // and does not allocate or touch the parent's memory. It runs in the
+        // forked child between fork and exec, per `pre_exec`'s contract.
+        unsafe {
+            cmd.pre_exec(|| {
+                process::setsid()
+                    .map(|_| ())
+                    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+            });
+        }
+
+        cmd.spawn().map(|child| (child, None))
+    }
+}
+
+/// Spawns the child attached to a freshly allocated pty. The master fd stays
+/// with the shim; the child's stdin, stdout, and stderr all point at the
+/// slave, and after `setsid` the child claims the slave as its controlling
+/// terminal (`TIOCSCTTY`). Because a pty carries one bidirectional stream,
+/// the child's stderr is merged into the same terminal as its stdout.
+fn spawn_child_pty(
+    mut cmd: Command,
+    request: &SpawnRequest,
+) -> io::Result<(Child, Option<OwnedFd>)> {
+    use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
+
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(errno)?;
+    grantpt(&master).map_err(errno)?;
+    unlockpt(&master).map_err(errno)?;
+
+    let slave_name = ptsname(&master, Vec::new()).map_err(errno)?;
+    let slave = rustix::fs::open(
+        slave_name.as_c_str(),
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(errno)?;
+
+    // The child inherits three dups of the slave as fds 0/1/2. Give each of
+    // stdin/stdout/stderr its own OwnedFd so std does not close a shared fd
+    // more than once.
+    let slave_in = slave.try_clone()?;
+    let slave_out = slave.try_clone()?;
+    let slave_err = slave;
+    cmd.stdin(Stdio::from(slave_in))
+        .stdout(Stdio::from(slave_out))
+        .stderr(Stdio::from(slave_err));
+
+    let winsize = window_size(request);
+
+    // Safety: the closure runs between fork and exec. It calls only
+    // async-signal-safe operations (setsid, ioctl) and touches no parent
+    // memory beyond the copied `winsize` value. fd 0 is the child's slave
+    // side after std has wired up stdio, so TIOCSCTTY on it makes the pty
+    // the controlling terminal.
     unsafe {
-        cmd.pre_exec(|| {
-            process::setsid()
-                .map(|_| ())
-                .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+        cmd.pre_exec(move || {
+            process::setsid().map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+
+            let stdin = std::os::fd::BorrowedFd::borrow_raw(0);
+            process::ioctl_tiocsctty(stdin)
+                .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+
+            if let Some(ws) = winsize {
+                rustix::termios::tcsetwinsize(stdin, ws)
+                    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+            }
+            Ok(())
         });
     }
 
-    cmd.spawn()
+    let child = cmd.spawn()?;
+    Ok((child, Some(master)))
+}
+
+/// Builds the initial pty window size from the request, if either dimension
+/// was provided. A dimension left unset defaults to 0, which the terminal
+/// treats as "unspecified".
+fn window_size(request: &SpawnRequest) -> Option<rustix::termios::Winsize> {
+    match (request.pty_rows, request.pty_cols) {
+        (None, None) => None,
+        (rows, cols) => Some(rustix::termios::Winsize {
+            ws_row: rows.unwrap_or(0),
+            ws_col: cols.unwrap_or(0),
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+    }
+}
+
+/// Maps a rustix errno into a std io error.
+fn errno(e: rustix::io::Errno) -> io::Error {
+    io::Error::from_raw_os_error(e.raw_os_error())
 }
 
 /// Pumps bytes from a child pipe into framed messages on `out`, sending
@@ -255,7 +375,7 @@ fn supervise<W: Write>(
     rx: Receiver<Event>,
     pgid: Pid,
     kill_grace: Duration,
-    child_stdin: &mut Option<impl Write>,
+    child_stdin: &mut Option<Box<dyn Write + Send>>,
     out: &Arc<Mutex<W>>,
     pumps: usize,
     pump_done: &Receiver<()>,

@@ -202,6 +202,11 @@ Options:
 
 - `:cd`, `:env`, `:merge_stderr`: as in `Forcola.run/2`.
 - `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
+- `:pty`: run the child under a pseudo-terminal (default `false`), for CLIs
+  that behave differently when they detect a tty. See
+  [pseudo-terminal](#pseudo-terminal) below.
+- `:pty_rows`, `:pty_cols`: initial pty window size, applied only under
+  `pty: true`.
 
 API:
 
@@ -227,6 +232,33 @@ Messages to the owner:
 
 A spawn failure is asynchronous: `open/2` still returns `{:ok, session}` and
 the failure arrives as `{:forcola_exit, session, {:spawn_error, reason}}`.
+
+#### Pseudo-terminal
+
+`pty: true` runs the child under a pseudo-terminal instead of pipes. CLIs
+that detect a tty then behave as they do in a real terminal: line buffering,
+color output, progress rendering, and interactive prompts (password entry,
+pagers, REPLs, TUIs).
+
+```elixir
+{:ok, session} =
+  Forcola.Duplex.open(["/bin/sh", "-c", "test -t 0 && echo tty || echo pipe"],
+    pty: true,
+    pty_rows: 24,
+    pty_cols: 80
+  )
+
+receive do
+  {:forcola_line, ^session, "tty"} -> :ok
+end
+```
+
+A terminal carries one stream, so a pty merges the child's stdout and stderr:
+all output arrives as `{:forcola_line, ...}` and no `:forcola_stderr` messages
+are produced. Passing `merge_stderr: false` with `pty: true` raises
+`ArgumentError`. Group-kill, `send_eof/1`, and owner-death cleanup work the
+same as in pipe mode. There is no dynamic resize yet; `:pty_rows`/`:pty_cols`
+set the initial size only.
 
 ## Next steps
 

@@ -5,7 +5,11 @@
 //! group, and then supervises it:
 //!
 //! - stdout/stderr from the child are framed back to the BEAM over the
-//!   shim's stdout
+//!   shim's stdout. When the SPAWN payload requests a pty, the child runs
+//!   under a pseudo-terminal instead of pipes: its stdin/stdout/stderr all
+//!   attach to the pty slave, it claims that slave as its controlling
+//!   terminal (`TIOCSCTTY` after `setsid`), and all of its output comes back
+//!   as STDOUT frames since a pty merges stderr onto the one terminal.
 //! - a timeout (or an explicit kill frame) triggers SIGTERM to the whole
 //!   group (`kill(-pgid, SIGTERM)`), escalating to SIGKILL after the grace
 //! - EOF on the shim's stdin means the BEAM died; the shim kills the group
@@ -18,7 +22,7 @@
 //!
 //! BEAM -> shim:
 //!   0x01 SPAWN   payload: JSON {argv, cd, env, merge_stderr, timeout_ms,
-//!                               kill_grace_ms}
+//!                               kill_grace_ms, pty, pty_rows, pty_cols}
 //!   0x02 STDIN   payload: bytes for the child's stdin (duplex mode)
 //!   0x03 EOF     close the child's stdin
 //!   0x04 KILL    kill the group now
