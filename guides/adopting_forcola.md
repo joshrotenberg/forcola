@@ -295,18 +295,16 @@ Choose something else when:
   the mature, actively maintained alternatives that cover the closest
   ground.
 
-## Migrating ordito
+## Migrating from erlexec
 
-`Ordito.OsProc` is the erlexec-based predecessor of this library: same
-contract (group kill on timeout, cleanup on BEAM death), different engine.
-Forcola ports its API and test suite, including the SIGTERM-ignoring child.
-Migration:
+For a wrapper that uses erlexec today for the same contract (group kill on
+timeout, cleanup on BEAM death), the migration is mechanical:
 
-1. Add `{:forcola, "~> 0.1"}` and swap `Ordito.OsProc` calls for their
-   Forcola counterparts; bounded runs become `Forcola.run/2` with
-   `:timeout_ms`.
-2. Run ordito's test suite; the OsProc contract tests are the acceptance
-   bar, and Forcola's own suite covers the same cases.
+1. Add `{:forcola, "~> 0.1"}` and swap the erlexec calls for their Forcola
+   counterparts; bounded runs become `Forcola.run/2` with `:timeout_ms`.
+2. Run your existing test suite; it is the acceptance bar. Forcola's own
+   suite covers the group-kill contract cases, including the
+   SIGTERM-ignoring child.
 3. Drop the erlexec dependency. This removes the C++ compile erlexec runs on
    each consumer's machine; Forcola ships precompiled shim binaries with
    checksum verification instead.

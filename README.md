@@ -1,5 +1,10 @@
 # Forcola
 
+[![CI](https://github.com/joshrotenberg/forcola/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/joshrotenberg/forcola/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/forcola.svg)](https://hex.pm/packages/forcola)
+[![Docs](https://img.shields.io/badge/docs-hexdocs.pm-blue.svg)](https://hexdocs.pm/forcola)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/joshrotenberg/forcola/blob/main/LICENSE)
+
 Leak-free external process execution for the BEAM.
 
 Forcola runs OS processes through a small Rust shim that puts each child in
@@ -14,7 +19,26 @@ small piece everything passes through, keeping the oar attached to the boat.
 
 All four execution modes are implemented against the Rust shim:
 `Forcola.run/2`, `Forcola.Stream.lines/2`, `Forcola.Daemon`, and
-`Forcola.Duplex`. Not yet published to Hex.
+`Forcola.Duplex`.
+
+## Installation
+
+Add `forcola` to your dependencies:
+
+```elixir
+def deps do
+  [
+    {:forcola, "~> 0.1"}
+  ]
+end
+```
+
+Requires Elixir 1.18+ and OTP 27+. No Rust toolchain is needed on the five
+precompiled targets (macOS arm64 and x86-64, Linux x86-64 and arm64 glibc,
+x86-64 musl): the shim binary is downloaded from the matching GitHub Release
+and verified against a SHA256 checksum at compile time. On other targets, or
+to opt out of the download, set `FORCOLA_BUILD=1` to build the shim from
+source with cargo.
 
 ## The problem
 
@@ -107,13 +131,10 @@ behaviour, keeps its `System.cmd/3` path as the default implementation, and
 accepts a Forcola-backed one via config, with Forcola as an optional dep.
 The [adoption guide](guides/adopting_forcola.md) covers the pattern, a
 worked example against a real wrapper, the mode mapping for common wrapper
-shapes, and migration notes for erlexec-based predecessors.
+shapes, and migration notes for erlexec-based wrappers.
 
 ## Prior art
 
-- [ordito's `Ordito.OsProc`](https://github.com/joshrotenberg/ordito) proved
-  this contract against erlexec; Forcola ports its API and test suite
-  (including the SIGTERM-ignoring child).
 - [erlexec](https://github.com/saleyn/erlexec) has process-group kill
   (opt-in per command via `kill_group`) but compiles C++ on the consumer's
   machine.
