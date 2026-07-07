@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/joshrotenberg/forcola/compare/v0.2.0...v0.3.0) (2026-07-07)
+
+
+### Features
+
+* demand-driven backpressure mode for Forcola.Stream.lines/2 (closes [#32](https://github.com/joshrotenberg/forcola/issues/32)) ([#43](https://github.com/joshrotenberg/forcola/issues/43)) ([4a2b7b2](https://github.com/joshrotenberg/forcola/commit/4a2b7b22b36371012869ef3508a04485cecd65d6))
+* optional Linux cgroup v2 containment layer (closes [#15](https://github.com/joshrotenberg/forcola/issues/15)) ([#41](https://github.com/joshrotenberg/forcola/issues/41)) ([162c408](https://github.com/joshrotenberg/forcola/commit/162c4085e0ebc2d27ac29d83f84307619aedc081))
+
 ## [0.2.0](https://github.com/joshrotenberg/forcola/compare/v0.1.0...v0.2.0) (2026-07-04)
 
 
