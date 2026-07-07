@@ -317,9 +317,10 @@ defmodule Forcola.Stream do
     %{state | outstanding: window, idle_deadline: reset_idle_deadline(state)}
   end
 
-  # The shim may have already exited (child done, EXIT frame in flight) by the
-  # time the consumer tops up credit, closing the port. There is nothing left
-  # to credit, so swallow the resulting badarg rather than crashing the stream.
+  # Best-effort credit grant. The shim keeps its stdin open until the BEAM
+  # closes the port (see the backpressure linger in supervisor.rs), so a grant
+  # never races a closed pipe into an epipe. The badarg guard is defensive: if
+  # the port is already closed there is nothing left to credit.
   defp send_credit(port, bytes) do
     Shim.send_frame(port, Shim.tag_credit(), Shim.encode_credit(bytes))
   catch

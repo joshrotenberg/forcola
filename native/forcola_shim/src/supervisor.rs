@@ -166,8 +166,8 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         spawn_timeout_timer(timeout_ms, tx.clone());
     }
 
-    supervise(
-        rx,
+    let beam_gone = supervise(
+        &rx,
         pgid,
         kill_grace,
         &mut child_stdin,
@@ -178,7 +178,33 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         credit.as_ref(),
     );
 
+    // Backpressure linger: the child is reaped and the EXIT frame is written,
+    // but the BEAM may still grant credit (Port.command) while it drains the
+    // frames it has already buffered. If the shim exited now, its stdin read
+    // end would close and that racing write would send the BEAM an epipe exit
+    // signal, killing the stream. Keep draining inbound frames (which keeps the
+    // stdin reader running and the pipe open) until the BEAM closes the port
+    // after it has consumed EXIT. Skipped when the BEAM is already gone, and
+    // never entered on the eager path, so the default behavior is unchanged.
+    if credit.is_some() && !beam_gone {
+        drain_inbound_until_closed(&rx);
+    }
+
     Ok(())
+}
+
+/// Drains inbound events after EXIT so late CREDIT writes from the BEAM are
+/// absorbed and the shim's stdin stays open until the BEAM closes the port
+/// (reported as `StdinClosed`) or the reader thread ends. Blocks on `recv`, so
+/// it does not busy-spin.
+fn drain_inbound_until_closed(rx: &Receiver<Event>) {
+    loop {
+        match rx.recv() {
+            Ok(Event::StdinClosed) | Ok(Event::StdinError(_)) => return,
+            Ok(_) => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 /// Builds and spawns the child process, calling `setsid()` in the child
@@ -490,9 +516,12 @@ fn spawn_timeout_timer(timeout_ms: u64, tx: Sender<Event>) {
 
 /// The main supervising loop: consumes events until the child has exited,
 /// drains the output pumps, then writes the EXIT frame.
+/// Runs the event loop until the child exits, drains output, and writes the
+/// EXIT frame. Returns whether the BEAM had already vanished (stdin EOF or
+/// error), which the caller uses to decide whether to linger for late credit.
 #[allow(clippy::too_many_arguments)]
 fn supervise<W: Write>(
-    rx: Receiver<Event>,
+    rx: &Receiver<Event>,
     pgid: Pid,
     kill_grace: Duration,
     child_stdin: &mut Option<Box<dyn Write + Send>>,
@@ -501,7 +530,7 @@ fn supervise<W: Write>(
     pump_done: &Receiver<()>,
     cgroup: Option<&Cgroup>,
     credit: Option<&Credit>,
-) {
+) -> bool {
     let mut timed_out = false;
     let mut beam_gone = false;
 
@@ -576,7 +605,7 @@ fn supervise<W: Write>(
         // stdout is the same dead BEAM that closed stdin. Attempting to
         // write would either block on a full pipe with no reader or
         // error out; either way there is no value in trying.
-        return;
+        return true;
     }
 
     // The child has been reaped, but the output pumps may not have hit
@@ -595,6 +624,8 @@ fn supervise<W: Write>(
         let mut w = out.lock().unwrap();
         let _ = frame::write_frame(&mut *w, TAG_EXIT, &payload);
     }
+
+    false
 }
 
 /// Final cgroup teardown after the child is reaped: SIGKILL any escapee still
