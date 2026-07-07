@@ -311,10 +311,19 @@ defmodule Forcola.Stream do
   # deadline elapses with no frame.
   defp grant_credit(%{window: window, outstanding: outstanding, port: port} = state) do
     if outstanding < window do
-      Shim.send_frame(port, Shim.tag_credit(), Shim.encode_credit(window - outstanding))
+      send_credit(port, window - outstanding)
     end
 
     %{state | outstanding: window, idle_deadline: reset_idle_deadline(state)}
+  end
+
+  # The shim may have already exited (child done, EXIT frame in flight) by the
+  # time the consumer tops up credit, closing the port. There is nothing left
+  # to credit, so swallow the resulting badarg rather than crashing the stream.
+  defp send_credit(port, bytes) do
+    Shim.send_frame(port, Shim.tag_credit(), Shim.encode_credit(bytes))
+  catch
+    :error, :badarg -> :ok
   end
 
   defp reset_idle_deadline(%{idle_timeout_ms: nil}), do: nil
