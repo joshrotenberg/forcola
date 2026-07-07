@@ -8,6 +8,10 @@ pub const TAG_SPAWN: u8 = 0x01;
 pub const TAG_STDIN: u8 = 0x02;
 pub const TAG_EOF: u8 = 0x03;
 pub const TAG_KILL: u8 = 0x04;
+/// Grants the stdout pump N more bytes of read budget under backpressure.
+/// Payload is an 8-byte big-endian byte count. Only sent when the BEAM
+/// opted into backpressure via `window_bytes`.
+pub const TAG_CREDIT: u8 = 0x05;
 
 /// Outbound tag: shim -> BEAM.
 pub const TAG_STDOUT: u8 = 0x11;

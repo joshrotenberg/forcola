@@ -57,6 +57,15 @@ pub struct SpawnRequest {
     /// leaves the kill path unchanged.
     #[serde(default)]
     pub cgroup: bool,
+    /// Opt in to demand-driven backpressure on the child's stdout. When
+    /// present, the stdout pump reads the child only while the BEAM has
+    /// granted read credit via CREDIT frames; when the credit is exhausted
+    /// the pump stops reading, the OS pipe fills, and the child's next write
+    /// blocks. The value is the BEAM's window size in bytes; it is
+    /// informational on the shim side, since the BEAM controls the actual
+    /// credit. Absent leaves the eager pump unchanged. STDERR is never gated.
+    #[serde(default)]
+    pub window_bytes: Option<u64>,
 }
 
 /// A user identity in a SPAWN payload: either a name to resolve or a raw
@@ -126,6 +135,14 @@ mod tests {
         assert_eq!(req.user, None);
         assert_eq!(req.group, None);
         assert!(!req.cgroup);
+        assert_eq!(req.window_bytes, None);
+    }
+
+    #[test]
+    fn spawn_request_window_bytes_opt_in() {
+        let json = r#"{"argv": ["cat"], "window_bytes": 4096}"#;
+        let req: SpawnRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.window_bytes, Some(4096));
     }
 
     #[test]

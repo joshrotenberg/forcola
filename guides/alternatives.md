@@ -44,12 +44,18 @@ embedded Linux, MuonTrap is the native choice.
 
 ## exile
 
-Takes a different shape: NIF-based demand-driven IO with real backpressure,
-ideal when a slow consumer must stream huge output without buffering. The
-tradeoff is cleanup: with no middleman process, a kill -9 of the BEAM orphans
-the child (in testing on macOS, exile's child survived where forcola's and
-MuonTrap's shims cleaned up). Forcola tracks a backpressure streaming mode in
-[#32](https://github.com/joshrotenberg/forcola/issues/32).
+Takes a different shape: NIF-based demand-driven IO where backpressure is the
+default streaming model, ideal when a slow consumer must stream huge output
+without buffering. Forcola now has an opt-in backpressure mode for
+`Forcola.Stream.lines/2` (`window_bytes:`,
+[#32](https://github.com/joshrotenberg/forcola/issues/32)) that bounds the same
+case: the shim reads the child only while the consumer has granted read credit.
+The architectures differ: exile pushes IO through NIFs with backpressure always
+on, while forcola keeps its eager pump as the default and adds a credit/window
+protocol between the BEAM and the shim when you ask for it. The exile tradeoff
+still stands: with no middleman process, a kill -9 of the BEAM orphans the child
+(in testing on macOS, exile's child survived where forcola's and MuonTrap's
+shims cleaned up).
 
 ## Porcelain and Rambo
 
@@ -75,9 +81,11 @@ forcola's release workflow is designed around.
   `systemd-run --scope`). MuonTrap's Nerves-native cgroup support is more mature
   and does not require you to arrange delegation; on Nerves or embedded Linux it
   is the native choice.
-- You need backpressure-first streaming and accept the kill -9 orphan risk:
-  exile. forcola tracks a backpressure mode in
-  [#32](https://github.com/joshrotenberg/forcola/issues/32).
+- You need backpressure-first streaming as the default model and accept the
+  kill -9 orphan risk: exile. forcola now has an opt-in backpressure mode for
+  `Forcola.Stream.lines/2` (`window_bytes:`,
+  [#32](https://github.com/joshrotenberg/forcola/issues/32)) while keeping its
+  leak-free cleanup; exile's is always on with a different NIF architecture.
 - You need Windows: Rambo's bundled binary or plain System.cmd. forcola tracks
   Windows support in [#34](https://github.com/joshrotenberg/forcola/issues/34).
 - You cannot ship native binaries at all: System.cmd/ports, with the

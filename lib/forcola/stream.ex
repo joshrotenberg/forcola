@@ -45,6 +45,31 @@ defmodule Forcola.Stream do
   after any lines already produced have been emitted. Omitting the option
   (the default) leaves behavior identical to a run bounded only by
   `:timeout_ms`.
+
+  ## Backpressure
+
+  By default the shim pumps the child's stdout forward as fast as the pipes
+  allow; unconsumed output buffers on the BEAM side, so a consumer slower than
+  the producer can grow BEAM memory without bound. `:window_bytes` (or
+  `backpressure: true`) opts into a demand-driven mode that bounds it.
+
+  With backpressure the shim reads the child's stdout only while it holds read
+  credit. The Stream grants one window of credit as its consumer pulls lines;
+  when the window is exhausted the shim stops reading, the OS pipe fills, and
+  the child's next write blocks. That block is the backpressure: the producer
+  runs no faster than the consumer drains it. The buffering bound is roughly
+  `window_bytes` in flight plus one frame in transit (plus a bounded
+  pipe-buffer flush when the child exits). Backpressure gates the child's
+  stdout only; stderr is never gated, and under `merge_stderr: true` the
+  merged stderr bytes ride eagerly.
+
+  Interaction with `:idle_timeout_ms`: a gap between frames can be caused by
+  the consumer not yet granting credit rather than a stalled producer. A
+  consumer-driven stall does not trip the idle timeout: the idle clock is reset
+  each time the Stream grants credit, so time spent waiting on the consumer is
+  excluded. A genuinely hung producer (credit available, no output) still trips
+  it, and the whole-run `:timeout_ms` still bounds a consumer that never
+  consumes.
   """
 
   alias Forcola.Shim
@@ -116,6 +141,10 @@ defmodule Forcola.Stream do
   @backstop_margin_ms 5_000
   @default_kill_grace_ms 5_000
 
+  # Default read window when backpressure is enabled with `backpressure: true`
+  # rather than an explicit `window_bytes`.
+  @default_window_bytes 64 * 1024
+
   @doc """
   Run `argv` and return its stdout as a lazy stream of lines.
 
@@ -132,6 +161,15 @@ defmodule Forcola.Stream do
   `:timeout_ms`; whichever bound fires first wins. See the module docs for
   the exact reset semantic.
 
+  `:window_bytes` (optional, positive integer) opts into demand-driven
+  backpressure: the shim reads the child's stdout only while it holds read
+  credit, and the Stream grants roughly one window as its consumer pulls
+  lines, so a slow consumer blocks the producer instead of buffering its
+  output on the BEAM. `backpressure: true` is shorthand for a default
+  #{@default_window_bytes}-byte window. Omitting both keeps the default eager
+  pump. See the module docs for the buffering bound and the interaction with
+  `:idle_timeout_ms`.
+
   Lines are emitted without their trailing newline. A partial line held
   across frame boundaries is emitted once its newline arrives; a final
   partial line with no newline is emitted before the stream terminates.
@@ -143,18 +181,41 @@ defmodule Forcola.Stream do
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
     idle_timeout_ms = Keyword.get(opts, :idle_timeout_ms)
+    window_bytes = resolve_window_bytes(opts)
 
     Stream.resource(
-      fn -> start(argv, opts, timeout_ms, kill_grace_ms, idle_timeout_ms) end,
+      fn -> start(argv, opts, timeout_ms, kill_grace_ms, idle_timeout_ms, window_bytes) end,
       &next/1,
       &cleanup/1
     )
   end
 
-  defp start(argv, opts, timeout_ms, kill_grace_ms, idle_timeout_ms) do
+  # Backpressure is opt-in. `:window_bytes` sets the read budget in bytes and
+  # enables it; `backpressure: true` enables it with a default window. Absent,
+  # the eager pump runs and behavior is byte-for-byte unchanged.
+  defp resolve_window_bytes(opts) do
+    case Keyword.get(opts, :window_bytes) do
+      nil ->
+        if Keyword.get(opts, :backpressure, false), do: @default_window_bytes, else: nil
+
+      n when is_integer(n) and n > 0 ->
+        n
+
+      other ->
+        raise ArgumentError,
+              ":window_bytes must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  defp start(argv, opts, timeout_ms, kill_grace_ms, idle_timeout_ms, window_bytes) do
     case Shim.open() do
       {:ok, port} ->
-        payload = Shim.encode_spawn(argv, Keyword.put(opts, :kill_grace_ms, kill_grace_ms))
+        spawn_opts =
+          opts
+          |> Keyword.put(:kill_grace_ms, kill_grace_ms)
+          |> put_window_bytes(window_bytes)
+
+        payload = Shim.encode_spawn(argv, spawn_opts)
         Shim.send_frame(port, Shim.tag_spawn(), payload)
 
         now = System.monotonic_time(:millisecond)
@@ -168,13 +229,21 @@ defmodule Forcola.Stream do
           idle_timeout_ms: idle_timeout_ms,
           idle_deadline: idle_deadline(idle_timeout_ms, now),
           kill_grace_ms: kill_grace_ms,
-          exit: nil
+          exit: nil,
+          # Backpressure state. `window` nil = disabled (eager). `outstanding`
+          # is the read budget granted to the shim but not yet accounted for by
+          # received STDOUT bytes; the shim never holds more than one window.
+          window: window_bytes,
+          outstanding: 0
         }
 
       {:error, :not_found} ->
         raise Error, reason: :shim_not_found
     end
   end
+
+  defp put_window_bytes(opts, nil), do: opts
+  defp put_window_bytes(opts, window_bytes), do: Keyword.put(opts, :window_bytes, window_bytes)
 
   # nil idle_timeout_ms leaves the idle deadline nil (disabled). Otherwise
   # the deadline is now + interval and is reset on every liveness frame.
@@ -185,17 +254,24 @@ defmodule Forcola.Stream do
   # `:exit` in the state and raise on the next call, so cleanup/1 always
   # sees a state that says whether the shim already accounted for the
   # child (and can skip the KILL/confirm handshake when it has).
-  defp next(%{exit: nil, port: port, deadline: deadline, idle_deadline: idle_deadline} = state) do
+  defp next(%{exit: nil, port: port} = state) do
+    # Under backpressure, top the shim's read budget back up to one window
+    # before waiting for the next frame. This is the demand signal: it runs
+    # only when the consumer pulls, so a paused consumer stops granting credit
+    # and the producer blocks. It also resets the idle deadline (see
+    # grant_credit) so a consumer-driven pause is excluded from the idle clock.
+    state = grant_credit(state)
+
     now = System.monotonic_time(:millisecond)
-    run_remaining = deadline - now
+    run_remaining = state.deadline - now
 
     # With idle disabled the wait is just the whole-run backstop. With it
     # enabled the wait is the sooner of the two, and on expiry we attribute
     # to whichever deadline actually elapsed.
     wait =
-      case idle_deadline do
+      case state.idle_deadline do
         nil -> run_remaining
-        _ -> min(run_remaining, idle_deadline - now)
+        idle_deadline -> min(run_remaining, idle_deadline - now)
       end
 
     receive do
@@ -214,6 +290,48 @@ defmodule Forcola.Stream do
 
   defp next(%{exit: :ok} = state), do: {:halt, state}
   defp next(%{exit: {:error, error}}), do: raise(error)
+
+  # Backpressure disabled: nothing to grant, idle handling unchanged.
+  defp grant_credit(%{window: nil} = state), do: state
+
+  # Backpressure enabled: top the shim's read budget back up to one window,
+  # then reset the idle deadline.
+  #
+  # The window bound: `outstanding` is bytes granted minus STDOUT bytes
+  # received, so topping it to `window` means the shim is told to hold at most
+  # one window of read-ahead. The buffering bound is roughly one window in
+  # flight plus one frame in transit.
+  #
+  # The idle reset: a consumer pause happens BETWEEN next/1 calls (the reducer
+  # sits without pulling), so the gap since the previous call is
+  # consumer-driven, not a stalled producer. Resetting the idle deadline here
+  # excludes that gap from the idle clock. A producer that is funded but truly
+  # silent still trips the idle bound: this resets once, then the following
+  # receive waits a full interval with credit already granted, and the idle
+  # deadline elapses with no frame.
+  defp grant_credit(%{window: window, outstanding: outstanding, port: port} = state) do
+    if outstanding < window do
+      send_credit(port, window - outstanding)
+    end
+
+    %{state | outstanding: window, idle_deadline: reset_idle_deadline(state)}
+  end
+
+  # Best-effort credit grant. The shim keeps its stdin open until the BEAM
+  # closes the port (see the backpressure linger in supervisor.rs), so a grant
+  # never races a closed pipe into an epipe. The badarg guard is defensive: if
+  # the port is already closed there is nothing left to credit.
+  defp send_credit(port, bytes) do
+    Shim.send_frame(port, Shim.tag_credit(), Shim.encode_credit(bytes))
+  catch
+    :error, :badarg -> :ok
+  end
+
+  defp reset_idle_deadline(%{idle_timeout_ms: nil}), do: nil
+
+  defp reset_idle_deadline(%{idle_timeout_ms: idle_timeout_ms}) do
+    System.monotonic_time(:millisecond) + idle_timeout_ms
+  end
 
   # Attribute an expired wait. When the idle deadline is the one that
   # elapsed it is an idle timeout: the shim is not timing out on its own
@@ -247,7 +365,8 @@ defmodule Forcola.Stream do
     cond do
       tag == Shim.tag_stdout() ->
         {lines, rest} = split_lines(state.buffer <> payload)
-        {lines, %{reset_idle(state) | buffer: rest}}
+        state = account_stdout(reset_idle(state), byte_size(payload))
+        {lines, %{state | buffer: rest}}
 
       tag == Shim.tag_stderr() ->
         {[], %{reset_idle(state) | stderr: [state.stderr | payload]}}
@@ -284,6 +403,15 @@ defmodule Forcola.Stream do
 
   defp reset_idle(%{idle_timeout_ms: idle_timeout_ms} = state) do
     %{state | idle_deadline: System.monotonic_time(:millisecond) + idle_timeout_ms}
+  end
+
+  # Charge received STDOUT bytes against the outstanding read budget so the
+  # next grant tops back up to exactly one window. A no-op when backpressure
+  # is disabled. STDERR bytes are not charged: the shim never gates stderr.
+  defp account_stdout(%{window: nil} = state, _bytes), do: state
+
+  defp account_stdout(%{outstanding: outstanding} = state, bytes) do
+    %{state | outstanding: max(outstanding - bytes, 0)}
   end
 
   defp split_lines(data) do

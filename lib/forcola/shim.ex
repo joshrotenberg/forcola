@@ -22,6 +22,7 @@ defmodule Forcola.Shim do
   @tag_stdin 0x02
   @tag_eof 0x03
   @tag_kill 0x04
+  @tag_credit 0x05
 
   # Outbound tag: shim -> BEAM.
   @tag_stdout 0x11
@@ -37,6 +38,8 @@ defmodule Forcola.Shim do
   def tag_eof, do: @tag_eof
   @doc false
   def tag_kill, do: @tag_kill
+  @doc false
+  def tag_credit, do: @tag_credit
   @doc false
   def tag_stdout, do: @tag_stdout
   @doc false
@@ -91,6 +94,18 @@ defmodule Forcola.Shim do
   end
 
   @doc """
+  Encodes a CREDIT frame payload: an 8-byte big-endian byte count.
+
+  Grants the shim's stdout pump that many more bytes of read budget under
+  backpressure. Only sent when the stream opted into backpressure via
+  `:window_bytes`; see `Forcola.Stream.lines/2`.
+  """
+  @spec encode_credit(non_neg_integer()) :: binary()
+  def encode_credit(bytes) when is_integer(bytes) and bytes >= 0 do
+    <<bytes::unsigned-big-integer-size(64)>>
+  end
+
+  @doc """
   Encodes a SPAWN frame payload from `Forcola.run/2` options.
 
   Shared by all four modes. Besides `:cd`/`:env`/`:merge_stderr`/`:timeout_ms`/
@@ -102,6 +117,11 @@ defmodule Forcola.Shim do
   when truthy, so the default SPAWN payload is unchanged; the shim defaults it
   to false when the key is absent. See `Forcola.run/2` for the Linux-only,
   delegation-required, graceful-fallback semantics.
+
+  `:window_bytes` opts into demand-driven backpressure on the child's stdout
+  (see `Forcola.Stream.lines/2`). Only added to the payload when present, so
+  the default SPAWN payload is unchanged; the shim gates its stdout pump when
+  the field is present and reads eagerly otherwise.
   """
   @spec encode_spawn(term(), keyword()) :: binary()
   def encode_spawn(argv, opts) do
@@ -117,6 +137,7 @@ defmodule Forcola.Shim do
     |> maybe_put("kill_grace_ms", Keyword.get(opts, :kill_grace_ms))
     |> maybe_put("user", Keyword.get(opts, :user))
     |> maybe_put("group", Keyword.get(opts, :group))
+    |> maybe_put("window_bytes", Keyword.get(opts, :window_bytes))
     |> put_cgroup(opts)
     |> put_pty(opts)
     |> :json.encode()

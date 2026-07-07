@@ -256,6 +256,244 @@ defmodule Forcola.StreamTest do
     end
   end
 
+  describe "backpressure" do
+    test "delivers every line byte-exact under a small window (multi-MB producer)" do
+      # 2 MB of output through a 4 KB window: heavy backpressure, fast
+      # consumer. `yes` reprints the line; `head` bounds it and exits 0.
+      line = String.duplicate("x", 100)
+      script = "yes #{line} | head -n 20000"
+
+      lines =
+        ["/bin/sh", "-c", script]
+        |> Forcola.Stream.lines(timeout_ms: 60_000, window_bytes: 4096)
+        |> Enum.to_list()
+
+      assert length(lines) == 20_000
+      assert Enum.all?(lines, &(&1 == line)), "a line was corrupted or truncated"
+    end
+
+    test "blocks the producer near the window and resumes when the consumer resumes",
+         %{tmp_dir: tmp_dir} do
+      progress = Path.join(tmp_dir, "progress")
+      test = self()
+
+      consumer =
+        spawn(fn ->
+          result =
+            ["/bin/sh", "-c", producer_script()]
+            |> Forcola.Stream.lines(
+              timeout_ms: 60_000,
+              window_bytes: 4096,
+              kill_grace_ms: 1_000,
+              env: [{"PROGRESS", progress}]
+            )
+            |> gated_consume(test)
+
+          send(test, {:done, result})
+        end)
+
+      # Consumer warms up (pulls a few lines) then pauses.
+      assert_receive :warmed, 15_000
+
+      # With the consumer paused, the producer blocks once it has filled the
+      # window plus the OS pipe buffer, so the byte counter stops advancing
+      # well below any unbounded growth threshold.
+      stalled = await_stall(progress)
+
+      assert stalled < 256_000,
+             "producer did not block under backpressure; wrote #{stalled} bytes while paused"
+
+      # Resume: the producer advances well past where it stalled.
+      send(consumer, :resume)
+
+      assert await_above(progress, stalled + 200_000, 20_000),
+             "producer did not resume after the consumer resumed"
+
+      assert_receive {:done, _}, 20_000
+    end
+
+    test "without backpressure the same paused consumer does not block the producer",
+         %{tmp_dir: tmp_dir} do
+      progress = Path.join(tmp_dir, "progress")
+      test = self()
+
+      consumer =
+        spawn(fn ->
+          result =
+            ["/bin/sh", "-c", producer_script()]
+            |> Forcola.Stream.lines(
+              timeout_ms: 60_000,
+              kill_grace_ms: 1_000,
+              env: [{"PROGRESS", progress}]
+            )
+            |> gated_consume(test)
+
+          send(test, {:done, result})
+        end)
+
+      assert_receive :warmed, 15_000
+
+      # Eager pump: the shim keeps reading and buffering on the BEAM side, so
+      # the producer never blocks and the byte counter blows past the bound.
+      assert await_above(progress, 256_000, 20_000),
+             "producer stalled without backpressure"
+
+      send(consumer, :resume)
+      assert_receive {:done, _}, 20_000
+    end
+
+    test "a slow-but-alive consumer under backpressure does not trip a short idle timeout" do
+      # A fast producer that is genuinely blocked by backpressure while the
+      # consumer pauses. The consumer pause is a controlled in-process sleep
+      # (1500ms) that exceeds the idle interval (500ms); it is consumer-driven
+      # and must not raise. Driving the pause in-process (rather than gating a
+      # spawned consumer) means next/1 is always idle-bounded, so a real credit
+      # deadlock would surface here as an idle raise, not a silent hang.
+      script = ~S(while :; do echo tick; done)
+
+      lines =
+        ["/bin/sh", "-c", script]
+        |> Forcola.Stream.lines(
+          timeout_ms: 30_000,
+          idle_timeout_ms: 500,
+          window_bytes: 4096,
+          kill_grace_ms: 1_000
+        )
+        |> Stream.with_index()
+        |> Stream.map(fn {line, i} ->
+          # Pause once, well past the idle interval, after a few lines.
+          if i == 3, do: Process.sleep(1_500)
+          line
+        end)
+        |> Enum.take(25)
+
+      assert length(lines) == 25
+      assert Enum.all?(lines, &(&1 == "tick")), "output corrupted under backpressure"
+    end
+
+    test "backpressure with an idle timeout delivers a clean-exiting producer intact" do
+      # A finite producer larger than one window (so backpressure genuinely
+      # parks it) consumed at full speed with a generous idle. The run must end
+      # cleanly with every line delivered in order; a credit deadlock on the
+      # clean-exit path would surface as an idle raise here.
+      lines =
+        ["/bin/sh", "-c", "seq 1 5000"]
+        |> Forcola.Stream.lines(
+          timeout_ms: 30_000,
+          idle_timeout_ms: 5_000,
+          window_bytes: 4096
+        )
+        |> Enum.to_list()
+
+      assert lines == Enum.map(1..5000, &Integer.to_string/1)
+    end
+
+    test "a genuinely hung producer under backpressure still raises the idle timeout" do
+      # One line, then the producer hangs with credit available. The idle
+      # bound must fire even though backpressure is on.
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", "echo tick; sleep 60"]
+          |> Forcola.Stream.lines(
+            timeout_ms: 60_000,
+            idle_timeout_ms: 300,
+            window_bytes: 4096,
+            kill_grace_ms: 1_000
+          )
+          |> Enum.to_list()
+        end
+
+      assert error.idle_timed_out
+      refute error.timed_out
+    end
+  end
+
+  # An infinite producer that writes 1000-byte lines to stdout and records the
+  # cumulative bytes it has successfully written to a side file. When stdout
+  # backpressures, the write blocks and the counter stops advancing.
+  defp producer_script do
+    ~S"""
+    CHUNK=$(printf '%01000d' 0)
+    i=0
+    while :; do
+      printf '%s\n' "$CHUNK"
+      i=$((i + 1001))
+      printf '%s\n' "$i" >> "$PROGRESS"
+    done
+    """
+  end
+
+  # Pulls a few lines, signals :warmed, blocks until :resume, then consumes a
+  # bounded burst before halting (which triggers the early-halt kill).
+  defp gated_consume(stream, test) do
+    Enum.reduce_while(stream, 0, fn _line, n ->
+      n = n + 1
+
+      cond do
+        n == 5 ->
+          send(test, :warmed)
+
+          receive do
+            :resume -> {:cont, n}
+          end
+
+        n >= 5_005 ->
+          {:halt, n}
+
+        true ->
+          {:cont, n}
+      end
+    end)
+  end
+
+  # The last complete integer written to the progress file, tolerating a
+  # partially written trailing line and a not-yet-created file.
+  defp progress(path) do
+    case File.read(path) do
+      {:ok, data} -> latest_count(data)
+      _ -> 0
+    end
+  end
+
+  defp latest_count(data) do
+    data
+    |> String.split("\n", trim: true)
+    |> Enum.reverse()
+    |> Enum.find_value(0, &parse_count/1)
+  end
+
+  defp parse_count(str) do
+    case Integer.parse(str) do
+      {n, ""} -> n
+      _ -> false
+    end
+  end
+
+  # Waits until the progress counter has not advanced for ~400ms (the producer
+  # has blocked), bounded overall, and returns the stalled value.
+  defp await_stall(path) do
+    deadline = System.monotonic_time(:millisecond) + 10_000
+    do_await_stall(path, progress(path), 0, deadline)
+  end
+
+  defp do_await_stall(path, last, stable, deadline) do
+    Process.sleep(80)
+    now = progress(path)
+
+    cond do
+      now > last -> do_await_stall(path, now, 0, deadline)
+      stable >= 5 -> now
+      System.monotonic_time(:millisecond) > deadline -> now
+      true -> do_await_stall(path, now, stable + 1, deadline)
+    end
+  end
+
+  # Polls until the progress counter exceeds `target`, up to `deadline_ms`.
+  defp await_above(path, target, deadline_ms) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+    poll(fn -> progress(path) > target end, deadline)
+  end
+
   # kill -0: probes existence without signalling.
   defp alive?(pid) do
     {_out, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
