@@ -343,56 +343,49 @@ defmodule Forcola.StreamTest do
     end
 
     test "a slow-but-alive consumer under backpressure does not trip a short idle timeout" do
-      # The producer emits far more than one window plus the OS pipe buffer, so
-      # it is genuinely blocked by backpressure while the consumer pauses. The
-      # pause (2000ms) exceeds the idle interval (1000ms), but the stall is
-      # consumer-driven and must not raise; all lines must still be delivered.
-      #
-      # A window this size keeps the post-resume drain to a handful of credit
-      # round-trips, each reading an already-full pipe, so a live producer never
-      # approaches the idle interval. A short window with this many lines would
-      # need hundreds of round-trips and could hit a scheduling hiccup on a
-      # loaded runner; that is a test-shape concern, not a backpressure one.
-      test = self()
+      # A fast producer that is genuinely blocked by backpressure while the
+      # consumer pauses. The consumer pause is a controlled in-process sleep
+      # (1500ms) that exceeds the idle interval (500ms); it is consumer-driven
+      # and must not raise. Driving the pause in-process (rather than gating a
+      # spawned consumer) means next/1 is always idle-bounded, so a real credit
+      # deadlock would surface here as an idle raise, not a silent hang.
+      script = ~S(while :; do echo tick; done)
 
-      consumer =
-        spawn(fn ->
-          result =
-            ["/bin/sh", "-c", "seq 1 50000"]
-            |> Forcola.Stream.lines(
-              timeout_ms: 60_000,
-              idle_timeout_ms: 1_000,
-              window_bytes: 65_536
-            )
-            |> Enum.reduce_while({0, []}, fn line, {n, acc} ->
-              n = n + 1
-              acc = [line | acc]
-
-              if n == 3 do
-                send(test, :warmed)
-
-                receive do
-                  :resume -> {:cont, {n, acc}}
-                end
-              else
-                {:cont, {n, acc}}
-              end
-            end)
-
-          {_n, collected} = result
-          send(test, {:result, collected})
+      lines =
+        ["/bin/sh", "-c", script]
+        |> Forcola.Stream.lines(
+          timeout_ms: 30_000,
+          idle_timeout_ms: 500,
+          window_bytes: 4096,
+          kill_grace_ms: 1_000
+        )
+        |> Stream.with_index()
+        |> Stream.map(fn {line, i} ->
+          # Pause once, well past the idle interval, after a few lines.
+          if i == 3, do: Process.sleep(1_500)
+          line
         end)
+        |> Enum.take(25)
 
-      assert_receive :warmed, 15_000
-      # Hold the consumer paused well past the idle interval, then resume.
-      Process.sleep(2_000)
-      send(consumer, :resume)
+      assert length(lines) == 25
+      assert Enum.all?(lines, &(&1 == "tick")), "output corrupted under backpressure"
+    end
 
-      assert_receive {:result, collected}, 30_000
-      lines = Enum.reverse(collected)
-      assert length(lines) == 50_000
-      assert List.first(lines) == "1"
-      assert List.last(lines) == "50000"
+    test "backpressure with an idle timeout delivers a clean-exiting producer intact" do
+      # A finite producer larger than one window (so backpressure genuinely
+      # parks it) consumed at full speed with a generous idle. The run must end
+      # cleanly with every line delivered in order; a credit deadlock on the
+      # clean-exit path would surface as an idle raise here.
+      lines =
+        ["/bin/sh", "-c", "seq 1 5000"]
+        |> Forcola.Stream.lines(
+          timeout_ms: 30_000,
+          idle_timeout_ms: 5_000,
+          window_bytes: 4096
+        )
+        |> Enum.to_list()
+
+      assert lines == Enum.map(1..5000, &Integer.to_string/1)
     end
 
     test "a genuinely hung producer under backpressure still raises the idle timeout" do
