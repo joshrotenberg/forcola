@@ -31,7 +31,7 @@ precompiled targets (macOS arm64 and x86-64, Linux x86-64 and arm64 glibc,
 x86-64 musl): the shim binary is downloaded from the matching GitHub Release
 and verified against a SHA256 checksum at compile time. On other targets, or
 to opt out of the download, set `FORCOLA_BUILD=1` to build from source with
-cargo. See the [getting started guide](guides/getting_started.md).
+cargo. See the [getting started guide](https://hexdocs.pm/forcola/getting_started.html).
 
 ## The problem
 
@@ -85,7 +85,7 @@ BEAM <--stdin/stdout pipes--> forcola_shim <--forks--> child (own process group)
 | Daemon | `Forcola.Daemon` | Long-running server under a supervision tree |
 | Duplex | `Forcola.Duplex` | Bidirectional stdin/stdout session |
 
-The [getting started guide](guides/getting_started.md) has a runnable example,
+The [getting started guide](https://hexdocs.pm/forcola/getting_started.html) has a runnable example,
 options, and return/message shapes for each mode.
 
 ## Process groups and cleanup
@@ -95,7 +95,7 @@ ordinary grandchildren die with the command. Deliberate daemonizers (double-fork
 plus `setsid`) leave the group; on Linux the opt-in `cgroup: true` layer
 contains them. Daemon control channels like docker and work handed to system
 schedulers stay out of reach of any process-based mechanism. The [process groups
-guide](guides/process_groups.md) covers the kill sequence, the cgroup containment
+guide](https://hexdocs.pm/forcola/process_groups.html) covers the kill sequence, the cgroup containment
 layer, the death-confirmed-before-return guarantee and its exception, and the
 full "What group kill cannot reach" audit.
 
@@ -105,7 +105,7 @@ Forcola slots into existing CLI wrapper libraries without becoming a mandatory
 dependency: the wrapper defines a small runner behaviour, keeps its
 `System.cmd/3` path as the default, and accepts a Forcola-backed one via
 config, with Forcola as an optional dep. The [adoption
-guide](guides/adopting_forcola.md) covers the pattern, a worked example against
+guide](https://hexdocs.pm/forcola/adopting_forcola.html) covers the pattern, a worked example against
 a real wrapper, the mode mapping, and migration notes for erlexec-based
 wrappers.
 
@@ -120,7 +120,7 @@ wrappers.
   package; its x86-64-only binary distribution is the cautionary tale the
   release workflow here is designed around.
 
-The [alternatives guide](guides/alternatives.md) compares these in detail.
+The [alternatives guide](https://hexdocs.pm/forcola/alternatives.html) compares these in detail.
 
 ## License
 
