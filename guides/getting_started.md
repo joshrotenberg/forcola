@@ -12,7 +12,7 @@ Add `forcola` to your dependencies:
 ```elixir
 def deps do
   [
-    {:forcola, "~> 0.1"}
+    {:forcola, "~> 0.3"}
   ]
 end
 ```
@@ -148,7 +148,10 @@ Key properties:
 - Graceful fallback, never an error. On macOS, on non-cgroup-v2 systems, or when
   the subtree is not delegated, it degrades to the process-group kill and logs a
   warning; ordinary in-group grandchildren still die exactly as before. A
-  `Logger.debug` line is emitted when containment was actually active.
+  `Logger.debug` line is emitted when containment was actually active; this
+  line comes from `run/2` and `Forcola.Daemon` (`Forcola.Stream` and
+  `Forcola.Duplex` report their exit through messages or a raise and do not
+  emit it).
 
 See the [process groups guide](process_groups.html#deliberate-daemonizers) for
 the mechanism.

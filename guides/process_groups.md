@@ -130,8 +130,10 @@ non-cgroup-v2 systems, and when the subtree is not delegated, `cgroup: true`
 falls back to the ordinary process-group kill and logs a warning; ordinary
 in-group grandchildren still die exactly as before. The EXIT report carries a
 `contained` flag reporting which mechanism was used, surfaced as a
-`Logger.debug` line when containment was active. See `Forcola.run/2` for the
-option.
+`Logger.debug` line when containment was active. That line comes from
+`Forcola.run/2` and `Forcola.Daemon`; `Forcola.Stream` and `Forcola.Duplex`
+report their exit through messages or a raise and do not emit it. See
+`Forcola.run/2` for the option.
 
 ### Client/daemon control channels
 

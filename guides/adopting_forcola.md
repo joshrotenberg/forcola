@@ -48,12 +48,12 @@ Three pieces:
 # mix.exs of the wrapper library
 defp deps do
   [
-    {:forcola, "~> 0.1", optional: true}
+    {:forcola, "~> 0.3", optional: true}
   ]
 end
 ```
 
-Consumers who want leak-free execution add `{:forcola, "~> 0.1"}` to their
+Consumers who want leak-free execution add `{:forcola, "~> 0.3"}` to their
 own deps and set one config line. Everyone else is untouched.
 
 ## Worked example: git_wrapper_ex
@@ -248,7 +248,7 @@ to choose each.
 For a wrapper that uses erlexec today for the same contract (group kill on
 timeout, cleanup on BEAM death), the migration is mechanical:
 
-1. Add `{:forcola, "~> 0.1"}` and swap the erlexec calls for their Forcola
+1. Add `{:forcola, "~> 0.3"}` and swap the erlexec calls for their Forcola
    counterparts; bounded runs become `Forcola.run/2` with `:timeout_ms`.
 2. Run your existing test suite; it is the acceptance bar. Forcola's own
    suite covers the group-kill contract cases, including the
