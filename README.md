@@ -21,7 +21,7 @@ Add `forcola` to your dependencies:
 ```elixir
 def deps do
   [
-    {:forcola, "~> 0.1"}
+    {:forcola, "~> 0.3"}
   ]
 end
 ```
@@ -91,12 +91,13 @@ options, and return/message shapes for each mode.
 ## Process groups and cleanup
 
 The group kill covers the child and everything it keeps in its process group:
-ordinary grandchildren die with the command. Deliberate daemonizers, daemon
-control channels like docker, and work handed to system schedulers leave the
-group and are out of reach of any client-side mechanism. The [process groups
-guide](guides/process_groups.md) covers the kill sequence, the
-death-confirmed-before-return guarantee and its exception, and the full "What
-group kill cannot reach" audit.
+ordinary grandchildren die with the command. Deliberate daemonizers (double-fork
+plus `setsid`) leave the group; on Linux the opt-in `cgroup: true` layer
+contains them. Daemon control channels like docker and work handed to system
+schedulers stay out of reach of any process-based mechanism. The [process groups
+guide](guides/process_groups.md) covers the kill sequence, the cgroup containment
+layer, the death-confirmed-before-return guarantee and its exception, and the
+full "What group kill cannot reach" audit.
 
 ## Adopting in a wrapper library
 

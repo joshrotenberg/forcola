@@ -138,7 +138,9 @@ defmodule Forcola.RunAsUserTest do
   @tag :root_only
   test "root can actually drop to nobody", %{tmp_dir: tmp_dir} do
     if current_uid() != "0" do
-      # Only meaningful as root; stays green as non-root on CI.
+      # Only meaningful as root; stays green as non-root on CI. Skip LOUDLY:
+      # print a clear reason rather than passing silently.
+      IO.puts("SKIP: root-only privilege-drop test; not running as root")
       assert true
     else
       out_file = Path.join(tmp_dir, "dropped-uid")

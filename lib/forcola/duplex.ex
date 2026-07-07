@@ -84,6 +84,10 @@ defmodule Forcola.Duplex do
       `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
       privileged shim; failures fail closed and arrive as
       `{:forcola_exit, session, {:spawn_error, reason}}`.
+    * `:cgroup` - opt-in Linux cgroup v2 containment of deliberate
+      daemonizers, as in `Forcola.run/2`. Linux only, requires a delegated
+      cgroup v2 subtree, and falls back to the process-group kill with a
+      warning elsewhere. Default `false`.
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace, default `5_000`.
     * `:pty` - run the child under a pseudo-terminal (default `false`). In
       pty mode stderr is merged into `:forcola_line` and no `:forcola_stderr`
