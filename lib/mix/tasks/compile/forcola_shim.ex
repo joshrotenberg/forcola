@@ -17,7 +17,11 @@ defmodule Mix.Tasks.Compile.ForcolaShim do
      copied into `priv/` when stale. This is the development path.
   4. Otherwise the compile fails with instructions.
 
-  `Forcola.Shim.path/0` reads whatever binary ends up in `priv/`.
+  The binary is placed in the source `priv/` and also synced into the
+  build priv (`Mix.Project.app_path/0` + `priv/`), where
+  `Forcola.Shim.path/0` and `mix release` read it. Mix copies a dep's
+  source priv into the build priv before this compiler runs, so the
+  sync is what makes a fresh install resolve; see #47.
   """
   use Mix.Task.Compiler
 
@@ -55,13 +59,17 @@ defmodule Mix.Tasks.Compile.ForcolaShim do
     dest = Path.join("priv", @bin_name)
 
     if File.exists?(dest) do
-      {:noop, []}
+      # Even when the source-priv binary is already present and the
+      # download is skipped, repair a stale or missing build priv so
+      # Shim.path/0 resolves on a fresh install (see #47).
+      sync_to_build_priv(dest)
     else
       version = Mix.Project.config()[:version]
       Mix.shell().info("Downloading precompiled forcola_shim v#{version}...")
 
       case Forcola.Precompiled.install(version, "priv") do
-        {:ok, _bin} ->
+        {:ok, bin} ->
+          sync_to_build_priv(bin)
           {:ok, []}
 
         {:error, message} ->
@@ -100,6 +108,31 @@ defmodule Mix.Tasks.Compile.ForcolaShim do
       File.mkdir_p!("priv")
       File.cp!(src, dest)
       File.chmod!(dest, 0o755)
+      sync_to_build_priv(dest)
+      {:ok, []}
+    else
+      # The cargo build was a noop, but the build priv may still be stale
+      # or missing (fresh install), so repair it (see #47).
+      sync_to_build_priv(dest)
+    end
+  end
+
+  # Copies the source-priv binary into the build priv, where Shim.path/0
+  # and `mix release` read it. Mix copies a dep's source priv into the
+  # build priv before this compiler downloads/builds the binary and does
+  # not re-sync afterward, so on a fresh install the build priv is stale
+  # or missing. Runs every compile but guards on a stale/exists check so
+  # it is cheap when already in sync. Uses Mix.Project.app_path/0, which
+  # is correct at compile time (Application.app_dir/2 may not resolve).
+  # Returns {:ok, []} when the build priv was (re)populated, {:noop, []}
+  # otherwise.
+  defp sync_to_build_priv(source) do
+    build_dest = Path.join([Mix.Project.app_path(), "priv", @bin_name])
+
+    if File.exists?(source) and stale?(source, build_dest) do
+      File.mkdir_p!(Path.dirname(build_dest))
+      File.cp!(source, build_dest)
+      File.chmod!(build_dest, 0o755)
       {:ok, []}
     else
       {:noop, []}
