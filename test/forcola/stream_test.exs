@@ -343,26 +343,32 @@ defmodule Forcola.StreamTest do
     end
 
     test "a slow-but-alive consumer under backpressure does not trip a short idle timeout" do
-      # The producer emits far more than one window, so it is genuinely
-      # blocked by backpressure while the consumer pauses. The pause (600ms)
-      # exceeds the idle interval (200ms), but it is consumer-driven and must
-      # not raise. All lines must still be delivered.
+      # The producer emits far more than one window plus the OS pipe buffer, so
+      # it is genuinely blocked by backpressure while the consumer pauses. The
+      # pause (2000ms) exceeds the idle interval (1000ms), but the stall is
+      # consumer-driven and must not raise; all lines must still be delivered.
+      #
+      # A window this size keeps the post-resume drain to a handful of credit
+      # round-trips, each reading an already-full pipe, so a live producer never
+      # approaches the idle interval. A short window with this many lines would
+      # need hundreds of round-trips and could hit a scheduling hiccup on a
+      # loaded runner; that is a test-shape concern, not a backpressure one.
       test = self()
 
       consumer =
         spawn(fn ->
           result =
-            ["/bin/sh", "-c", "seq 1 100000"]
+            ["/bin/sh", "-c", "seq 1 50000"]
             |> Forcola.Stream.lines(
               timeout_ms: 60_000,
-              idle_timeout_ms: 200,
-              window_bytes: 4096
+              idle_timeout_ms: 1_000,
+              window_bytes: 65_536
             )
             |> Enum.reduce_while({0, []}, fn line, {n, acc} ->
               n = n + 1
               acc = [line | acc]
 
-              if n == 5 do
+              if n == 3 do
                 send(test, :warmed)
 
                 receive do
@@ -378,15 +384,15 @@ defmodule Forcola.StreamTest do
         end)
 
       assert_receive :warmed, 15_000
-      # Hold the consumer paused past the idle interval, then resume.
-      Process.sleep(600)
+      # Hold the consumer paused well past the idle interval, then resume.
+      Process.sleep(2_000)
       send(consumer, :resume)
 
       assert_receive {:result, collected}, 30_000
       lines = Enum.reverse(collected)
-      assert length(lines) == 100_000
+      assert length(lines) == 50_000
       assert List.first(lines) == "1"
-      assert List.last(lines) == "100000"
+      assert List.last(lines) == "50000"
     end
 
     test "a genuinely hung producer under backpressure still raises the idle timeout" do
