@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/joshrotenberg/forcola/compare/v0.3.1...v0.3.2) (2026-07-07)
+
+
+### Bug Fixes
+
+* sync downloaded shim into the build priv so Shim.path/0 resolves on fresh install (closes [#47](https://github.com/joshrotenberg/forcola/issues/47)) ([#48](https://github.com/joshrotenberg/forcola/issues/48)) ([93b8f24](https://github.com/joshrotenberg/forcola/commit/93b8f24d18a8a0f313d51737663712386d6d0c95))
+
 ## [0.3.1](https://github.com/joshrotenberg/forcola/compare/v0.3.0...v0.3.1) (2026-07-07)
 
 
