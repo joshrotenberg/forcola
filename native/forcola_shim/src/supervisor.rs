@@ -2,9 +2,10 @@
 //! and applies the kill sequence on timeout, KILL frame, or stdin EOF.
 
 use crate::cgroup::{self, Cgroup};
+use crate::credit::{Credit, Permit};
 use crate::frame::{
-    self, Frame, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_KILL, TAG_SPAWN, TAG_STDERR, TAG_STDIN,
-    TAG_STDOUT,
+    self, Frame, TAG_CREDIT, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_KILL, TAG_SPAWN, TAG_STDERR,
+    TAG_STDIN, TAG_STDOUT,
 };
 use crate::privdrop::{self, DropPlan};
 use crate::protocol::{ErrorReport, ExitReport, SpawnRequest};
@@ -84,6 +85,12 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
     let pgid = Pid::from_child(&child);
     let kill_grace = Duration::from_millis(request.kill_grace_ms);
 
+    // Backpressure is opt-in: a `window_bytes` in the SPAWN payload gates the
+    // stdout pump on a shared read budget. Absent, the pump reads eagerly and
+    // the default path is byte-for-byte unchanged. The budget starts at zero,
+    // so the pump parks until the BEAM's first CREDIT frame.
+    let credit = request.window_bytes.map(|_| Credit::new());
+
     let (tx, rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
 
     // Pump completion channel: each pump sends one () when its source hits
@@ -111,6 +118,7 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
                 TAG_STDOUT,
                 Arc::clone(&out),
                 pump_done_tx.clone(),
+                credit.clone(),
             );
             // Dropping the last pump_done_tx sender is what lets drain_pumps
             // terminate; keep the count honest by dropping the spare here.
@@ -127,17 +135,22 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
                 TAG_STDOUT,
                 Arc::clone(&out),
                 pump_done_tx.clone(),
+                credit.clone(),
             );
             let stderr_tag = if request.merge_stderr {
                 TAG_STDOUT
             } else {
                 TAG_STDERR
             };
+            // STDERR is never gated: backpressure bounds the child's stdout
+            // stream only. Under merge_stderr the stderr bytes ride the STDOUT
+            // tag but stay eager.
             pumps += spawn_output_pump(
                 child.stderr.take(),
                 stderr_tag,
                 Arc::clone(&out),
                 pump_done_tx,
+                None,
             );
         }
     }
@@ -162,6 +175,7 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         pumps,
         &pump_done_rx,
         cgroup.as_ref(),
+        credit.as_ref(),
     );
 
     Ok(())
@@ -348,31 +362,81 @@ fn errno(e: rustix::io::Errno) -> io::Error {
 /// one `()` on `done` when the pipe is exhausted. Returns the number of
 /// pumps spawned (0 or 1); 0 only if the pipe wasn't captured, which
 /// shouldn't happen given `Stdio::piped()`.
+///
+/// With `credit` present the pump is gated: it reads the child only while it
+/// holds read budget, which is how backpressure reaches the producer. With
+/// `credit` `None` the pump reads eagerly (the default path).
 fn spawn_output_pump<P: Read + Send + 'static, W: Write + Send + 'static>(
     pipe: Option<P>,
     tag: u8,
     out: Arc<Mutex<W>>,
     done: Sender<()>,
+    credit: Option<Credit>,
 ) -> usize {
     let Some(mut pipe) = pipe else { return 0 };
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        loop {
-            match pipe.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let mut w = out.lock().unwrap();
-                    if frame::write_frame(&mut *w, tag, &buf[..n]).is_err() {
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
+        match credit {
+            None => pump_eager(&mut pipe, tag, &out, &mut buf),
+            Some(credit) => pump_gated(&mut pipe, tag, &out, &mut buf, &credit),
         }
         let _ = done.send(());
     });
     1
+}
+
+/// The default, ungated pump: read as fast as the pipe allows, forward every
+/// chunk. Unchanged from the pre-backpressure behavior.
+fn pump_eager<P: Read, W: Write>(pipe: &mut P, tag: u8, out: &Arc<Mutex<W>>, buf: &mut [u8]) {
+    loop {
+        match pipe.read(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut w = out.lock().unwrap();
+                if frame::write_frame(&mut *w, tag, &buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// The backpressure pump: read the child only while the budget allows. At
+/// zero credit it parks on the condvar (no busy-spin); the OS pipe fills and
+/// the child's next write blocks. A CREDIT grant wakes it; an uncork (child
+/// exited) lets it drain the pipe to EOF so buffered output is not lost.
+fn pump_gated<P: Read, W: Write>(
+    pipe: &mut P,
+    tag: u8,
+    out: &Arc<Mutex<W>>,
+    buf: &mut [u8],
+    credit: &Credit,
+) {
+    loop {
+        let n = match credit.await_permit(buf.len()) {
+            Permit::Uncork => match pipe.read(buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            },
+            Permit::Read(cap) => match pipe.read(&mut buf[..cap]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    credit.consume(n);
+                    n
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            },
+        };
+        let mut w = out.lock().unwrap();
+        if frame::write_frame(&mut *w, tag, &buf[..n]).is_err() {
+            break;
+        }
+    }
 }
 
 /// Reads protocol frames off the shim's stdin and forwards them as
@@ -436,6 +500,7 @@ fn supervise<W: Write>(
     pumps: usize,
     pump_done: &Receiver<()>,
     cgroup: Option<&Cgroup>,
+    credit: Option<&Credit>,
 ) {
     let mut timed_out = false;
     let mut beam_gone = false;
@@ -452,6 +517,13 @@ fn supervise<W: Write>(
             }
             Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
                 kill_group(pgid, kill_grace, cgroup);
+            }
+            Ok(Event::Stdin(f)) if f.tag == TAG_CREDIT => {
+                // Grant the stdout pump more read budget. Ignored when
+                // backpressure was not requested (no shared budget exists).
+                if let (Some(c), Some(n)) = (credit, crate::credit::parse_grant(&f.payload)) {
+                    c.grant(n);
+                }
             }
             Ok(Event::Stdin(_)) => {
                 // Unknown/unexpected tag mid-session; ignore rather than
@@ -482,6 +554,13 @@ fn supervise<W: Write>(
         status: None,
         signal: None,
     });
+
+    // The child is reaped. Uncork the stdout pump so a credit-starved pump
+    // wakes and drains whatever the child left in the pipe to EOF, instead of
+    // parking until the drain grace elapses and losing that trailing output.
+    if let Some(c) = credit {
+        c.uncork();
+    }
 
     // Tear the contained subtree down after the child is reaped, whether it
     // was killed or exited on its own. `finish_cgroup` writes cgroup.kill (in
@@ -638,8 +717,88 @@ fn write_error<W: Write>(out: &Arc<Mutex<W>>, reason: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::probe_says_alive;
+    use super::{probe_says_alive, pump_eager, pump_gated};
+    use crate::credit::Credit;
+    use crate::frame::{read_frame, TAG_STDOUT};
     use rustix::io::Errno;
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    // Decodes concatenated frames back into their joined payload bytes.
+    fn joined_payloads(bytes: &[u8]) -> Vec<u8> {
+        let mut cur = Cursor::new(bytes.to_vec());
+        let mut out = Vec::new();
+        while let Some(f) = read_frame(&mut cur).unwrap() {
+            assert_eq!(f.tag, TAG_STDOUT);
+            out.extend_from_slice(&f.payload);
+        }
+        out
+    }
+
+    fn wait_for_len(out: &Arc<Mutex<Vec<u8>>>, target: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while out.lock().unwrap().len() < target {
+            assert!(
+                Instant::now() < deadline,
+                "output never reached {target} bytes"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn gated_pump_pauses_at_zero_credit_and_resumes_on_grant() {
+        let data: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let credit = Credit::new();
+
+        let out2 = Arc::clone(&out);
+        let credit2 = credit.clone();
+        let data2 = data.clone();
+        let handle = thread::spawn(move || {
+            let mut pipe = Cursor::new(data2);
+            let mut buf = [0u8; 8192];
+            pump_gated(&mut pipe, TAG_STDOUT, &out2, &mut buf, &credit2);
+        });
+
+        // Grant 40 bytes: the pump forwards exactly one 40-byte frame (5 bytes
+        // of framing) and then parks, unable to read further without credit.
+        credit.grant(40);
+        wait_for_len(&out, 45);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            out.lock().unwrap().len(),
+            45,
+            "pump read past its credit while parked"
+        );
+
+        // Grant the remaining 60: forwarded, then parks again (no credit, and
+        // not yet uncorked, even though the pipe is at EOF).
+        credit.grant(60);
+        wait_for_len(&out, 110);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(out.lock().unwrap().len(), 110);
+
+        // Uncork lets the pump observe EOF and exit.
+        credit.uncork();
+        handle.join().unwrap();
+
+        assert_eq!(joined_payloads(&out.lock().unwrap()), data);
+    }
+
+    #[test]
+    fn eager_pump_forwards_everything_without_credit() {
+        let data: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+        let mut pipe = Cursor::new(data.clone());
+        let mut buf = [0u8; 8192];
+        pump_eager(&mut pipe, TAG_STDOUT, &out, &mut buf);
+
+        assert_eq!(joined_payloads(&out.lock().unwrap()), data);
+    }
 
     #[test]
     fn probe_ok_means_alive() {

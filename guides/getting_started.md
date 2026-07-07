@@ -176,6 +176,26 @@ or stderr), not only newline-terminated lines. This suits a long-lived follow
 (agent stream-json, `docker events`) that may legitimately run for hours but
 should die if the producer hangs.
 
+`:window_bytes` (optional) opts into demand-driven backpressure. By default the
+shim forwards the child's stdout as fast as the pipes allow, so a consumer slower
+than the producer buffers unconsumed output on the BEAM and can grow memory
+without bound. With a window the shim reads the child only while the stream has
+granted read credit; a slow consumer blocks the producer instead of buffering.
+The buffering bound is roughly one window in flight plus a frame in transit.
+`backpressure: true` is shorthand for a 64 KiB window.
+
+```elixir
+# Stream gigabytes to a slow consumer with bounded memory.
+Forcola.Stream.lines(["produce-huge-output"], timeout_ms: 600_000, window_bytes: 65_536)
+|> Stream.each(&slowly_handle/1)
+|> Stream.run()
+```
+
+A consumer-driven pause does not trip `:idle_timeout_ms` (the idle clock is reset
+each time the stream grants credit); a genuinely hung producer still does, and
+`:timeout_ms` still bounds a consumer that never consumes. Backpressure gates the
+child's stdout only; stderr always rides eagerly.
+
 Termination:
 
 - A zero exit ends the stream cleanly.

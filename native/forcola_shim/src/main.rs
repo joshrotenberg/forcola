@@ -23,10 +23,13 @@
 //! BEAM -> shim:
 //!   0x01 SPAWN   payload: JSON {argv, cd, env, merge_stderr, timeout_ms,
 //!                               kill_grace_ms, pty, pty_rows, pty_cols,
-//!                               user, group, cgroup}
+//!                               user, group, cgroup, window_bytes}
 //!   0x02 STDIN   payload: bytes for the child's stdin (duplex mode)
 //!   0x03 EOF     close the child's stdin
 //!   0x04 KILL    kill the group now
+//!   0x05 CREDIT  payload: 8-byte big-endian byte count; grants the stdout
+//!                pump that many more bytes of read budget under backpressure
+//!                (only when SPAWN carried window_bytes)
 //!
 //! shim -> BEAM:
 //!   0x11 STDOUT  payload: bytes from the child's stdout
@@ -35,6 +38,7 @@
 //!   0x14 ERROR   payload: JSON {reason} (spawn failure etc.)
 
 mod cgroup;
+mod credit;
 mod frame;
 mod privdrop;
 mod protocol;
