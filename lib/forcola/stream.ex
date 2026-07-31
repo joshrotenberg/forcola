@@ -42,9 +42,10 @@ defmodule Forcola.Stream do
   counts as alive. On idle expiry the same early-halt kill-and-confirm
   path runs (KILL the group, wait for the shim to confirm death, close the
   port) and `Forcola.Stream.Error` is raised with `idle_timed_out: true`
-  after any lines already produced have been emitted. Omitting the option
-  (the default) leaves behavior identical to a run bounded only by
-  `:timeout_ms`.
+  after any lines already produced have been emitted. Its `status` is the
+  confirmed child status from the shim; `{:signal, :unconfirmed}` is reserved
+  for a missing or invalid confirmation. Omitting the option (the default)
+  leaves behavior identical to a run bounded only by `:timeout_ms`.
 
   ## Backpressure
 
@@ -344,8 +345,13 @@ defmodule Forcola.Stream do
   # (stdin EOF) in cleanup/1 is the remaining kill lever.
   defp timeout_error(%{idle_deadline: idle_deadline, deadline: deadline} = state)
        when not is_nil(idle_deadline) and idle_deadline <= deadline do
-    kill_and_confirm(state)
-    %Error{status: {:signal, :unconfirmed}, idle_timed_out: true, stderr: stderr(state)}
+    status =
+      case kill_and_confirm(state) do
+        {:exit, status, _timed_out} -> status
+        _unconfirmed -> {:signal, :unconfirmed}
+      end
+
+    %Error{status: status, idle_timed_out: true, stderr: stderr(state)}
   end
 
   defp timeout_error(state) do
@@ -360,7 +366,7 @@ defmodule Forcola.Stream do
     Shim.send_frame(port, Shim.tag_kill())
     await_exit(port, kill_grace_ms + @backstop_margin_ms)
   catch
-    :error, :badarg -> :ok
+    :error, :badarg -> :shim_exited
   end
 
   defp handle_frame(tag, payload, state) do
@@ -460,31 +466,41 @@ defmodule Forcola.Stream do
     receive do
       {^port, {:data, <<tag, payload::binary>>}} ->
         cond do
-          tag == Shim.tag_exit() -> exit_confirmation(payload)
-          tag == Shim.tag_error() -> :ok
+          tag == Shim.tag_exit() -> decode_terminal_exit(payload)
+          tag == Shim.tag_error() -> :error
           true -> do_await_exit(port, deadline)
         end
 
       {^port, {:exit_status, _status}} ->
-        :ok
+        :shim_exited
     after
       max(remaining, 0) -> :timeout
     end
   end
 
-  defp exit_confirmation(payload) do
-    case Shim.decode_exit(payload) do
-      {{:signal, :unconfirmed}, _timed_out} -> :unconfirmed
-      _confirmed -> :ok
-    end
+  defp decode_terminal_exit(payload) do
+    {status, timed_out} = Shim.decode_exit(payload)
+    {:exit, status, timed_out}
+  rescue
+    _invalid_payload -> :malformed_exit
+  catch
+    _kind, _reason -> :malformed_exit
   end
 
-  defp warn_unconfirmed_cleanup(:unconfirmed) do
+  defp warn_unconfirmed_cleanup({:exit, {:signal, :unconfirmed}, _timed_out}) do
     Logger.warning("forcola: stream cleanup could not confirm process-group death")
   end
 
   defp warn_unconfirmed_cleanup(:timeout) do
     Logger.warning("forcola: stream cleanup timed out before shim confirmation")
+  end
+
+  defp warn_unconfirmed_cleanup(:malformed_exit) do
+    Logger.warning("forcola: stream cleanup received a malformed EXIT confirmation")
+  end
+
+  defp warn_unconfirmed_cleanup(:shim_exited) do
+    Logger.warning("forcola: shim exited before stream cleanup confirmation")
   end
 
   defp warn_unconfirmed_cleanup(_confirmed), do: :ok
