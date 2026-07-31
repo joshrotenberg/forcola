@@ -81,6 +81,15 @@ fn user_spawn_payload(argv: &[&str], user: &str) -> Vec<u8> {
     serde_json::to_vec(&obj).unwrap()
 }
 
+/// SPAWN payload carrying a numeric `group` and no user.
+fn group_spawn_payload(argv: &[&str], group: u32) -> Vec<u8> {
+    let obj = serde_json::json!({
+        "argv": argv,
+        "group": group,
+    });
+    serde_json::to_vec(&obj).unwrap()
+}
+
 /// SPAWN payload carrying `cgroup: true`, plus an optional kill grace.
 fn cgroup_spawn_payload(argv: &[&str], kill_grace_ms: Option<u64>) -> Vec<u8> {
     let mut obj = serde_json::json!({
@@ -341,6 +350,7 @@ fn group_kill_reaches_grandchild() {
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
     fn getuid() -> u32;
+    fn getgid() -> u32;
 }
 unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
     kill(pid, sig)
@@ -685,6 +695,64 @@ fn run_as_current_user_by_name_succeeds() {
         "command did not run as the current user"
     );
 
+    let _ = child.wait();
+}
+
+#[test]
+fn group_only_current_gid_is_applied_or_fails_closed() {
+    // An explicit group request must call setgroups even when setgid itself is
+    // unnecessary. Root can apply it and the child must see only that group;
+    // a non-root shim cannot call setgroups and must fail before exec.
+    let uid = unsafe { getuid() };
+    let gid = unsafe { getgid() };
+    let marker =
+        std::env::temp_dir().join(format!("forcola-same-gid-group-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+
+    let command = if uid == 0 {
+        vec!["id", "-G"]
+    } else {
+        vec!["sh", "-c", "touch $FORCOLA_SAME_GID_MARKER"]
+    };
+
+    let mut child = Command::new(shim_binary())
+        .env("FORCOLA_SAME_GID_MARKER", &marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start forcola_shim");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(&mut stdin, TAG_SPAWN, &group_spawn_payload(&command, gid));
+
+    let (out, terminal) = drain_until_exit(&mut stdout);
+    let terminal = terminal.expect("expected a terminal frame");
+
+    if uid == 0 {
+        assert_eq!(terminal.tag, TAG_EXIT, "root should apply the group plan");
+        let groups: Vec<u32> = String::from_utf8_lossy(&out)
+            .split_whitespace()
+            .map(|group| group.parse().expect("id -G returned a non-numeric gid"))
+            .collect();
+        assert!(!groups.is_empty(), "id -G returned no groups");
+        assert!(
+            groups.iter().all(|group| *group == gid),
+            "supplementary groups were not cleared to the requested gid: {groups:?}"
+        );
+    } else {
+        assert_eq!(
+            terminal.tag, TAG_ERROR,
+            "a non-root same-gid group request must fail closed at setgroups"
+        );
+        assert!(
+            !marker.exists(),
+            "the command ran despite setgroups lacking privilege"
+        );
+    }
+
+    let _ = std::fs::remove_file(&marker);
     let _ = child.wait();
 }
 

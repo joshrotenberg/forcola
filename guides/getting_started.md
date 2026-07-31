@@ -117,7 +117,10 @@ order. Key properties:
   these semantics fails with a clear error.
 - One-way drop. The shim process must already run with enough privilege to drop
   (root, or `CAP_SETUID`/`CAP_SETGID` on Linux). Requesting the user the shim
-  already runs as is a no-op and always succeeds.
+  already runs as, without `:group`, is a no-op and always succeeds. An
+  explicit `:group` always replaces supplementary groups, even when it resolves
+  to the current primary gid, so it still requires permission to call
+  `setgroups`.
 - Fail-closed. If the user/group cannot be resolved, or the shim lacks the
   privilege to drop, the child is never executed. The failure surfaces as the
   mode's normal spawn error (`{:error, {:spawn, reason}}` for `run/2`,

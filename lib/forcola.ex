@@ -111,8 +111,10 @@ defmodule Forcola do
   `setgid`, then `setuid`, in that order) in the child before exec. This
   is POSIX-only, a one-way drop, and requires the shim process itself to
   run with enough privilege to drop: root, or `CAP_SETUID`/`CAP_SETGID`
-  on Linux. Requesting the user the shim already runs as is a no-op and
-  always succeeds.
+  on Linux. Requesting only the user the shim already runs as is a no-op
+  and always succeeds. An explicit `:group` always replaces supplementary
+  groups, even when it is the current primary gid, so that path still needs
+  permission to call `setgroups`.
 
   It fails closed. If the user or group cannot be resolved, or the shim
   lacks the privilege to drop, the child is never executed and the call

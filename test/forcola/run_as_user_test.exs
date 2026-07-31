@@ -16,6 +16,11 @@ defmodule Forcola.RunAsUserTest do
     String.trim(out)
   end
 
+  defp current_gid do
+    {out, 0} = System.cmd("id", ["-g"])
+    out |> String.trim() |> String.to_integer()
+  end
+
   describe "run/2 :user happy path (no-op drop to the current user)" do
     test "requesting the current user by name runs the command" do
       me = current_username()
@@ -97,6 +102,32 @@ defmodule Forcola.RunAsUserTest do
 
       assert reason
       refute File.exists?(marker)
+    end
+  end
+
+  test "an explicit current gid clears groups as root or fails closed as non-root", %{
+    tmp_dir: tmp_dir
+  } do
+    gid = current_gid()
+
+    if current_uid() == "0" do
+      assert {:ok, %Forcola.Result{status: 0, stdout: stdout}} =
+               Forcola.run(["id", "-G"], timeout_ms: 5_000, group: gid)
+
+      groups = stdout |> String.split() |> Enum.map(&String.to_integer/1)
+      assert groups != []
+      assert Enum.all?(groups, &(&1 == gid))
+    else
+      marker = Path.join(tmp_dir, "same-gid-group-must-not-run")
+
+      assert {:error, {:spawn, reason}} =
+               Forcola.run(["/bin/sh", "-c", "touch #{marker}"],
+                 timeout_ms: 5_000,
+                 group: gid
+               )
+
+      assert reason
+      refute File.exists?(marker), "the command ran despite setgroups lacking privilege"
     end
   end
 

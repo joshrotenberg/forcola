@@ -10,7 +10,7 @@
 //!    another thread at fork time). Resolution failures fail closed: the child
 //!    is never spawned.
 //!
-//! 2. **Child, after fork, inside `pre_exec`** ([`Credentials::apply`]): call
+//! 2. **Child, after fork, inside `pre_exec`** ([`DropPlan::apply`]): call
 //!    only the numeric syscalls `setgroups`, `setgid`, `setuid`, in that fixed
 //!    order. Each is fail-closed: any error returns `Err` from the `pre_exec`
 //!    closure, aborting exec so the child never runs as the wrong user. Groups
@@ -36,18 +36,25 @@ pub struct Credentials {
     /// request this is what `getgrouplist` returned; for a `group`-only
     /// request it is just `[gid]`.
     pub groups: Vec<u32>,
+    /// Whether the SPAWN request explicitly supplied `group`. Even if that
+    /// group resolves to the current primary gid, its security meaning still
+    /// requires installing the prepared supplementary list.
+    group_requested: bool,
 }
 
 /// The subset of syscalls the child must actually run, computed in the parent
 /// by diffing [`Credentials`] against the shim's current identity. A field is
-/// `None` when the current process already satisfies it, so the syscall is
-/// skipped: this is what makes a no-op drop to the current user succeed even
-/// as a non-root process (where `setgroups`/`setgid`/`setuid` to the *same*
-/// identity would still fail with EPERM). A genuinely different target keeps
-/// its `Some`, so the syscall runs and fails closed when unprivileged.
+/// `None` when the current process already satisfies it, except that an
+/// explicitly requested group always retains `setgroups` so inherited
+/// supplementary groups are replaced. Skipping the other satisfied setters
+/// is what makes a no-op request for the current user succeed even as a
+/// non-root process. A genuinely different target keeps its `Some`, so the
+/// syscall runs and fails closed when unprivileged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropPlan {
-    groups: Option<Vec<u32>>,
+    /// Native gid values prepared in the parent so `apply` allocates nothing
+    /// after fork.
+    groups: Option<Vec<libc::gid_t>>,
     gid: Option<u32>,
     uid: Option<u32>,
 }
@@ -83,6 +90,7 @@ fn resolve_credentials(
                 uid: None,
                 gid,
                 groups: vec![gid],
+                group_requested: true,
             }))
         }
 
@@ -91,6 +99,7 @@ fn resolve_credentials(
         // gid but leaves the supplementary list as the user's.
         (Some(user), group) => {
             let resolved = resolve_user(user)?;
+            let group_requested = group.is_some();
             let gid = match group {
                 Some(group) => resolve_gid(group)?,
                 None => resolved.primary_gid,
@@ -100,6 +109,7 @@ fn resolve_credentials(
                 uid: Some(resolved.uid),
                 gid,
                 groups,
+                group_requested,
             }))
         }
     }
@@ -109,17 +119,20 @@ fn resolve_credentials(
 /// [`DropPlan`] that omits any syscall the process already satisfies. This runs
 /// in the parent so the child only ever runs the numeric setters.
 ///
-/// The key case is a no-op drop to the current user: when the request changes
-/// neither the uid nor the gid, there is nothing to drop, so all three setters
-/// (including `setgroups`) are skipped. This matters because `setgroups`
+/// The key no-op case is a request for only the current user: when the request
+/// changes neither uid nor gid and did not explicitly name a group, there is
+/// nothing to drop, so all three setters (including `setgroups`) are skipped.
+/// This matters because `setgroups`
 /// requires privilege even to install the *same* set, and because the group
 /// list resolved from the passwd/group database can legitimately differ from
 /// the process's live `getgroups()` set (notably on macOS, where directory
 /// membership is broader than the kernel's capped supplementary set): forcing
 /// it on a no-op would fail closed for no reason.
 ///
-/// When the request *does* change the uid or gid, a real drop was asked for, so
-/// `setgroups` is kept; it runs and fails closed if the shim is unprivileged.
+/// When the request *does* change the uid or gid, or explicitly supplies a
+/// group, `setgroups` is kept. In particular, `group: <current gid>` must still
+/// clear inherited supplementary groups; it runs and fails closed if the shim
+/// is unprivileged.
 fn plan_from_current(creds: Credentials) -> DropPlan {
     let cur_uid = unsafe { libc::getuid() } as u32;
     let cur_gid = unsafe { libc::getgid() } as u32;
@@ -127,10 +140,17 @@ fn plan_from_current(creds: Credentials) -> DropPlan {
     let uid = creds.uid.filter(|u| *u != cur_uid);
     let gid = Some(creds.gid).filter(|g| *g != cur_gid);
 
-    // A genuine drop changes the uid or the gid. If neither changes, the whole
-    // request is a no-op: skip setgroups too.
-    let groups = if uid.is_some() || gid.is_some() {
-        Some(creds.groups)
+    // An explicit group is never a full no-op: even a same-gid request must
+    // install the requested supplementary set. Convert to libc's native gid
+    // type here in the parent so apply() allocates nothing after fork.
+    let groups = if creds.group_requested || uid.is_some() || gid.is_some() {
+        Some(
+            creds
+                .groups
+                .into_iter()
+                .map(|group| group as libc::gid_t)
+                .collect(),
+        )
     } else {
         None
     };
@@ -225,9 +245,11 @@ impl DropPlan {
     /// privilege to change them. Each is fail-closed: the first error returns
     /// `Err`, aborting exec so the child never runs as the wrong user.
     ///
-    /// A field the parent found already satisfied is `None` and its syscall is
-    /// skipped, which is what lets a no-op drop to the current user succeed
-    /// without privilege.
+    /// A field the parent found already satisfied is generally `None` and its
+    /// syscall is skipped. The exception is an explicit group request, whose
+    /// supplementary list must be installed even when the primary gid already
+    /// matches. This is what lets a user-only no-op succeed without weakening
+    /// group-only clearing.
     ///
     /// # Safety
     ///
@@ -238,9 +260,8 @@ impl DropPlan {
         // 1. Supplementary groups first: must precede setuid, since after
         //    setuid the process may lack the privilege to call setgroups.
         if let Some(groups) = &self.groups {
-            let gids: Vec<libc::gid_t> = groups.iter().map(|g| *g as libc::gid_t).collect();
-            // Safety: gids points at a live, correctly-sized slice.
-            if unsafe { libc::setgroups(gids.len() as _, gids.as_ptr()) } != 0 {
+            // Safety: groups is a live, parent-prepared native gid slice.
+            if unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()) } != 0 {
                 return Err(io::Error::last_os_error());
             }
         }
@@ -449,6 +470,7 @@ mod tests {
         assert_eq!(creds.uid, None);
         assert_eq!(creds.gid, 20);
         assert_eq!(creds.groups, vec![20]);
+        assert!(creds.group_requested);
     }
 
     #[test]
@@ -461,6 +483,7 @@ mod tests {
         assert_eq!(creds.uid, Some(4242));
         assert_eq!(creds.gid, 99);
         assert_eq!(creds.groups, vec![99]);
+        assert!(creds.group_requested);
     }
 
     #[test]
@@ -506,6 +529,7 @@ mod tests {
             uid: Some(cur_uid),
             gid: cur_gid,
             groups: vec![cur_gid, 999_999],
+            group_requested: false,
         });
         assert_eq!(plan.uid, None, "uid to the current user must be skipped");
         assert_eq!(plan.gid, None, "gid to the current group must be skipped");
@@ -526,6 +550,7 @@ mod tests {
             uid: Some(other),
             gid: unsafe { libc::getgid() } as u32,
             groups: vec![10, 20],
+            group_requested: false,
         });
         assert_eq!(
             plan.uid,
@@ -549,9 +574,29 @@ mod tests {
             uid: None,
             gid: other_gid,
             groups: vec![other_gid],
+            group_requested: true,
         });
         assert_eq!(plan.uid, None);
         assert_eq!(plan.gid, Some(other_gid));
         assert_eq!(plan.groups, Some(vec![other_gid]));
+    }
+
+    #[test]
+    fn plan_keeps_setgroups_for_explicit_current_gid() {
+        let cur_gid = unsafe { libc::getgid() } as u32;
+        let plan = plan_from_current(Credentials {
+            uid: None,
+            gid: cur_gid,
+            groups: vec![cur_gid],
+            group_requested: true,
+        });
+
+        assert_eq!(plan.uid, None);
+        assert_eq!(plan.gid, None, "same-gid setgid remains unnecessary");
+        assert_eq!(
+            plan.groups,
+            Some(vec![cur_gid]),
+            "an explicit group must clear inherited supplementary groups"
+        );
     }
 }
