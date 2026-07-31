@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.3](https://github.com/joshrotenberg/forcola/compare/v0.3.2...v0.3.3) (2026-07-31)
+
+
+### Bug Fixes
+
+* honor explicit supplementary-group clearing ([#60](https://github.com/joshrotenberg/forcola/issues/60)) ([f1543fe](https://github.com/joshrotenberg/forcola/commit/f1543feb597833b95fb2f78685a66f8a1c180e53))
+* make shim installs content-aware and atomic ([#59](https://github.com/joshrotenberg/forcola/issues/59)) ([df1e23b](https://github.com/joshrotenberg/forcola/commit/df1e23b43bde2a3c833bcb11410b61e8c3531d8b))
+* preserve confirmed Stream idle-timeout status ([#61](https://github.com/joshrotenberg/forcola/issues/61)) ([bfd392c](https://github.com/joshrotenberg/forcola/commit/bfd392ce22c0679203396addadcfd4a45e3e5be9))
+* reap residual process-group members after leader exit ([#56](https://github.com/joshrotenberg/forcola/issues/56)) ([0b94c50](https://github.com/joshrotenberg/forcola/commit/0b94c50bd3a60555d4690d3efeda523008038c44))
+* surface unconfirmed process teardown ([#58](https://github.com/joshrotenberg/forcola/issues/58)) ([f1e92a1](https://github.com/joshrotenberg/forcola/commit/f1e92a199fd6cb96f662af4025e682eb8f1e257b))
+
 ## [0.3.2](https://github.com/joshrotenberg/forcola/compare/v0.3.1...v0.3.2) (2026-07-07)
 
 
