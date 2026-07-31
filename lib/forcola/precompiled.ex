@@ -13,9 +13,9 @@ defmodule Forcola.Precompiled do
   At compile time the `:forcola_shim` Mix compiler calls `install/2`,
   which detects the current target, downloads the matching tarball
   (cached under the user cache dir), verifies its SHA256 against the
-  checksum file, and extracts the binary into `priv/`. Any checksum
-  mismatch is an error; nothing is installed from an unverified
-  tarball.
+  checksum file, and atomically installs the binary into `priv/`. Any
+  checksum mismatch is an error; nothing is installed from an unverified
+  tarball and the live executable is never overwritten in place.
   """
 
   @targets [
@@ -123,16 +123,25 @@ defmodule Forcola.Precompiled do
   """
   @spec install(String.t(), Path.t()) :: {:ok, Path.t()} | {:error, String.t()}
   def install(version, priv_dir \\ "priv") do
+    case install_with_status(version, priv_dir) do
+      {:ok, bin, _status} -> {:ok, bin}
+      {:error, message} -> {:error, message}
+    end
+  end
+
+  @doc false
+  @spec install_with_status(String.t(), Path.t()) ::
+          {:ok, Path.t(), :changed | :unchanged} | {:error, String.t()}
+  def install_with_status(version, priv_dir \\ "priv") do
     with {:ok, target} <- target(),
          {:ok, checksums} <- read_checksums() do
       name = artifact_name(version, target)
 
       with {:ok, expected} <- expected_checksum(checksums, name),
            {:ok, body} <- fetch_artifact(name, download_url(version, target), expected),
-           :ok <- extract(body, priv_dir) do
+           {:ok, status} <- install_archive(body, priv_dir) do
         bin = Path.join(priv_dir, @bin_name)
-        File.chmod!(bin, 0o755)
-        {:ok, bin}
+        {:ok, bin, status}
       end
     end
   end
@@ -184,13 +193,48 @@ defmodule Forcola.Precompiled do
     :ok
   end
 
-  defp extract(body, dest_dir) do
+  @doc false
+  @spec install_archive(binary(), Path.t()) ::
+          {:ok, :changed | :unchanged} | {:error, String.t()}
+  def install_archive(body, dest_dir) do
     File.mkdir_p!(dest_dir)
+    extraction_dir = extraction_dir(dest_dir)
+    File.mkdir_p!(extraction_dir)
 
-    case :erl_tar.extract({:binary, body}, [:compressed, {:cwd, String.to_charlist(dest_dir)}]) do
-      :ok -> :ok
-      {:error, reason} -> {:error, "tarball extraction failed: #{inspect(reason)}"}
+    try do
+      case :erl_tar.extract(
+             {:binary, body},
+             [:compressed, {:cwd, String.to_charlist(extraction_dir)}]
+           ) do
+        :ok ->
+          install_extracted_binary(extraction_dir, dest_dir)
+
+        {:error, reason} ->
+          {:error, "tarball extraction failed: #{inspect(reason)}"}
+      end
+    after
+      File.rm_rf(extraction_dir)
     end
+  end
+
+  defp install_extracted_binary(extraction_dir, dest_dir) do
+    source = Path.join(extraction_dir, @bin_name)
+    destination = Path.join(dest_dir, @bin_name)
+
+    if File.regular?(source) do
+      {:ok, Forcola.AtomicFile.copy_executable_if_changed(source, destination)}
+    else
+      {:error, "tarball did not contain #{@bin_name}"}
+    end
+  rescue
+    error in File.Error -> {:error, "binary install failed: #{Exception.message(error)}"}
+  end
+
+  defp extraction_dir(dest_dir) do
+    destination = Path.expand(dest_dir)
+    parent = Path.dirname(destination)
+    unique = System.unique_integer([:monotonic, :positive])
+    Path.join(parent, ".forcola_shim.extract-#{unique}")
   end
 
   defp system_architecture do

@@ -91,4 +91,47 @@ defmodule Forcola.PrecompiledTest do
       assert message =~ "not found"
     end
   end
+
+  describe "install_archive/2" do
+    @tag :tmp_dir
+    test "atomically replaces the installed executable", %{tmp_dir: tmp_dir} do
+      archive = archive(tmp_dir, "new shim")
+      priv_dir = Path.join(tmp_dir, "priv")
+      destination = Path.join(priv_dir, "forcola_shim")
+      File.mkdir_p!(priv_dir)
+      File.write!(destination, "old shim")
+      old_handle = File.open!(destination, [:read, :binary])
+
+      try do
+        assert {:ok, :changed} = Precompiled.install_archive(archive, priv_dir)
+        assert File.read!(destination) == "new shim"
+        assert IO.binread(old_handle, :eof) == "old shim"
+        assert Bitwise.band(File.stat!(destination).mode, 0o777) == 0o755
+      after
+        File.close(old_handle)
+      end
+    end
+
+    @tag :tmp_dir
+    test "leaves no extraction directory after an invalid archive", %{tmp_dir: tmp_dir} do
+      priv_dir = Path.join(tmp_dir, "priv")
+
+      assert {:error, message} = Precompiled.install_archive("not a tarball", priv_dir)
+      assert message =~ "tarball extraction failed"
+      assert Path.wildcard(Path.join(tmp_dir, ".forcola_shim.extract-*")) == []
+    end
+  end
+
+  defp archive(tmp_dir, body) do
+    archive_path = Path.join(tmp_dir, "shim.tar.gz")
+
+    :ok =
+      :erl_tar.create(
+        String.to_charlist(archive_path),
+        [{~c"forcola_shim", body}],
+        [:compressed]
+      )
+
+    File.read!(archive_path)
+  end
 end
