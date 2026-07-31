@@ -3,6 +3,52 @@ defmodule Mix.Tasks.Compile.ForcolaShimTest do
   # which must not race other tests that spawn the shim.
   use ExUnit.Case, async: false
 
+  alias Mix.Tasks.Compile.ForcolaShim
+
+  @tag :tmp_dir
+  test "source builds defer freshness to Cargo instead of target mtimes", %{tmp_dir: tmp_dir} do
+    fixture = compiler_fixture(tmp_dir, "new shim")
+    File.mkdir_p!(Path.dirname(fixture.dest))
+    File.write!(fixture.dest, "stale shim")
+    File.touch!(fixture.dest, System.os_time(:second) + 3_600)
+
+    assert {:ok, []} =
+             ForcolaShim.build_and_copy(:debug,
+               cargo: fixture.cargo,
+               native_dir: fixture.native_dir,
+               dest: fixture.dest,
+               build_dest: fixture.build_dest
+             )
+
+    assert File.read!(fixture.dest) == "new shim"
+    assert File.read!(fixture.build_dest) == "new shim"
+  end
+
+  @tag :tmp_dir
+  test "source builds report noop when installed content is unchanged", %{tmp_dir: tmp_dir} do
+    fixture = compiler_fixture(tmp_dir, "same shim")
+    File.mkdir_p!(Path.dirname(fixture.dest))
+    File.mkdir_p!(Path.dirname(fixture.build_dest))
+    File.write!(fixture.dest, "same shim")
+    File.write!(fixture.build_dest, "same shim")
+    File.chmod!(fixture.dest, 0o755)
+    File.chmod!(fixture.build_dest, 0o755)
+
+    destination_inode = File.stat!(fixture.dest).inode
+    build_inode = File.stat!(fixture.build_dest).inode
+
+    assert {:noop, []} =
+             ForcolaShim.build_and_copy(:debug,
+               cargo: fixture.cargo,
+               native_dir: fixture.native_dir,
+               dest: fixture.dest,
+               build_dest: fixture.build_dest
+             )
+
+    assert File.stat!(fixture.dest).inode == destination_inode
+    assert File.stat!(fixture.build_dest).inode == build_inode
+  end
+
   # Reproduces the fresh-install condition from #47.
   #
   # When forcola is a dependency, Mix COPIES the dep's source priv/ into
@@ -67,5 +113,23 @@ defmodule Mix.Tasks.Compile.ForcolaShimTest do
 
     assert File.exists?(build_bin), "compiler did not repopulate the build priv"
     assert {:ok, ^build_bin} = Forcola.Shim.path()
+  end
+
+  defp compiler_fixture(tmp_dir, target_body) do
+    native_dir = Path.join(tmp_dir, "native/forcola_shim")
+    target = Path.join(native_dir, "target/debug/forcola_shim")
+    cargo = Path.join(tmp_dir, "cargo")
+
+    File.mkdir_p!(Path.dirname(target))
+    File.write!(target, target_body)
+    File.write!(cargo, "#!/bin/sh\nexit 0\n")
+    File.chmod!(cargo, 0o755)
+
+    %{
+      native_dir: native_dir,
+      cargo: cargo,
+      dest: Path.join(tmp_dir, "source_priv/forcola_shim"),
+      build_dest: Path.join(tmp_dir, "build_priv/forcola_shim")
+    }
   end
 end
