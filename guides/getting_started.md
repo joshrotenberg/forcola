@@ -181,7 +181,9 @@ stalled, the group is killed, and `Forcola.Stream.Error` is raised with
 whichever bound fires first wins. The idle deadline resets on any output (stdout
 or stderr), not only newline-terminated lines. This suits a long-lived follow
 (agent stream-json, `docker events`) that may legitimately run for hours but
-should die if the producer hangs.
+should die if the producer hangs. The error carries the child status from the
+shim's confirming EXIT frame; it uses `{:signal, :unconfirmed}` only when that
+confirmation is missing, malformed, or itself reports unconfirmed cleanup.
 
 `:window_bytes` (optional) opts into demand-driven backpressure. By default the
 shim forwards the child's stdout as fast as the pipes allow, so a consumer slower

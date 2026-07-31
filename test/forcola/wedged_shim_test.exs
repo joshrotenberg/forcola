@@ -42,9 +42,9 @@ defmodule Forcola.WedgedShimTest do
     :ok
   end
 
-  test "run/2 and Stream.lines return {:signal, :unconfirmed} at the backstop deadline" do
-    # Both deadlines are timeout + grace + margin; the two scenarios run
-    # concurrently so the test costs one deadline, not two.
+  test "run/2 and both Stream backstops return :unconfirmed at their deadlines" do
+    # All deadlines are timeout + grace + margin; the three scenarios run
+    # concurrently so the test costs one deadline, not three.
     deadline_ms = @timeout_ms + @kill_grace_ms + @backstop_margin_ms
 
     run_task =
@@ -70,10 +70,30 @@ defmodule Forcola.WedgedShimTest do
         end)
       end)
 
+    idle_stream_task =
+      Task.async(fn ->
+        timed(fn ->
+          try do
+            ["/bin/echo", "hi"]
+            |> Forcola.Stream.lines(
+              timeout_ms: 60_000,
+              idle_timeout_ms: @timeout_ms,
+              kill_grace_ms: @kill_grace_ms
+            )
+            |> Enum.to_list()
+          rescue
+            e in Forcola.Stream.Error -> {:raised, e}
+          end
+        end)
+      end)
+
     # Task.await bounds the upper side: a backstop that never fires
     # fails here instead of hanging the suite.
     {run_result, run_ms} = Task.await(run_task, deadline_ms + 10_000)
     {stream_result, stream_ms} = Task.await(stream_task, deadline_ms + 10_000)
+
+    {idle_stream_result, idle_stream_ms} =
+      Task.await(idle_stream_task, deadline_ms + 10_000)
 
     assert {:error, {:timeout, %Forcola.Result{status: {:signal, :unconfirmed}}}} = run_result
     assert run_ms >= deadline_ms - 100, "run/2 returned before its backstop deadline"
@@ -82,6 +102,16 @@ defmodule Forcola.WedgedShimTest do
              stream_result
 
     assert stream_ms >= deadline_ms - 100, "Stream returned before its backstop deadline"
+
+    assert {:raised,
+            %Forcola.Stream.Error{
+              status: {:signal, :unconfirmed},
+              idle_timed_out: true,
+              timed_out: false
+            }} = idle_stream_result
+
+    assert idle_stream_ms >= deadline_ms - 100,
+           "Stream idle cleanup returned before its confirmation backstop"
   end
 
   test "Duplex.close/1 and Daemon stop return after the shutdown backstop" do

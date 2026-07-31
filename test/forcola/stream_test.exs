@@ -172,10 +172,52 @@ defmodule Forcola.StreamTest do
 
       assert error.idle_timed_out
       refute error.timed_out
+      refute error.status == {:signal, :unconfirmed}
 
       [parent, child] = pid_file |> File.read!() |> String.split()
       refute alive?(parent), "parent survived the idle-timeout kill"
       refute alive?(child), "grandchild survived the idle-timeout kill (group kill failed)"
+    end
+
+    test "preserves the confirmed child status when EXIT races the idle kill", %{
+      tmp_dir: tmp_dir
+    } do
+      fake_shim = Path.join(tmp_dir, "forcola_shim")
+
+      File.write!(fake_shim, """
+      #!/usr/bin/env elixir
+      read_frame = fn ->
+        case IO.binread(:stdio, 4) do
+          <<length::32-big>> -> IO.binread(:stdio, length)
+          _eof -> :eof
+        end
+      end
+
+      _spawn = read_frame.()
+      _kill = read_frame.()
+      payload = ~s({"status":7,"timed_out":false,"confirmed":true,"contained":false})
+      body = <<0x13, payload::binary>>
+      IO.binwrite(:stdio, <<byte_size(body)::32-big, body::binary>>)
+      """)
+
+      File.chmod!(fake_shim, 0o755)
+
+      with_fake_shim(tmp_dir, fake_shim, fn ->
+        error =
+          assert_raise Forcola.Stream.Error, fn ->
+            ["ignored-by-fake-shim"]
+            |> Forcola.Stream.lines(
+              timeout_ms: 10_000,
+              idle_timeout_ms: 100,
+              kill_grace_ms: 200
+            )
+            |> Enum.to_list()
+          end
+
+        assert error.idle_timed_out
+        refute error.timed_out
+        assert error.status == 7
+      end)
     end
 
     test "does not fire while the producer keeps emitting within the interval" do
@@ -516,6 +558,24 @@ defmodule Forcola.StreamTest do
       true ->
         Process.sleep(50)
         poll(fun, deadline)
+    end
+  end
+
+  defp with_fake_shim(tmp_dir, fake_shim, fun) do
+    real_ebin = :code.lib_dir(:forcola) |> List.to_string() |> Path.join("ebin")
+    fake_app = Path.join(tmp_dir, "forcola")
+    File.mkdir_p!(Path.join(fake_app, "priv"))
+    File.ln_s!(real_ebin, Path.join(fake_app, "ebin"))
+    installed_shim = Path.join(fake_app, "priv/forcola_shim")
+    File.cp!(fake_shim, installed_shim)
+    File.chmod!(installed_shim, 0o755)
+
+    true = :code.replace_path(:forcola, String.to_charlist(Path.join(fake_app, "ebin")))
+
+    try do
+      fun.()
+    after
+      true = :code.replace_path(:forcola, String.to_charlist(real_ebin))
     end
   end
 end

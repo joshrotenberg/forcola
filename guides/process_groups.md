@@ -43,7 +43,10 @@ library exists to close. On expiry the group is killed and the caller receives
 the gap between output frames: if no output (stdout or stderr) arrives within
 the interval the producer is treated as stalled, the group is killed, and
 `Forcola.Stream.Error` is raised with `idle_timed_out: true`. It is independent
-of and composable with `:timeout_ms`; whichever bound fires first wins.
+of and composable with `:timeout_ms`; whichever bound fires first wins. A
+confirmed idle-timeout kill preserves the child status from the shim's EXIT
+frame. Only a missing, malformed, or explicitly unconfirmed EXIT uses
+`{:signal, :unconfirmed}`.
 
 `Forcola.Daemon` and `Forcola.Duplex` take no `:timeout_ms`; passing one raises
 `ArgumentError`. Their bound is the supervisor and the owner process
