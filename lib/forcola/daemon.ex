@@ -7,9 +7,10 @@ defmodule Forcola.Daemon do
   its own process group; when this GenServer terminates for any reason,
   including supervisor shutdown and owner crash, the shim kills the group
   (SIGTERM, then SIGKILL after the kill grace) and the terminate blocks
-  until the shim confirms the group is dead. If the daemon process is
-  killed brutally (no terminate), the port closes, the shim sees stdin
-  EOF, and the group is killed anyway; the same path covers BEAM death.
+  for the shim's bounded confirmation. If teardown cannot be confirmed,
+  termination returns after the backstop and logs a warning. If the daemon
+  process is killed brutally (no terminate), the port closes, the shim sees
+  stdin EOF, and the group is killed anyway; the same path covers BEAM death.
 
       children = [
         {Forcola.Daemon,

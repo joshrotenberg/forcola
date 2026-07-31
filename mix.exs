@@ -55,6 +55,7 @@ defmodule Forcola.MixProject do
         .formatter.exs
         mix.exs
         README.md
+        CHANGELOG.md
         LICENSE
         checksum-forcola_shim.exs
       )
@@ -68,6 +69,7 @@ defmodule Forcola.MixProject do
       source_ref: "v#{@version}",
       extras: [
         "README.md",
+        "CHANGELOG.md",
         "guides/getting_started.md",
         "guides/process_groups.md",
         "guides/adopting_forcola.md",

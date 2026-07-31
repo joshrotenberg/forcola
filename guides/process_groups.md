@@ -65,15 +65,14 @@ run. It also covers a `Forcola.Stream`, `Forcola.Daemon`, or `Forcola.Duplex`
 process being killed brutally: the port closes, the shim sees EOF, and the
 group dies.
 
-## Group death confirmed before the call returns
+## Confirmation before the call returns
 
-The shim confirms the group is dead before it reports back. Concretely: after
-the kill sequence, the shim waits for the group to be reaped, then sends its
-EXIT frame. The Elixir side blocks on that frame. So when a bounded run returns
-a timeout, when an early stream halt returns, when a daemon's `terminate/2`
-finishes, or when `Forcola.Duplex.close/1` returns, the group is already dead.
-`{:error, :timeout}` means the process is gone, not that it may still be
-running.
+On the normal path, the shim confirms the group is dead before it reports back.
+After the kill sequence it waits for the group to be reaped, then sends its
+EXIT frame, and the Elixir side blocks on that frame. A bounded run or idle
+stream timeout carries the confirmed child status. Early stream halt,
+`Forcola.Daemon` termination, and `Forcola.Duplex.close/1` block for the same
+bounded confirmation before returning.
 
 ### Confirmation exceptions
 
@@ -82,6 +81,10 @@ after the final SIGKILL wait, or a contained cgroup does not drain before its
 deadline, the EXIT report is marked unconfirmed. Public result shapes surface
 that as `{:signal, :unconfirmed}` even though the direct child's original status
 may have been known. Treat it as leaked and investigate.
+
+Early stream halt, daemon termination, and duplex close have no result value in
+which to carry that status. They return after their bounded backstop and emit a
+warning when confirmation is missing, malformed, or explicitly unconfirmed.
 
 The Elixir side also arms a backstop
 deadline (`timeout_ms + kill_grace_ms` plus a margin) in case the shim never

@@ -22,8 +22,9 @@ defmodule Forcola.Stream do
       force every `Stream.map(&decode/1)` pipeline to special-case it.
       Stderr captured during the run rides in the exception.
     * Halting the stream early (`Enum.take/2`, `Stream.take_while/2`, an
-      exception downstream) kills the process group and blocks until the
-      shim confirms the group is dead.
+      exception downstream) kills the process group and blocks for the shim's
+      bounded confirmation. If teardown cannot be confirmed, the halt still
+      returns after the backstop and logs a warning.
     * If the consuming process dies, the port closes, the shim sees stdin
       EOF, and the group is killed.
 

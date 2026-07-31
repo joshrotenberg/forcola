@@ -212,14 +212,15 @@ Termination:
   `Forcola.Stream.Error` after every line produced before death has been
   emitted. Stderr captured during the run rides in the exception.
 - Halting the stream early (`Enum.take/2`, `Stream.take_while/2`, an exception
-  downstream) kills the process group and blocks until the shim confirms the
-  group is dead.
+  downstream) kills the process group and blocks for the shim's bounded
+  confirmation. It logs a warning if teardown remains unconfirmed.
 
 ### Daemon: `Forcola.Daemon`
 
 A long-running server under a supervision tree. When the GenServer terminates
 for any reason, including supervisor shutdown and owner crash, the shim kills
-the group and the terminate blocks until the group is confirmed dead.
+the group and the terminate callback blocks for bounded confirmation. It logs
+a warning if teardown remains unconfirmed when that backstop expires.
 
 ```elixir
 children = [
