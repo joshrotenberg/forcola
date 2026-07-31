@@ -143,6 +143,65 @@ fn normal_exit_reports_status() {
 }
 
 #[test]
+fn normal_exit_reaps_lingering_group_member() {
+    // The direct child exits normally after forking a background sleep. The
+    // sleep stays in the child's process group, so it is ordinary supervised
+    // work rather than a deliberate setsid escape. EXIT must not be reported
+    // until that residual member has been killed.
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    let script = "sleep 60 & echo GRANDCHILD_PID=$!; exit 7";
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &spawn_payload(&["sh", "-c", script], None, Some(200), false),
+    );
+
+    let (out, exit_frame) = drain_until_exit(&mut stdout);
+    let exit_frame = exit_frame.expect("expected an EXIT frame");
+    assert_eq!(exit_frame.tag, TAG_EXIT);
+
+    let report: serde_json::Value = serde_json::from_slice(&exit_frame.payload).unwrap();
+    assert_eq!(report["status"], 7, "leader status must be preserved");
+    assert_eq!(report["timed_out"], false);
+
+    let text = String::from_utf8_lossy(&out);
+    let grandchild_pid: i32 = text
+        .lines()
+        .find_map(|line| line.strip_prefix("GRANDCHILD_PID="))
+        .expect("did not observe grandchild pid")
+        .trim()
+        .parse()
+        .expect("grandchild pid was not numeric");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut alive = true;
+    while Instant::now() < deadline {
+        alive = unsafe { libc_kill(grandchild_pid, 0) == 0 };
+        if !alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // If the assertion is about to fail, clean the regression probe up first
+    // so a failing test never leaves the very process it is checking for.
+    if alive {
+        unsafe {
+            libc_kill(grandchild_pid, 9);
+        }
+    }
+    assert!(
+        !alive,
+        "grandchild pid {grandchild_pid} survived its leader's normal exit"
+    );
+
+    let _ = child.wait();
+}
+
+#[test]
 fn signal_exit_reports_signal() {
     let mut child = start_shim();
     let mut stdin = child.stdin.take().unwrap();
