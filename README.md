@@ -123,6 +123,28 @@ wrappers.
 
 The [alternatives guide](https://hexdocs.pm/forcola/alternatives.html) compares these in detail.
 
+## Development
+
+The local quality gate mirrors CI:
+
+```sh
+mix deps.get
+mix format --check-formatted
+mix compile --warnings-as-errors
+mix test
+mix credo --strict
+mix dialyzer
+cargo test --manifest-path native/forcola_shim/Cargo.toml
+cargo clippy --manifest-path native/forcola_shim/Cargo.toml --all-targets -- -D warnings
+```
+
+CI runs the Elixir integration suite on Ubuntu and macOS, and runs the
+privilege-drop tests under passwordless `sudo` on its Linux runner. Real cgroup
+containment needs a delegated writable cgroup v2 subtree, which hosted runners
+do not always provide; the platform job reports availability in its job summary.
+Set `FORCOLA_REQUIRE_ROOT_TESTS=1` or `FORCOLA_REQUIRE_CGROUP=1` to turn either
+platform prerequisite into a hard failure on a suitable dedicated runner.
+
 ## License
 
 MIT

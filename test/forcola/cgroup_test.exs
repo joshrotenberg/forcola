@@ -104,6 +104,10 @@ defmodule Forcola.CgroupTest do
         refute alive?(escapee),
                "daemonized escapee survived: cgroup.kill did not reap it (pid #{escapee})"
       else
+        if System.get_env("FORCOLA_REQUIRE_CGROUP") == "1" do
+          flunk("FORCOLA_REQUIRE_CGROUP=1 but no delegated cgroup v2 subtree is available")
+        end
+
         # No delegated cgroup v2 subtree on this host. Skip LOUDLY: print a
         # clear reason rather than passing silently, and do not fail red.
         IO.puts(

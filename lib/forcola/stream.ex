@@ -377,7 +377,7 @@ defmodule Forcola.Stream do
         {lines, %{state | buffer: rest}}
 
       tag == Shim.tag_stderr() ->
-        {[], %{reset_idle(state) | stderr: [state.stderr | payload]}}
+        {[], %{reset_idle(state) | stderr: [state.stderr, payload]}}
 
       tag == Shim.tag_exit() ->
         handle_exit(payload, state)

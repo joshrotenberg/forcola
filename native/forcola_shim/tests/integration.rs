@@ -890,6 +890,11 @@ fn cgroup_reaps_daemonizer_that_escaped_the_process_group() {
     // provide. Probe first; if containment is not actually active, SKIP LOUDLY
     // rather than passing silently or failing red.
     if !probe_cgroup_contained() {
+        assert_ne!(
+            std::env::var("FORCOLA_REQUIRE_CGROUP").as_deref(),
+            Ok("1"),
+            "FORCOLA_REQUIRE_CGROUP=1 but no delegated cgroup v2 subtree is available"
+        );
         eprintln!(
             "SKIP cgroup_reaps_daemonizer_that_escaped_the_process_group: \
              no delegated cgroup v2 subtree on this host (cgroup fell back to \
