@@ -22,6 +22,7 @@ killed by the SIGKILL that follows.
 
 The group is killed on any of:
 
+- The direct child exiting while other members remain in its process group.
 - A bounded run hitting `:timeout_ms`.
 - An early halt of a `Forcola.Stream.lines/2` stream.
 - Termination of a `Forcola.Daemon` GenServer, including supervisor shutdown

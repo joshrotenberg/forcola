@@ -50,6 +50,29 @@ defmodule Forcola.RunTest do
   end
 
   describe "the port-kill discipline" do
+    test "normal leader exit reaps a lingering group member", %{tmp_dir: tmp_dir} do
+      pid_file = Path.join(tmp_dir, "lingering-pid")
+      script = ~S(sleep 60 & echo "$!" > "$PID_FILE"; exit 0)
+
+      on_exit(fn ->
+        with {:ok, contents} <- File.read(pid_file),
+             pid when pid != "" <- String.trim(contents),
+             true <- alive?(pid) do
+          System.cmd("kill", ["-KILL", pid], stderr_to_stdout: true)
+        end
+      end)
+
+      assert {:ok, %Forcola.Result{status: 0}} =
+               Forcola.run(["/bin/sh", "-c", script],
+                 timeout_ms: 5_000,
+                 kill_grace_ms: 200,
+                 env: [{"PID_FILE", pid_file}]
+               )
+
+      pid = pid_file |> File.read!() |> String.trim()
+      refute alive?(pid), "background child survived its leader's normal exit"
+    end
+
     test "timeout kills the whole OS process group, not just the parent", %{tmp_dir: tmp_dir} do
       pid_file = Path.join(tmp_dir, "pids")
 

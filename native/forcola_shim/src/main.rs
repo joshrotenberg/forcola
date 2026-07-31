@@ -12,6 +12,8 @@
 //!   as STDOUT frames since a pty merges stderr onto the one terminal.
 //! - a timeout (or an explicit kill frame) triggers SIGTERM to the whole
 //!   group (`kill(-pgid, SIGTERM)`), escalating to SIGKILL after the grace
+//! - a normally exiting leader triggers the same cleanup for any descendants
+//!   that remain in its process group
 //! - EOF on the shim's stdin means the BEAM died; the shim kills the group
 //!   and exits
 //!

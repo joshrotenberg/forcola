@@ -533,6 +533,12 @@ fn supervise<W: Write>(
 ) -> bool {
     let mut timed_out = false;
     let mut beam_gone = false;
+    // Once any terminal path has run the group kill, do not run it again when
+    // the waiter reports the leader's exit. Besides being redundant, a second
+    // kill after the group has disappeared widens the already-small pgid reuse
+    // window. A normal ChildExited event with no prior kill still runs the
+    // sequence so background descendants cannot outlive their leader.
+    let mut group_cleanup_started = false;
 
     let outcome = loop {
         match rx.recv() {
@@ -545,7 +551,10 @@ fn supervise<W: Write>(
                 *child_stdin = None; // drop closes the pipe
             }
             Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
-                kill_group(pgid, kill_grace, cgroup);
+                if !group_cleanup_started {
+                    group_cleanup_started = true;
+                    kill_group(pgid, kill_grace, cgroup);
+                }
             }
             Ok(Event::Stdin(f)) if f.tag == TAG_CREDIT => {
                 // Grant the stdout pump more read budget. Ignored when
@@ -563,18 +572,38 @@ fn supervise<W: Write>(
                 // real exit event from the waiter thread so we reap the
                 // child properly, but there's no one left to report to.
                 beam_gone = true;
-                kill_group(pgid, kill_grace, cgroup);
+                if !group_cleanup_started {
+                    group_cleanup_started = true;
+                    kill_group(pgid, kill_grace, cgroup);
+                }
             }
             Ok(Event::StdinError(e)) => {
                 eprintln!("forcola_shim: stdin read error, treating as BEAM death: {e}");
                 beam_gone = true;
-                kill_group(pgid, kill_grace, cgroup);
+                if !group_cleanup_started {
+                    group_cleanup_started = true;
+                    kill_group(pgid, kill_grace, cgroup);
+                }
             }
             Ok(Event::TimedOut) => {
                 timed_out = true;
-                kill_group(pgid, kill_grace, cgroup);
+                if !group_cleanup_started {
+                    group_cleanup_started = true;
+                    kill_group(pgid, kill_grace, cgroup);
+                }
             }
-            Ok(Event::ChildExited(outcome)) => break Some(outcome),
+            Ok(Event::ChildExited(outcome)) => {
+                // The direct child can exit after starting background work that
+                // remains in its process group. Reaping the leader alone does
+                // not terminate those descendants: they are reparented to pid
+                // 1 and would survive the shim. Run the normal TERM -> KILL
+                // sequence before reporting EXIT so every ordinary descendant
+                // is gone when the BEAM sees the leader's status.
+                if !group_cleanup_started {
+                    kill_group(pgid, kill_grace, cgroup);
+                }
+                break Some(outcome);
+            }
             Err(_) => break None,
         }
     };
