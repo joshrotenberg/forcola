@@ -70,7 +70,8 @@ BEAM <--stdin/stdout pipes--> forcola_shim <--forks--> child (own process group)
   group. Kill means the whole group: the CLI and everything it forked.
 - Timeout is mandatory on bounded runs. On expiry the caller receives
   `{:error, {:timeout, partial_result}}` with output captured so far, and
-  the group is confirmed dead before the call returns.
+  the group is confirmed dead before the call returns (or the result is
+  explicitly marked `{:signal, :unconfirmed}`).
 - If the BEAM dies, even by `kill -9`, the shim sees stdin EOF and kills the
   group before exiting.
 - Shim binaries ship precompiled per target via GitHub Releases with SHA256

@@ -74,6 +74,8 @@ defmodule Forcola.Stream do
 
   alias Forcola.Shim
 
+  require Logger
+
   defmodule Error do
     @moduledoc """
     Raised when a streamed run does not end with a clean zero exit.
@@ -426,14 +428,17 @@ defmodule Forcola.Stream do
   # for the shim's EXIT frame (the shim confirms group death before
   # sending it), so the halt does not return until the group is dead.
   defp cleanup(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms}) do
-    try do
-      Shim.send_frame(port, Shim.tag_kill())
-      await_exit(port, kill_grace_ms + @backstop_margin_ms)
-    catch
-      # The port raced us shut (shim already gone); its death killed the
-      # group by the shim's stdin-EOF rule, so there is nothing to wait on.
-      :error, :badarg -> :ok
-    end
+    confirmation =
+      try do
+        Shim.send_frame(port, Shim.tag_kill())
+        await_exit(port, kill_grace_ms + @backstop_margin_ms)
+      catch
+        # The port raced us shut (shim already gone); its death killed the
+        # group by the shim's stdin-EOF rule, so there is nothing to wait on.
+        :error, :badarg -> :ok
+      end
+
+    warn_unconfirmed_cleanup(confirmation)
 
     close_port(port)
     flush_port(port)
@@ -453,11 +458,11 @@ defmodule Forcola.Stream do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     receive do
-      {^port, {:data, <<tag, _payload::binary>>}} ->
-        if tag in [Shim.tag_exit(), Shim.tag_error()] do
-          :ok
-        else
-          do_await_exit(port, deadline)
+      {^port, {:data, <<tag, payload::binary>>}} ->
+        cond do
+          tag == Shim.tag_exit() -> exit_confirmation(payload)
+          tag == Shim.tag_error() -> :ok
+          true -> do_await_exit(port, deadline)
         end
 
       {^port, {:exit_status, _status}} ->
@@ -466,6 +471,23 @@ defmodule Forcola.Stream do
       max(remaining, 0) -> :timeout
     end
   end
+
+  defp exit_confirmation(payload) do
+    case Shim.decode_exit(payload) do
+      {{:signal, :unconfirmed}, _timed_out} -> :unconfirmed
+      _confirmed -> :ok
+    end
+  end
+
+  defp warn_unconfirmed_cleanup(:unconfirmed) do
+    Logger.warning("forcola: stream cleanup could not confirm process-group death")
+  end
+
+  defp warn_unconfirmed_cleanup(:timeout) do
+    Logger.warning("forcola: stream cleanup timed out before shim confirmation")
+  end
+
+  defp warn_unconfirmed_cleanup(_confirmed), do: :ok
 
   defp close_port(port) do
     if Port.info(port) != nil do

@@ -102,6 +102,9 @@ pub struct ExitReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
     pub timed_out: bool,
+    /// Whether every active cleanup mechanism confirmed that its supervised
+    /// processes were gone before this report was sent.
+    pub confirmed: bool,
     /// Whether Linux cgroup v2 containment was actually active for this run.
     /// `true` only when `cgroup: true` was requested and a delegated cgroup v2
     /// subtree was available; `false` on the default path, on fallback, and on
@@ -201,11 +204,27 @@ mod tests {
             status: Some(0),
             signal: None,
             timed_out: false,
+            confirmed: true,
             contained: false,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"status\":0"));
         assert!(!json.contains("signal"));
+        assert!(json.contains("\"confirmed\":true"));
         assert!(json.contains("\"contained\":false"));
+    }
+
+    #[test]
+    fn exit_report_serializes_unconfirmed_cleanup() {
+        let report = ExitReport {
+            status: None,
+            signal: Some(9),
+            timed_out: true,
+            confirmed: false,
+            contained: false,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"signal\":9"));
+        assert!(json.contains("\"confirmed\":false"));
     }
 }

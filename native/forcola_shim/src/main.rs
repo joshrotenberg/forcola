@@ -36,7 +36,7 @@
 //! shim -> BEAM:
 //!   0x11 STDOUT  payload: bytes from the child's stdout
 //!   0x12 STDERR  payload: bytes from the child's stderr
-//!   0x13 EXIT    payload: JSON {status | signal, timed_out, contained}
+//!   0x13 EXIT    payload: JSON {status | signal, timed_out, confirmed, contained}
 //!   0x14 ERROR   payload: JSON {reason} (spawn failure etc.)
 
 mod cgroup;

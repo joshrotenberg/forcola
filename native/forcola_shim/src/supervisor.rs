@@ -533,6 +533,7 @@ fn supervise<W: Write>(
 ) -> bool {
     let mut timed_out = false;
     let mut beam_gone = false;
+    let mut group_confirmed = true;
     // Once any terminal path has run the group kill, do not run it again when
     // the waiter reports the leader's exit. Besides being redundant, a second
     // kill after the group has disappeared widens the already-small pgid reuse
@@ -553,7 +554,7 @@ fn supervise<W: Write>(
             Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
                 if !group_cleanup_started {
                     group_cleanup_started = true;
-                    kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
                 }
             }
             Ok(Event::Stdin(f)) if f.tag == TAG_CREDIT => {
@@ -574,7 +575,7 @@ fn supervise<W: Write>(
                 beam_gone = true;
                 if !group_cleanup_started {
                     group_cleanup_started = true;
-                    kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
                 }
             }
             Ok(Event::StdinError(e)) => {
@@ -582,14 +583,14 @@ fn supervise<W: Write>(
                 beam_gone = true;
                 if !group_cleanup_started {
                     group_cleanup_started = true;
-                    kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
                 }
             }
             Ok(Event::TimedOut) => {
                 timed_out = true;
                 if !group_cleanup_started {
                     group_cleanup_started = true;
-                    kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
                 }
             }
             Ok(Event::ChildExited(outcome)) => {
@@ -600,7 +601,7 @@ fn supervise<W: Write>(
                 // sequence before reporting EXIT so every ordinary descendant
                 // is gone when the BEAM sees the leader's status.
                 if !group_cleanup_started {
-                    kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
                 }
                 break Some(outcome);
             }
@@ -623,11 +624,9 @@ fn supervise<W: Write>(
     // Tear the contained subtree down after the child is reaped, whether it
     // was killed or exited on its own. `finish_cgroup` writes cgroup.kill (in
     // case a daemonizer escaped the process group and is still alive),
-    // confirms the cgroup drained, and rmdirs it. Runs even on beam_gone so a
-    // vanished BEAM does not leak the cgroup directory.
-    if let Some(cg) = cgroup {
-        finish_cgroup(cg, kill_grace);
-    }
+    // confirms the cgroup drained, and rmdirs it only after confirmation. Runs
+    // even on beam_gone so a vanished BEAM does not leak the cgroup directory.
+    let cgroup_confirmed = cgroup.is_none_or(|cg| finish_cgroup(cg, kill_grace));
 
     if beam_gone {
         // Nothing to report to: the reader/writer on the other end of
@@ -647,6 +646,7 @@ fn supervise<W: Write>(
         status: outcome.status,
         signal: outcome.signal,
         timed_out,
+        confirmed: group_confirmed && cgroup_confirmed,
         contained: cgroup.is_some(),
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
@@ -661,8 +661,10 @@ fn supervise<W: Write>(
 /// in the subtree via `cgroup.kill`, confirm the cgroup drained (bounded by the
 /// kill grace), then rmdir it. Layered on top of the process-group kill, which
 /// has already run; this only matters for a descendant that left the process
-/// group by daemonizing.
-fn finish_cgroup(cg: &Cgroup, grace: Duration) {
+/// group by daemonizing. Returns true only when the cgroup was observed empty;
+/// an expired drain deadline leaves the directory in place and is reported as
+/// an unconfirmed EXIT.
+fn finish_cgroup(cg: &Cgroup, grace: Duration) -> bool {
     // SIGKILL the whole subtree. This is the backstop that reaches a
     // deliberate daemonizer the process-group kill could not.
     cg.kill();
@@ -670,17 +672,19 @@ fn finish_cgroup(cg: &Cgroup, grace: Duration) {
     // Wait for the cgroup to drain, in addition to the process-group death
     // probe the kill path already did. Bound the wait so a wedged cgroup
     // cannot delay the EXIT report forever.
-    let deadline = Instant::now() + grace + Duration::from_millis(500);
-    while Instant::now() < deadline {
-        if cg.drained() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
+    let drained = wait_until(
+        grace + Duration::from_millis(500),
+        Duration::from_millis(20),
+        || cg.drained(),
+    );
+
+    // Only remove a cgroup we observed empty. A live subtree is left for the
+    // delegation owner and surfaced to the BEAM as unconfirmed.
+    if drained {
+        cg.remove();
     }
 
-    // rmdir the now-empty cgroup. Best-effort: if it is somehow non-empty the
-    // delegation owner reaps it later.
-    cg.remove();
+    drained
 }
 
 /// Waits (bounded by `OUTPUT_DRAIN_GRACE`) for `pumps` output pump
@@ -700,7 +704,8 @@ fn drain_pumps(pumps: usize, pump_done: &Receiver<()>) {
 
 /// SIGTERM the whole process group, then SIGKILL after `grace` if it
 /// hasn't died. Confirms death via a signal-0 liveness probe before
-/// returning.
+/// returning. Returns false when the hard post-SIGKILL deadline expires while
+/// the group still appears alive.
 ///
 /// When a cgroup is present, `cgroup.kill` is written after the group kill so a
 /// descendant that escaped the process group by daemonizing is SIGKILLed too.
@@ -708,24 +713,18 @@ fn drain_pumps(pumps: usize, pump_done: &Receiver<()>) {
 /// SIGTERM/SIGKILL group sequence is unchanged; the cgroup write is added at
 /// the end. The final drain-and-rmdir happens once, after the child is reaped,
 /// in `finish_cgroup`.
-fn kill_group(pgid: Pid, grace: Duration, cgroup: Option<&Cgroup>) {
+fn kill_group(pgid: Pid, grace: Duration, cgroup: Option<&Cgroup>) -> bool {
     let _ = process::kill_process_group(pgid, Signal::TERM);
 
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if !group_alive(pgid) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
+    let mut confirmed = wait_until(grace, Duration::from_millis(20), || !group_alive(pgid));
 
-    if group_alive(pgid) {
+    if !confirmed {
         let _ = process::kill_process_group(pgid, Signal::KILL);
-        // Give the kernel a moment to finish tearing the group down.
-        let hard_deadline = Instant::now() + Duration::from_millis(500);
-        while group_alive(pgid) && Instant::now() < hard_deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
+        confirmed = wait_until(
+            Duration::from_millis(500),
+            Duration::from_millis(10),
+            || !group_alive(pgid),
+        );
     }
 
     // Backstop for a deliberate daemonizer that left the process group: the
@@ -733,6 +732,30 @@ fn kill_group(pgid: Pid, grace: Duration, cgroup: Option<&Cgroup>) {
     // still in the subtree at once.
     if let Some(cg) = cgroup {
         cg.kill();
+    }
+
+    confirmed
+}
+
+/// Polls `done` until it succeeds or a monotonic deadline expires. The
+/// predicate is checked once even for a zero timeout, so an already-complete
+/// teardown can be recognized without sleeping.
+fn wait_until<F>(timeout: Duration, poll_interval: Duration, mut done: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+
+        thread::sleep(poll_interval.min(deadline - now));
     }
 }
 
@@ -777,7 +800,7 @@ fn write_error<W: Write>(out: &Arc<Mutex<W>>, reason: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{probe_says_alive, pump_eager, pump_gated};
+    use super::{probe_says_alive, pump_eager, pump_gated, wait_until};
     use crate::credit::Credit;
     use crate::frame::{read_frame, TAG_STDOUT};
     use rustix::io::Errno;
@@ -880,5 +903,21 @@ mod tests {
     #[test]
     fn probe_other_errors_mean_alive() {
         assert!(probe_says_alive(Err(Errno::INVAL)));
+    }
+
+    #[test]
+    fn wait_until_reports_success() {
+        let mut attempts = 0;
+        let completed = wait_until(Duration::from_millis(100), Duration::ZERO, || {
+            attempts += 1;
+            attempts == 3
+        });
+        assert!(completed);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn wait_until_reports_deadline_expiry() {
+        assert!(!wait_until(Duration::ZERO, Duration::ZERO, || false));
     }
 }

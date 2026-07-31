@@ -175,17 +175,28 @@ defmodule Forcola.Shim do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  @doc "Decodes an EXIT frame payload into `{status_or_signal, timed_out}`."
+  @doc """
+  Decodes an EXIT frame payload into `{status_or_signal, timed_out}`.
+
+  A new shim reports `confirmed: false` when its bounded cleanup probes still
+  observed a live process group or cgroup. That maps to
+  `{:signal, :unconfirmed}` in every execution mode. The field defaults to true
+  when absent for compatibility with older shims.
+  """
   @spec decode_exit(binary()) ::
-          {non_neg_integer() | {:signal, non_neg_integer()}, boolean()}
+          {non_neg_integer() | {:signal, atom() | non_neg_integer()}, boolean()}
   def decode_exit(payload) do
     decoded = :json.decode(payload)
     timed_out = Map.get(decoded, "timed_out", false)
 
     status =
-      case decoded do
-        %{"status" => status} when is_integer(status) -> status
-        %{"signal" => signal} when is_integer(signal) -> {:signal, signal}
+      if Map.get(decoded, "confirmed", true) do
+        case decoded do
+          %{"status" => status} when is_integer(status) -> status
+          %{"signal" => signal} when is_integer(signal) -> {:signal, signal}
+        end
+      else
+        {:signal, :unconfirmed}
       end
 
     {status, timed_out}

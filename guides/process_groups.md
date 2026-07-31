@@ -72,9 +72,15 @@ finishes, or when `Forcola.Duplex.close/1` returns, the group is already dead.
 `{:error, :timeout}` means the process is gone, not that it may still be
 running.
 
-### The backstop exception
+### Confirmation exceptions
 
-The confirmation guarantee has one exception. The Elixir side arms a backstop
+The shim's TERM-to-KILL sequence is bounded. If the process group still exists
+after the final SIGKILL wait, or a contained cgroup does not drain before its
+deadline, the EXIT report is marked unconfirmed. Public result shapes surface
+that as `{:signal, :unconfirmed}` even though the direct child's original status
+may have been known. Treat it as leaked and investigate.
+
+The Elixir side also arms a backstop
 deadline (`timeout_ms + kill_grace_ms` plus a margin) in case the shim never
 reports back at all, for example if the shim is wedged or the BEAM-to-shim pipe
 is stuck. If that deadline fires first, the result's status is
