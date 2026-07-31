@@ -167,22 +167,26 @@ defmodule Forcola.RunAsUserTest do
   end
 
   @tag :root_only
-  test "root can actually drop to nobody", %{tmp_dir: tmp_dir} do
+  test "root can actually drop to nobody" do
+    require_root? = System.get_env("FORCOLA_REQUIRE_ROOT_TESTS") == "1"
+
+    if require_root? and current_uid() != "0" do
+      flunk("FORCOLA_REQUIRE_ROOT_TESTS=1 but the test process is not root")
+    end
+
     if current_uid() != "0" do
       # Only meaningful as root; stays green as non-root on CI. Skip LOUDLY:
       # print a clear reason rather than passing silently.
       IO.puts("SKIP: root-only privilege-drop test; not running as root")
       assert true
     else
-      out_file = Path.join(tmp_dir, "dropped-uid")
-
-      assert {:ok, %Forcola.Result{status: 0}} =
-               Forcola.run(["/bin/sh", "-c", "id -u > #{out_file}"],
+      assert {:ok, %Forcola.Result{status: 0, stdout: stdout}} =
+               Forcola.run(["id", "-u"],
                  timeout_ms: 5_000,
                  user: "nobody"
                )
 
-      dropped = out_file |> File.read!() |> String.trim()
+      dropped = String.trim(stdout)
       refute dropped == "0", "child still ran as root after requesting nobody"
     end
   end

@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   elixir:
-    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
+    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }} (Ubuntu)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -28,15 +28,17 @@ jobs:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
 
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Restore deps cache
         uses: actions/cache@v5
         with:
           path: |
             deps
             _build
-          key: mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+          key: mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            mix-${{ matrix.elixir }}-${{ matrix.otp }}-
+            mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
 
       - name: Install dependencies
         run: mix deps.get
@@ -52,6 +54,142 @@ jobs:
 
       - name: Run tests
         run: mix test
+
+  elixir-macos:
+    name: Elixir integration (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore deps cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-1.18-27-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ runner.os }}-1.18-27-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Run tests
+        run: mix test
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Dialyzer cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: dialyzer-${{ runner.os }}-1.18-27-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            dialyzer-${{ runner.os }}-1.18-27-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Run Dialyzer
+        run: mix dialyzer
+
+  platform-coverage:
+    name: Privileged and cgroup coverage (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.18"
+          otp-version: "27"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore deps cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+          key: platform-${{ runner.os }}-1.18-27-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            platform-${{ runner.os }}-1.18-27-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile test environment (warnings as errors)
+        env:
+          MIX_ENV: test
+        run: mix compile --warnings-as-errors
+
+      - name: Detect delegated cgroup v2 subtree
+        id: cgroup
+        shell: bash
+        run: |
+          own_relative="$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)"
+          own_cgroup="/sys/fs/cgroup${own_relative}"
+          probe="${own_cgroup}/forcola-ci-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          if [ -f /sys/fs/cgroup/cgroup.controllers ] && mkdir "${probe}" 2>/dev/null; then
+            rmdir "${probe}"
+            echo "delegated=true" >> "${GITHUB_OUTPUT}"
+            echo "### cgroup coverage: delegated subtree available" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "delegated=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice title=cgroup coverage unavailable::The hosted runner has no delegated writable cgroup v2 subtree; fallback behavior runs, while the real containment test reports an explicit skip."
+            echo "### cgroup coverage: unavailable on this hosted runner" >> "${GITHUB_STEP_SUMMARY}"
+            echo "The fallback path is covered. Run with FORCOLA_REQUIRE_CGROUP=1 on a delegated runner to make real containment mandatory." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Run Elixir cgroup coverage
+        env:
+          FORCOLA_REQUIRE_CGROUP: ${{ steps.cgroup.outputs.delegated == 'true' && '1' || '0' }}
+        run: mix test test/forcola/cgroup_test.exs --seed 0
+
+      - name: Run Rust cgroup containment coverage
+        if: steps.cgroup.outputs.delegated == 'true'
+        env:
+          FORCOLA_REQUIRE_CGROUP: "1"
+        run: cargo test --manifest-path native/forcola_shim/Cargo.toml cgroup_reaps_daemonizer_that_escaped_the_process_group -- --nocapture
+
+      - name: Run privilege-drop coverage as root
+        run: sudo env "PATH=${PATH}" "HOME=${HOME}" MIX_ENV=test FORCOLA_REQUIRE_ROOT_TESTS=1 mix test test/forcola/run_as_user_test.exs --seed 0
+
+      - name: Record privileged coverage
+        if: always()
+        run: |
+          echo "### privilege-drop coverage: root test invoked through passwordless sudo" >> "${GITHUB_STEP_SUMMARY}"
 
   shim:
     name: Rust shim

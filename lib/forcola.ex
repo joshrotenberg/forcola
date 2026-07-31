@@ -194,10 +194,10 @@ defmodule Forcola do
   defp handle_frame(port, tag, payload, acc, deadline) do
     cond do
       tag == Shim.tag_stdout() ->
-        collect(port, %{acc | stdout: [acc.stdout | payload]}, deadline)
+        collect(port, %{acc | stdout: [acc.stdout, payload]}, deadline)
 
       tag == Shim.tag_stderr() ->
-        collect(port, %{acc | stderr: [acc.stderr | payload]}, deadline)
+        collect(port, %{acc | stderr: [acc.stderr, payload]}, deadline)
 
       tag == Shim.tag_exit() ->
         {status, timed_out} = Shim.decode_exit(payload)
