@@ -220,7 +220,8 @@ Per-mode notes:
   run, not the gap between lines. A non-zero exit, death by signal, timeout,
   or spawn failure raises `Forcola.Stream.Error` after every line produced
   before death has been emitted; halting the stream early kills the process
-  group and blocks until it is confirmed dead.
+  group and blocks for bounded confirmation, warning if teardown remains
+  unconfirmed.
 - `Forcola.Daemon`: no `:timeout_ms` (passing one raises `ArgumentError`);
   the daemon's bound is its supervisor. Supports a `:ready` check so
   `start_link` blocks until the server accepts connections, and `:output`

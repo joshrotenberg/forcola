@@ -12,7 +12,7 @@ marked "tested" were verified empirically on macOS with Elixir 1.20 / OTP 29.
 | [Porcelain](https://github.com/alco/porcelain) + goon | Go middleman, manual download | Closes child stdin and waits; never kills | No | goon fetched by hand; last goon release 2014 | Unmaintained (last release 2016, last commit 2020) |
 | [Rambo](https://github.com/jayjun/rambo) | Rust shim per call | SIGKILLs direct child on stdin EOF | No | Bundled x86-64 binaries only; broken out of the box on Apple Silicon (tested) | Dormant (last release March 2021) |
 | [exile](https://github.com/akash-akya/exile) | NIF IO + spawner that execs into the command | Normal exits yes; kill -9 of BEAM orphans the child (tested) | No | C compiler (elixir_make) | Maintained, single author (0.14.0, Feb 2026) |
-| forcola | Rust shim per command | stdin EOF kills the process group, covers kill -9; death confirmed before EXIT | Yes (setsid + kill(-pgid), TERM then KILL); opt-in Linux cgroup v2 also contains daemonizers | None on 5 precompiled targets; cargo elsewhere | New (v0.3.0) |
+| forcola | Rust shim per command | stdin EOF kills the process group, covers kill -9; EXIT confirms death or explicitly reports unconfirmed teardown | Yes (setsid + kill(-pgid), TERM then KILL); opt-in Linux cgroup v2 also contains daemonizers | None on 5 precompiled targets; cargo elsewhere | New (v0.3.0) |
 
 ## erlexec
 

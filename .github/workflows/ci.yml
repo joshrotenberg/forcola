@@ -55,6 +55,20 @@ jobs:
       - name: Run tests
         run: mix test
 
+      - name: Build documentation (warnings as errors)
+        run: mix docs --warnings-as-errors
+
+      - name: Validate Hex package contents
+        shell: bash
+        run: |
+          audit_dir="$(mktemp -d)"
+          trap 'rm -f checksum-forcola_shim.exs' EXIT
+          printf '%s\n' '%{"release-audit-placeholder" => "0"}' > checksum-forcola_shim.exs
+          mix hex.build --unpack --output "${audit_dir}/package"
+          test -f "${audit_dir}/package/CHANGELOG.md"
+          test -f "${audit_dir}/package/checksum-forcola_shim.exs"
+          test -f "${audit_dir}/package/native/forcola_shim/Cargo.lock"
+
   elixir-macos:
     name: Elixir integration (macOS)
     runs-on: macos-latest
