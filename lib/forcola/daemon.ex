@@ -81,7 +81,8 @@ defmodule Forcola.Daemon do
 
   When the child exits on its own, the daemon stops: status 0 stops
   `:normal`, a non-zero status stops `{:exit_status, n}`, and death by
-  signal stops `{:exit_signal, n}`. Under `restart: :permanent` any of
+  signal stops `{:exit_signal, n}`. An unconfirmed teardown stops
+  `{:exit_signal, :unconfirmed}`. Under `restart: :permanent` any of
   these restarts the daemon; under `:transient` only the abnormal ones do.
   """
 
@@ -374,14 +375,17 @@ defmodule Forcola.Daemon do
   # The child may still be running: kill the group and wait for the
   # shim's EXIT frame (the shim confirms group death before sending it).
   defp shutdown(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms}) do
-    try do
-      Shim.send_frame(port, Shim.tag_kill())
-      await_exit(port, kill_grace_ms + @backstop_margin_ms)
-    catch
-      # The port raced us shut (shim already gone); its death killed the
-      # group by the shim's stdin-EOF rule, so there is nothing to wait on.
-      :error, :badarg -> :ok
-    end
+    confirmation =
+      try do
+        Shim.send_frame(port, Shim.tag_kill())
+        await_exit(port, kill_grace_ms + @backstop_margin_ms)
+      catch
+        # The port raced us shut (shim already gone); its death killed the
+        # group by the shim's stdin-EOF rule, so there is nothing to wait on.
+        :error, :badarg -> :ok
+      end
+
+    warn_unconfirmed_cleanup(confirmation)
 
     close_port(port)
   end
@@ -400,11 +404,11 @@ defmodule Forcola.Daemon do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     receive do
-      {^port, {:data, <<tag, _payload::binary>>}} ->
-        if tag in [Shim.tag_exit(), Shim.tag_error()] do
-          :ok
-        else
-          do_await_exit(port, deadline)
+      {^port, {:data, <<tag, payload::binary>>}} ->
+        cond do
+          tag == Shim.tag_exit() -> exit_confirmation(payload)
+          tag == Shim.tag_error() -> :ok
+          true -> do_await_exit(port, deadline)
         end
 
       {^port, {:exit_status, _status}} ->
@@ -413,6 +417,23 @@ defmodule Forcola.Daemon do
       max(remaining, 0) -> :timeout
     end
   end
+
+  defp exit_confirmation(payload) do
+    case Shim.decode_exit(payload) do
+      {{:signal, :unconfirmed}, _timed_out} -> :unconfirmed
+      _confirmed -> :ok
+    end
+  end
+
+  defp warn_unconfirmed_cleanup(:unconfirmed) do
+    Logger.warning("forcola: daemon cleanup could not confirm process-group death")
+  end
+
+  defp warn_unconfirmed_cleanup(:timeout) do
+    Logger.warning("forcola: daemon cleanup timed out before shim confirmation")
+  end
+
+  defp warn_unconfirmed_cleanup(_confirmed), do: :ok
 
   defp close_port(port) do
     if Port.info(port) != nil do

@@ -171,9 +171,9 @@ Mapping notes, each verified against `Forcola.run/2`:
 
 - `:timeout_ms` is mandatory. The wrapper's existing timeout value maps onto
   it directly. On expiry Forcola returns `{:error, {:timeout, partial}}`
-  only after the child's process group is confirmed dead, so
-  `{:error, :timeout}` now means "git is gone", not "git may still be
-  running".
+  after the child's process group is confirmed dead, or marks the partial
+  result `status: {:signal, :unconfirmed}` when bounded teardown could not
+  prove that. Wrappers should preserve that distinction.
 - A non-zero exit is `{:ok, %Forcola.Result{}}`, matching `System.cmd/3`, so
   `parse_output/2` keeps receiving the exit code and decides what it means.
 - `merge_stderr: true` is the equivalent of `stderr_to_stdout: true`; use it

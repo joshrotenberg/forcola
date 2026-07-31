@@ -34,5 +34,22 @@ defmodule ForcolaTest do
       assert {:ok, path} = Forcola.Shim.path()
       assert File.exists?(path)
     end
+
+    test "decode_exit/1 defaults an older shim to confirmed" do
+      payload = :json.encode(%{"status" => 0, "timed_out" => false}) |> IO.iodata_to_binary()
+      assert {0, false} = Forcola.Shim.decode_exit(payload)
+    end
+
+    test "decode_exit/1 surfaces an unconfirmed teardown" do
+      payload =
+        :json.encode(%{
+          "signal" => 9,
+          "timed_out" => true,
+          "confirmed" => false
+        })
+        |> IO.iodata_to_binary()
+
+      assert {{:signal, :unconfirmed}, true} = Forcola.Shim.decode_exit(payload)
+    end
   end
 end

@@ -75,8 +75,9 @@ Options:
 - `:timeout_ms` (required): on expiry the child's process group is killed
   (SIGTERM, then SIGKILL after the kill grace) and
   `{:error, {:timeout, partial_result}}` is returned with output captured so
-  far. The group is confirmed dead before the call returns, with one
-  exception described in the [process groups guide](process_groups.html).
+  far. The group is normally confirmed dead before the call returns; an
+  unconfirmed cleanup is surfaced as `status: {:signal, :unconfirmed}` as
+  described in the [process groups guide](process_groups.html).
 - `:kill_grace_ms`: SIGTERM-to-SIGKILL grace in milliseconds, default
   `5_000`.
 - `:cd`: working directory.

@@ -55,11 +55,11 @@ defmodule Forcola do
     * `:timeout_ms` - required. On expiry the child's process group is
       killed (SIGTERM, then SIGKILL after the kill grace) and
       `{:error, {:timeout, partial_result}}` is returned with output
-      captured so far. The group is confirmed dead before the call
-      returns, with one exception: if the shim itself never reports back,
-      an Elixir-side backstop returns a result whose status is
-      `{:signal, :unconfirmed}`, meaning death was not confirmed (see
-      `Forcola.Result`). A child that exits exactly at the timeout
+      captured so far. The group is normally confirmed dead before the call
+      returns. If the shim's bounded kill probes cannot confirm that the group
+      (or an active cgroup) drained, or if the shim itself never reports back,
+      the result status is `{:signal, :unconfirmed}` (see `Forcola.Result`). A
+      child that exits exactly at the timeout
       boundary can be reported as a timeout whose result carries the
       normal exit status, including `status: 0`.
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace in milliseconds,

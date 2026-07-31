@@ -138,6 +138,7 @@ fn normal_exit_reports_status() {
     let report: serde_json::Value = serde_json::from_slice(&exit_frame.payload).unwrap();
     assert_eq!(report["status"], 7);
     assert_eq!(report["timed_out"], false);
+    assert_eq!(report["confirmed"], true);
 
     let _ = child.wait();
 }
@@ -166,6 +167,7 @@ fn normal_exit_reaps_lingering_group_member() {
     let report: serde_json::Value = serde_json::from_slice(&exit_frame.payload).unwrap();
     assert_eq!(report["status"], 7, "leader status must be preserved");
     assert_eq!(report["timed_out"], false);
+    assert_eq!(report["confirmed"], true);
 
     let text = String::from_utf8_lossy(&out);
     let grandchild_pid: i32 = text
@@ -479,6 +481,7 @@ fn timeout_kills_group_and_reports_timed_out() {
     let exit_frame = exit_frame.expect("expected an EXIT frame");
     let report: serde_json::Value = serde_json::from_slice(&exit_frame.payload).unwrap();
     assert_eq!(report["timed_out"], true);
+    assert_eq!(report["confirmed"], true);
     assert!(
         elapsed < Duration::from_secs(5),
         "timeout took too long to take effect: {elapsed:?}"
@@ -803,6 +806,7 @@ fn cgroup_reports_contained_flag() {
         report["contained"].is_boolean(),
         "EXIT report must carry a boolean `contained` flag, got {report}"
     );
+    assert_eq!(report["confirmed"], true);
 
     let _ = child.wait();
 }
