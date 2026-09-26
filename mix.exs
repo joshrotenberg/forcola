@@ -15,7 +15,11 @@ defmodule Forcola.MixProject do
         "Leak-free external process execution: process-group kill on timeout or BEAM death via a precompiled Rust shim",
       source_url: @source_url,
       homepage_url: @source_url,
-      dialyzer: [plt_add_apps: [:mix]],
+      dialyzer: [
+        plt_add_apps: [:mix],
+        plt_local_path: "priv/plts",
+        plt_core_path: "priv/plts"
+      ],
       package: package(),
       docs: docs(),
       deps: deps()
