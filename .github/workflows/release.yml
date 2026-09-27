@@ -125,6 +125,11 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
+      # Runs before the checksum file exists, so the shim is built from
+      # source at this tag rather than downloaded.
+      - name: Run tests
+        run: mix test
+
       # Downloads the tarballs the build jobs just attached to the
       # release and writes the gitignored checksum-forcola_shim.exs
       # that ships in the hex package.

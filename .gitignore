@@ -30,3 +30,6 @@ forcola-*.tar
 # hex package only. Its presence switches the compile onto the
 # precompiled download path, so it must never exist in a git checkout.
 /checksum-forcola_shim.exs
+
+# Dialyzer PLTs, cached in CI.
+/priv/plts/
