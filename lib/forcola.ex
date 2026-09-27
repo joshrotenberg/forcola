@@ -50,6 +50,11 @@ defmodule Forcola do
   @doc """
   Run `argv` (`[binary | args]`) to completion under the shim.
 
+  The child's stdin is closed immediately after spawn: this mode has no
+  way to write to it, so a child that reads until EOF (`cat`, `codex exec`,
+  anything that checks for piped input) sees EOF right away instead of
+  blocking until `:timeout_ms`. Use `Forcola.Duplex` for interactive stdin.
+
   ## Options
 
     * `:timeout_ms` - required. On expiry the child's process group is
@@ -161,6 +166,12 @@ defmodule Forcola do
   defp spawn_and_collect(port, argv, opts, timeout_ms, kill_grace_ms) do
     payload = Shim.encode_spawn(argv, Keyword.put(opts, :kill_grace_ms, kill_grace_ms))
     Shim.send_frame(port, Shim.tag_spawn(), payload)
+
+    # run/2 has no way to write to the child's stdin, so an open pipe with
+    # no writer only serves to hang a child that reads until EOF (`cat`,
+    # `codex exec`, anything that checks for piped input). Close it right
+    # away; Forcola.Duplex is the mode for interactive stdin.
+    Shim.send_frame(port, Shim.tag_eof(), "")
 
     # Elixir-side backstop only: the shim itself enforces timeout_ms and
     # confirms group death within kill_grace_ms before reporting EXIT, so

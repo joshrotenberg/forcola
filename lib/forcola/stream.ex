@@ -157,6 +157,11 @@ defmodule Forcola.Stream do
   privileged shim required); `:timeout_ms` is required and bounds the
   whole run, not the gap between lines.
 
+  The child's stdin is closed immediately after spawn, as in `Forcola.run/2`:
+  this mode has no way to write to it, so a child that reads until EOF sees
+  EOF right away instead of blocking. Use `Forcola.Duplex` for interactive
+  stdin.
+
   `:idle_timeout_ms` (optional, milliseconds; default `nil` = disabled)
   bounds the gap between output frames: if no STDOUT or STDERR data
   arrives within the interval the producer is treated as stalled, the
@@ -221,6 +226,12 @@ defmodule Forcola.Stream do
 
         payload = Shim.encode_spawn(argv, spawn_opts)
         Shim.send_frame(port, Shim.tag_spawn(), payload)
+
+        # lines/2 has no way to write to the child's stdin, so an open pipe
+        # with no writer only serves to hang a child that reads until EOF.
+        # Close it right away; Forcola.Duplex is the mode for interactive
+        # stdin.
+        Shim.send_frame(port, Shim.tag_eof(), "")
 
         now = System.monotonic_time(:millisecond)
         deadline = now + timeout_ms + kill_grace_ms + @backstop_margin_ms

@@ -74,6 +74,18 @@ defmodule Forcola.StreamTest do
 
       assert error.reason
     end
+
+    test "closes the child's stdin so a reader sees EOF instead of hanging to the timeout" do
+      {elapsed, lines} =
+        timed(fn ->
+          ["/bin/sh", "-c", "cat; echo done"]
+          |> Forcola.Stream.lines(timeout_ms: 5_000)
+          |> Enum.to_list()
+        end)
+
+      assert lines == ["done"]
+      assert elapsed < 2_000, "lines/2 blocked on stdin instead of seeing EOF (took #{elapsed}ms)"
+    end
   end
 
   describe "the kill discipline" do
@@ -540,6 +552,12 @@ defmodule Forcola.StreamTest do
   defp alive?(pid) do
     {_out, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
     status == 0
+  end
+
+  defp timed(fun) do
+    t0 = System.monotonic_time(:millisecond)
+    result = fun.()
+    {System.monotonic_time(:millisecond) - t0, result}
   end
 
   defp eventually(fun, deadline_ms \\ 5_000) do

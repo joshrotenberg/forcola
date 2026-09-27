@@ -47,6 +47,14 @@ defmodule Forcola.RunTest do
 
       assert reason
     end
+
+    test "closes the child's stdin so a reader sees EOF instead of hanging to the timeout" do
+      {elapsed, result} =
+        timed(fn -> Forcola.run(["/bin/sh", "-c", "cat; echo done"], timeout_ms: 5_000) end)
+
+      assert {:ok, %Forcola.Result{status: 0, stdout: "done\n"}} = result
+      assert elapsed < 2_000, "run/2 blocked on stdin instead of seeing EOF (took #{elapsed}ms)"
+    end
   end
 
   describe "the port-kill discipline" do
@@ -121,5 +129,11 @@ defmodule Forcola.RunTest do
   defp alive?(pid) do
     {_out, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
     status == 0
+  end
+
+  defp timed(fun) do
+    t0 = System.monotonic_time(:millisecond)
+    result = fun.()
+    {System.monotonic_time(:millisecond) - t0, result}
   end
 end
