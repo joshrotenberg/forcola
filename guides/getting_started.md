@@ -393,6 +393,9 @@ Options:
 
 - `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`, `:cgroup`, `:shim_path`: as in `Forcola.run/2`.
 - `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
+- `:terminal_recipient`: optional process that receives
+  `{:forcola_terminal, session, terminal}` even if the owner dies. This is
+  useful when another process supervises the attempt.
 - `:pty`: run the child under a pseudo-terminal (default `false`), for CLIs
   that behave differently when they detect a tty. See
   [pseudo-terminal](#pseudo-terminal) below.
@@ -407,8 +410,34 @@ API:
 - `send_eof/1`: closes the child's stdin without killing the group, for CLIs
   that exit when input ends. The child's own exit then arrives as a
   `:forcola_exit` message.
-- `close/1`: kills the child's process group and blocks until the shim
-  confirms the group is dead. Idempotent.
+- `close/1`: kills the child's process group, waits for its bounded report,
+  and returns `:ok` for compatibility. It releases retained terminal evidence.
+- `shutdown/1`: closes the session and returns `{:ok, terminal}` with the
+  native status and cleanup confirmation kept separate. Repeated calls return
+  the same result.
+- `await_terminal/2`: waits for a natural exit or another caller's shutdown,
+  then returns the retained terminal result. A wait timeout returns
+  `{:error, :timeout}` and says nothing about cleanup.
+- `forget_terminal/1`: releases the retained result after the owner has
+  accounted for it. Otherwise it remains available until the owner exits.
+
+For example, a caller that must account for uncertain cleanup can use:
+
+```elixir
+{:ok, terminal} = Forcola.Duplex.shutdown(session)
+
+case terminal.confirmation do
+  :confirmed -> :ok
+  other -> {:cleanup_uncertain, other, terminal.status}
+end
+```
+
+`terminal.scope` is `:process_group` or `:active_cgroup` when the native
+EXIT report identifies the active mechanism, and `:unknown` without a report.
+It describes what was observed, not proof that a descendant outside that
+mechanism was confined. An abrupt shim loss is `:transport_lost`; a shim
+that does not answer before the backstop is `:timeout`. The legacy
+`{:forcola_exit, session, status}` message remains unchanged.
 
 Messages to the owner:
 

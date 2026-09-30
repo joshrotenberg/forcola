@@ -243,6 +243,172 @@ defmodule Forcola.DuplexTest do
     end
   end
 
+  describe "terminal evidence" do
+    test "normal exit remains available after the session process exits" do
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", "exit 7"], kill_grace_ms: 1_000)
+
+      assert_receive {:forcola_exit, ^session, 7}, 10_000
+
+      assert {:ok,
+              %Forcola.Duplex.Terminal{
+                status: 7,
+                confirmation: :confirmed,
+                cause: :child_exit,
+                scope: :process_group
+              } = terminal} = Forcola.Duplex.await_terminal(session, 10_000)
+
+      assert {:ok, ^terminal} = Forcola.Duplex.shutdown(session)
+      assert {:ok, ^terminal} = Forcola.Duplex.await_terminal(session, 0)
+      assert :ok = Forcola.Duplex.forget_terminal(session)
+      assert {:error, :released} = Forcola.Duplex.await_terminal(session, 0)
+    end
+
+    test "explicit shutdown preserves native status and unconfirmed cleanup", %{tmp_dir: tmp_dir} do
+      shim_path = terminal_fixture(tmp_dir)
+
+      {:ok, session} =
+        Forcola.Duplex.open(["unconfirmed"], shim_path: shim_path, kill_grace_ms: 100)
+
+      assert_receive {:forcola_line, ^session, "ready"}, 5_000
+
+      assert {:ok,
+              %Forcola.Duplex.Terminal{
+                status: 7,
+                confirmation: :unconfirmed,
+                cause: :explicit_close,
+                scope: :process_group
+              } = terminal} = Forcola.Duplex.shutdown(session)
+
+      assert {:ok, ^terminal} = Forcola.Duplex.shutdown(session)
+      assert {:ok, ^terminal} = Forcola.Duplex.await_terminal(session, 0)
+      assert :ok = Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "explicit shutdown reports confirmed active containment from the shim", %{
+      tmp_dir: tmp_dir
+    } do
+      shim_path = terminal_fixture(tmp_dir)
+      {:ok, session} = Forcola.Duplex.open(["contained"], shim_path: shim_path)
+      assert_receive {:forcola_line, ^session, "ready"}, 5_000
+
+      assert {:ok,
+              %Forcola.Duplex.Terminal{
+                status: 7,
+                confirmation: :confirmed,
+                cause: :explicit_close,
+                scope: :active_cgroup
+              }} = Forcola.Duplex.shutdown(session)
+
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "await timeout does not report settlement" do
+      {:ok, session} = Forcola.Duplex.open(["/bin/cat"], kill_grace_ms: 100)
+      assert {:error, :timeout} = Forcola.Duplex.await_terminal(session, 0)
+      assert {:error, :active} = Forcola.Duplex.forget_terminal(session)
+
+      assert {:ok, %Forcola.Duplex.Terminal{confirmation: :confirmed}} =
+               Forcola.Duplex.shutdown(session)
+
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a nonreporting shim yields timeout evidence", %{tmp_dir: tmp_dir} do
+      shim_path = terminal_fixture(tmp_dir)
+      {:ok, session} = Forcola.Duplex.open(["timeout"], shim_path: shim_path, kill_grace_ms: 100)
+      assert_receive {:forcola_line, ^session, "ready"}, 5_000
+
+      assert {:ok,
+              %Forcola.Duplex.Terminal{
+                status: nil,
+                confirmation: :timeout,
+                cause: :explicit_close,
+                scope: :unknown
+              } = terminal} = Forcola.Duplex.shutdown(session)
+
+      assert {:ok, ^terminal} = Forcola.Duplex.await_terminal(session, 0)
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "legacy close remains idempotent and releases retained evidence" do
+      {:ok, session} = Forcola.Duplex.open(["/bin/cat"], kill_grace_ms: 100)
+      assert :ok = Forcola.Duplex.close(session)
+      assert :ok = Forcola.Duplex.close(session)
+      assert {:error, :released} = Forcola.Duplex.await_terminal(session, 0)
+    end
+
+    test "an abruptly killed session cannot be reported as confirmed" do
+      {:ok, session} = Forcola.Duplex.open(["/bin/cat"], kill_grace_ms: 100)
+      Process.exit(session.pid, :kill)
+
+      assert {:ok,
+              %Forcola.Duplex.Terminal{
+                status: nil,
+                confirmation: :transport_lost,
+                cause: :session_lost,
+                scope: :unknown
+              } = terminal} = Forcola.Duplex.await_terminal(session, 5_000)
+
+      assert {:ok, ^terminal} = Forcola.Duplex.await_terminal(session, 0)
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a child-exit and shutdown race retains one stable terminal result" do
+      {:ok, session} = Forcola.Duplex.open(["/bin/cat"], kill_grace_ms: 100)
+      :ok = Forcola.Duplex.send_eof(session)
+
+      assert {:ok, %Forcola.Duplex.Terminal{confirmation: :confirmed} = terminal} =
+               Forcola.Duplex.shutdown(session)
+
+      assert terminal.cause in [:child_exit, :explicit_close]
+      assert {:ok, ^terminal} = Forcola.Duplex.await_terminal(session, 0)
+      assert {:ok, ^terminal} = Forcola.Duplex.shutdown(session)
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a separate recipient gets terminal evidence when the owner dies" do
+      observer = self()
+
+      owner =
+        spawn(fn ->
+          {:ok, session} =
+            Forcola.Duplex.open(["/bin/sh", "-c", "echo ready; cat"],
+              kill_grace_ms: 100,
+              terminal_recipient: observer
+            )
+
+          receive do
+            {:forcola_line, ^session, "ready"} -> :ok
+          end
+
+          send(observer, {:opened, session})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:opened, session}, 5_000
+      Process.exit(owner, :kill)
+
+      assert_receive {:forcola_terminal, ^session,
+                      %Forcola.Duplex.Terminal{
+                        confirmation: :confirmed,
+                        cause: :owner_death,
+                        scope: :process_group
+                      }},
+                     10_000
+
+      assert {:error, :released} = Forcola.Duplex.await_terminal(session, 0)
+    end
+  end
+
+  defp terminal_fixture(tmp_dir) do
+    source = Path.expand("../fixtures/duplex_terminal_shim.py", __DIR__)
+    destination = Path.join(tmp_dir, "duplex_terminal_shim.py")
+    File.cp!(source, destination)
+    File.chmod!(destination, 0o755)
+    destination
+  end
+
   # kill -0: probes existence without signalling.
   defp alive?(pid) do
     {_out, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
