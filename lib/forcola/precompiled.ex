@@ -49,7 +49,13 @@ defmodule Forcola.Precompiled do
   def target(system_architecture \\ system_architecture()) do
     with {:ok, arch} <- parse_arch(system_architecture),
          {:ok, os} <- parse_os(system_architecture) do
-      {:ok, "#{arch}-#{os}"}
+      target = "#{arch}-#{os}"
+
+      if target in @targets do
+        {:ok, target}
+      else
+        {:error, "unsupported precompiled target #{target} (#{system_architecture})"}
+      end
     end
   end
 

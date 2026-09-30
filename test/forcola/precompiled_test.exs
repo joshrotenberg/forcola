@@ -23,6 +23,11 @@ defmodule Forcola.PrecompiledTest do
       assert {:ok, "x86_64-unknown-linux-musl"} = Precompiled.target("x86_64-pc-linux-musl")
     end
 
+    test "rejects architecture and OS combinations without a release artifact" do
+      assert {:error, message} = Precompiled.target("aarch64-alpine-linux-musl")
+      assert message =~ "unsupported precompiled target aarch64-unknown-linux-musl"
+    end
+
     test "rejects unsupported architectures" do
       assert {:error, message} = Precompiled.target("i686-pc-linux-gnu")
       assert message =~ "unsupported architecture"
