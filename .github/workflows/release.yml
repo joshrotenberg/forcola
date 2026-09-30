@@ -72,7 +72,7 @@ jobs:
 
       - name: Upload artifact (dry run)
         if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.artifact }}
           path: |
