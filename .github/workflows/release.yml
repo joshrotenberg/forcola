@@ -9,13 +9,20 @@ name: Release
 # dispatches this workflow at the new tag because GITHUB_TOKEN-created
 # tags do not fire on-tag-push workflows. Pushing a v* tag by hand
 # works the same way. A workflow_dispatch from a branch ref runs the
-# build matrix only, as a dry run; assets are uploaded and the package
-# published only when the ref is a tag.
+# build matrix only, as a dry run. The explicit publish_existing_tag input
+# resumes Hex publishing from main after verifying the package sources
+# match its tag and all release assets are present.
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish_existing_tag:
+        description: "Resume Hex publishing for the current mix.exs version"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -24,6 +31,7 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    if: ${{ github.ref_type == 'tag' || inputs.publish_existing_tag != true }}
     strategy:
       fail-fast: false
       matrix:
@@ -91,7 +99,11 @@ jobs:
     name: Publish to Hex.pm
     runs-on: ubuntu-latest
     needs: build
-    if: github.ref_type == 'tag'
+    if: >-
+      ${{ always() &&
+          ((github.ref_type == 'tag' && needs.build.result == 'success') ||
+           (github.event_name == 'workflow_dispatch' && inputs.publish_existing_tag == true &&
+            github.ref_name == 'main' && needs.build.result == 'skipped')) }}
 
     steps:
       - name: Check HEX_API_KEY is configured
@@ -106,12 +118,44 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Check tag matches mix.exs version
+        if: github.ref_type == 'tag'
         run: |
           version="$(grep -o '@version "[^"]*"' mix.exs | head -1 | cut -d '"' -f 2)"
           if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
             echo "::error::mix.exs version ${version} does not match tag ${GITHUB_REF_NAME}"
             exit 1
           fi
+
+      - name: Verify existing release for Hex recovery
+        if: inputs.publish_existing_tag == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(grep -o '@version "[^"]*"' mix.exs | head -1 | cut -d '"' -f 2)"
+          tag="v${version}"
+          git fetch --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+
+          # Test and workflow changes are fine; the package's inputs must
+          # still be exactly the sources used for the tagged release.
+          package_paths=(.formatter.exs mix.exs mix.lock lib guides README.md CHANGELOG.md LICENSE
+            native/forcola_shim/src native/forcola_shim/Cargo.toml native/forcola_shim/Cargo.lock)
+          if ! git diff --quiet "${tag}" HEAD -- "${package_paths[@]}"; then
+            echo "::error::Package sources differ from ${tag}; cannot resume its Hex publish."
+            git diff --name-only "${tag}" HEAD -- "${package_paths[@]}"
+            exit 1
+          fi
+
+          assets="$(gh release view "${tag}" --json assets --jq '.assets[].name')"
+          for target in aarch64-apple-darwin x86_64-apple-darwin \
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl; do
+            archive="forcola_shim-${tag}-${target}.tar.gz"
+            for name in "${archive}" "${archive}.sha256"; do
+              if ! printf '%s\n' "${assets}" | grep -Fxq "${name}"; then
+                echo "::error::Missing ${name} on release ${tag}."
+                exit 1
+              fi
+            done
+          done
 
       - uses: erlef/setup-beam@v1
         with:
