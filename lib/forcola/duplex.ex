@@ -86,6 +86,7 @@ defmodule Forcola.Duplex do
   ## Options
 
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
+    * `:shim_path` - trusted absolute shim path, as in `Forcola.run/2`.
     * `:user`, `:group` - run the child as a different user/group, as in
       `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
       privileged shim; failures fail closed and arrive as
@@ -107,6 +108,10 @@ defmodule Forcola.Duplex do
   A spawn failure (e.g. a missing binary) is asynchronous: `open/2`
   still returns `{:ok, session}` and the failure arrives as
   `{:forcola_exit, session, {:spawn_error, reason}}`.
+  Shim path validation and synchronous port startup failures return
+  `{:error, reason}` immediately, including `{:invalid_shim_path, reason}`
+  for a bad override. A shim that exits after its port opens is reported
+  through `{:forcola_exit, session, :shim_exited}`.
   """
   @spec open([String.t(), ...], keyword()) :: {:ok, session()} | {:error, term()}
   def open([binary | _] = argv, opts) when is_binary(binary) do
@@ -169,7 +174,7 @@ defmodule Forcola.Duplex do
 
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
 
-    case Shim.open() do
+    case Shim.open(opts) do
       {:ok, port} ->
         payload = Shim.encode_spawn(argv, Keyword.put(opts, :kill_grace_ms, kill_grace_ms))
         Shim.send_frame(port, Shim.tag_spawn(), payload)
@@ -188,6 +193,9 @@ defmodule Forcola.Duplex do
 
       {:error, :not_found} ->
         {:stop, :shim_not_found}
+
+      {:error, reason} ->
+        {:stop, reason}
     end
   end
 
@@ -339,13 +347,13 @@ defmodule Forcola.Duplex do
 
   ## Port writes
 
-  # Port.command raises :badarg once the port is closed (the shim raced
-  # us shut); surface that as the session being over.
+  # A closed port means the shim raced us shut; surface that as the
+  # session being over.
   defp port_command(port, tag, payload) do
-    Shim.send_frame(port, tag, payload)
-    :ok
-  catch
-    :error, :badarg -> {:error, :closed}
+    case Shim.send_frame(port, tag, payload) do
+      true -> :ok
+      false -> {:error, :closed}
+    end
   end
 
   ## Kill discipline
@@ -413,11 +421,5 @@ defmodule Forcola.Duplex do
 
   defp warn_unconfirmed_cleanup(_confirmed), do: :ok
 
-  defp close_port(port) do
-    if Port.info(port) != nil do
-      Port.close(port)
-    end
-  catch
-    :error, :badarg -> :ok
-  end
+  defp close_port(port), do: Shim.close(port)
 end

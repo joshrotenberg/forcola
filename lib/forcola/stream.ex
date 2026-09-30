@@ -99,7 +99,7 @@ defmodule Forcola.Stream do
 
     @type t :: %__MODULE__{
             status: non_neg_integer() | {:signal, atom() | non_neg_integer()} | nil,
-            reason: String.t() | atom() | nil,
+            reason: String.t() | atom() | tuple() | nil,
             stderr: binary(),
             timed_out: boolean(),
             idle_timed_out: boolean()
@@ -152,7 +152,8 @@ defmodule Forcola.Stream do
   @doc """
   Run `argv` and return its stdout as a lazy stream of lines.
 
-  Takes the same options as `Forcola.run/2`, including `:user`/`:group`
+  Takes the same options as `Forcola.run/2`, including the trusted
+  `:shim_path` override and `:user`/`:group`
   for running the child as a different user (POSIX-only, fail-closed,
   privileged shim required); `:timeout_ms` is required and bounds the
   whole run, not the gap between lines.
@@ -217,7 +218,7 @@ defmodule Forcola.Stream do
   end
 
   defp start(argv, opts, timeout_ms, kill_grace_ms, idle_timeout_ms, window_bytes) do
-    case Shim.open() do
+    case Shim.open(opts) do
       {:ok, port} ->
         spawn_opts =
           opts
@@ -254,6 +255,9 @@ defmodule Forcola.Stream do
 
       {:error, :not_found} ->
         raise Error, reason: :shim_not_found
+
+      {:error, reason} ->
+        raise Error, reason: reason
     end
   end
 
@@ -459,12 +463,10 @@ defmodule Forcola.Stream do
     warn_unconfirmed_cleanup(confirmation)
 
     close_port(port)
-    flush_port(port)
   end
 
   defp cleanup(%{port: port}) do
     close_port(port)
-    flush_port(port)
   end
 
   defp await_exit(port, timeout_ms) do
@@ -517,22 +519,5 @@ defmodule Forcola.Stream do
 
   defp warn_unconfirmed_cleanup(_confirmed), do: :ok
 
-  defp close_port(port) do
-    if Port.info(port) != nil do
-      Port.close(port)
-    end
-  catch
-    :error, :badarg -> :ok
-  end
-
-  # Drop any port messages already delivered to the mailbox; the port is
-  # closed, so nothing new arrives and stragglers would sit in a
-  # long-lived consumer's mailbox forever.
-  defp flush_port(port) do
-    receive do
-      {^port, _} -> flush_port(port)
-    after
-      0 -> :ok
-    end
-  end
+  defp close_port(port), do: Shim.close(port)
 end

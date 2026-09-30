@@ -24,6 +24,103 @@ and verified against a SHA256 checksum at compile time. On other targets, or
 to opt out of the download, set `FORCOLA_BUILD=1` to build the shim from
 source with cargo.
 
+### Mix escripts
+
+A native executable inside an escript archive cannot be launched directly.
+Include the shim when building your CLI:
+
+```elixir
+# In project/0 in the consumer's mix.exs:
+escript: [main_module: MyCLI, embed_elixir: true, include_priv_for: [:forcola]]
+```
+
+The consumer owns extraction and passes the resulting **trusted absolute
+filesystem path** as `:shim_path`. This option is supported by all four APIs:
+
+```elixir
+Forcola.run(argv, timeout_ms: 5_000, shim_path: path)
+Forcola.Stream.lines(argv, timeout_ms: 5_000, shim_path: path) |> Enum.to_list()
+Forcola.Duplex.open(argv, shim_path: path)
+Forcola.Daemon.start_link(argv: argv, shim_path: path)
+```
+
+Without the option, Mix and releases continue to use the installed
+`priv/forcola_shim`. Forcola does not read an environment variable to replace
+the shim, extract an archive automatically, or fall back to `System.cmd`.
+The selected shim still implements the same timeout, cancellation, and
+process-group cleanup protocol.
+
+This consumer helper extracts only the bundled shim into a new directory
+for each invocation. `private_parent` must already be an absolute path to
+an application-owned directory whose contents and ancestors cannot be
+replaced by untrusted users. Mix documents `:escript.extract/2` for reading
+[included priv files](https://hexdocs.pm/mix/Mix.Tasks.Escript.Build.html).
+
+```elixir
+defmodule MyCLI.Shim do
+  def with_shim(private_parent, fun) do
+    {:ok, sections} = :escript.extract(:escript.script_name(), [])
+    archive = Keyword.fetch!(sections, :archive)
+    entry = ~c"forcola/priv/forcola_shim"
+    {:ok, [{^entry, binary}]} = :zip.extract(archive, [:memory, {:file_list, [entry]}])
+
+    unique = Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    directory = Path.join(private_parent, "forcola-" <> unique)
+    File.mkdir!(directory)
+
+    try do
+      File.chmod!(directory, 0o700)
+      shim = Path.join(directory, "forcola_shim")
+      File.write!(shim, binary, [:binary, :exclusive])
+      File.chmod!(shim, 0o500)
+      fun.(shim)
+    after
+      File.rm_rf!(directory)
+    end
+  end
+end
+
+MyCLI.Shim.with_shim(private_parent, fn path ->
+  Forcola.run(["git", "--version"], timeout_ms: 5_000, shim_path: path)
+end)
+```
+
+Each directory is created exclusively, and the path is handed to Forcola
+only after the entire file is written and made executable. Concurrent CLI
+invocations never reuse a cache file. The executable comes from that
+escript's own Forcola build, so versions and architectures cannot share a
+stale cached binary. The escript must be built for the host's OS and CPU;
+embedding Elixir does not make the native shim portable between targets.
+
+Keep the directory until all streams have been consumed and all duplex
+sessions and daemons have stopped. The helper's `after` block removes it
+on ordinary completion or an exception; abrupt VM death can leave it
+behind, so the consumer's installation policy should clean up abandoned
+directories when no invocation uses them. Long-lived supervised daemons
+can instead use an executable installed by the application's packaging
+step and retained for its lifetime.
+
+The override is trusted executable code running with the BEAM's privileges,
+before any child `:user`/`:group` drop. Do not obtain it from untrusted
+command input or allow other users to replace the file, symlink target,
+or parent directories. Forcola validates the path's basic shape and file
+permissions, but does not authenticate a supplied executable or prevent
+replacement between validation and launch. If using a persistent cache,
+the consumer must additionally isolate versions/targets, verify its contents
+against the bundled binary, and publish files atomically in a protected
+directory.
+
+A missing default shim keeps the existing `:shim_not_found` error.
+An invalid override reports `{:invalid_shim_path, reason}` (for example
+`:not_absolute`, `:enoent`, or `:not_executable`); a synchronous OS failure
+to open the port reports `{:shim_start_failed, reason}`. These appear in
+the mode's normal startup-error shape: `{:error, {:spawn, reason}}` for
+bounded runs and daemons, `Forcola.Stream.Error.reason` when consuming a stream, and
+`{:error, reason}` from `Forcola.Duplex.open/2`.
+If the port opens but its executable then fails, the mode reports its
+existing shim-death error instead; duplex and daemon sessions can report
+this after startup.
+
 ## A first run
 
 `Forcola.run/2` runs a command to completion under the shim. The argument is
@@ -83,6 +180,8 @@ Options:
 - `:cd`: working directory.
 - `:env`: list of `{name, value}` strings.
 - `:merge_stderr`: route stderr into stdout, default `false`.
+- `:shim_path`: trusted absolute path to an installed shim; see
+  [Mix escripts](#mix-escripts). Omit to use the normal `priv` location.
 - `:user`: run the child as this user, a string username or an integer uid.
 - `:group`: run the child with this group as its primary gid, a string group
   name or an integer gid.
@@ -95,8 +194,9 @@ Return shapes:
   completed run. `status` is an exit code or `{:signal, n}`.
 - `{:error, {:timeout, %Forcola.Result{}}}` on timeout, carrying output
   captured so far.
-- `{:error, {:spawn, reason}}` where `reason` is `:shim_not_found`, a string
-  reported by the shim, or `{:shim_exited, %Forcola.Result{}}`.
+- `{:error, {:spawn, reason}}` where `reason` is `:shim_not_found`, a shim
+  path/startup error described above, a string reported by the shim, or
+  `{:shim_exited, %Forcola.Result{}}`.
 
 #### Running as a different user
 
@@ -238,7 +338,7 @@ Options:
 
 - `:argv` (required): `[binary | args]` as in `Forcola.run/2`.
 - `:name`: optional GenServer registration name.
-- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`, `:cgroup`: as in `Forcola.run/2`.
+- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`, `:cgroup`, `:shim_path`: as in `Forcola.run/2`.
 - `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
 - `:output`: where child output goes, default `:logger`.
 - `:log_output`: `Logger` level for `output: :logger`, default `:info`.
@@ -291,7 +391,7 @@ There is no `:timeout_ms`; the session is bounded by its owner process and
 
 Options:
 
-- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`, `:cgroup`: as in `Forcola.run/2`.
+- `:cd`, `:env`, `:merge_stderr`, `:user`, `:group`, `:cgroup`, `:shim_path`: as in `Forcola.run/2`.
 - `:kill_grace_ms`: SIGTERM-to-SIGKILL grace, default `5_000`.
 - `:pty`: run the child under a pseudo-terminal (default `false`), for CLIs
   that behave differently when they detect a tty. See
@@ -321,8 +421,9 @@ Messages to the owner:
   `{:spawn_error, reason}` if it never started, or `:shim_exited` if the shim
   died without reporting. The session is over; `close/1` is not required.
 
-A spawn failure is asynchronous: `open/2` still returns `{:ok, session}` and
-the failure arrives as `{:forcola_exit, session, {:spawn_error, reason}}`.
+A child spawn failure is asynchronous: `open/2` still returns `{:ok, session}`
+and the failure arrives as `{:forcola_exit, session, {:spawn_error, reason}}`.
+A missing or invalid shim fails synchronously with `{:error, reason}`.
 
 #### Pseudo-terminal
 
