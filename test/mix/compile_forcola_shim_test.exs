@@ -74,24 +74,20 @@ defmodule Mix.Tasks.Compile.ForcolaShimTest do
     # A normal compile leaves the shim in the source priv; the suite needs it.
     assert File.exists?(source_bin), "expected a compiled source-priv shim before the test"
 
-    link_target =
-      case File.read_link(build_priv) do
-        {:ok, target} -> target
-        {:error, _} -> nil
-      end
-
     saved_bin = File.read!(source_bin)
+    # Keep the entire original priv entry, whether it is a symlink or a real
+    # directory. Restoring an empty directory loses the built shim on runners
+    # where Mix copied priv instead of linking it.
+    backup =
+      build_priv <>
+        ".test-backup-" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+
+    File.rename!(build_priv, backup)
 
     on_exit(fn ->
-      # Restore the original build priv (symlink to the source priv), and
-      # make sure the shim is back in place for the rest of the suite.
+      # Restore the original build priv and source binary for later tests.
       File.rm_rf!(build_priv)
-
-      if link_target do
-        File.ln_s!(link_target, build_priv)
-      else
-        File.mkdir_p!(build_priv)
-      end
+      File.rename!(backup, build_priv)
 
       File.mkdir_p!(Path.dirname(source_bin))
       File.write!(source_bin, saved_bin)
@@ -101,7 +97,6 @@ defmodule Mix.Tasks.Compile.ForcolaShimTest do
     # Stand in for a freshly copied dependency priv: a real directory that
     # does not yet contain the downloaded/built shim, while the source
     # priv (left untouched) does.
-    File.rm_rf!(build_priv)
     File.mkdir_p!(build_priv)
 
     refute File.exists?(build_bin)
