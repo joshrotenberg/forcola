@@ -34,7 +34,7 @@ defmodule Forcola do
   @typedoc """
   Errors a bounded run can return.
 
-  The spawn reason is one of `:shim_not_found`, a reason string reported
+  The spawn reason describes shim discovery/startup, a failure reported
   by the shim, or `{:shim_exited, %Forcola.Result{}}`; see `run/2`.
   """
   @type run_error :: {:timeout, Result.t()} | {:spawn, term()}
@@ -72,6 +72,10 @@ defmodule Forcola do
     * `:cd` - working directory.
     * `:env` - list of `{name, value}` strings.
     * `:merge_stderr` - route stderr into stdout; default `false`.
+    * `:shim_path` - trusted absolute path to a matching native shim,
+      overriding normal discovery. Also accepted by Stream, Duplex, and
+      Daemon. The caller owns installation, permissions, protection from
+      replacement, and cleanup; see `Forcola.Shim.path/1`.
     * `:user` - run the child as this user, a string username or an
       integer uid. The user's primary gid and supplementary groups are
       taken from the passwd/group database unless `:group` overrides the
@@ -136,6 +140,12 @@ defmodule Forcola do
 
     * `{:error, {:spawn, :shim_not_found}}` - no shim binary exists for
       this target (neither downloaded nor built).
+    * `{:error, {:spawn, {:invalid_shim_path, reason}}}` - an explicit
+      `:shim_path` is not an absolute binary path to a regular executable
+      file, or the file cannot be accessed. Filesystem failures use POSIX
+      reasons such as `:enoent`.
+    * `{:error, {:spawn, {:shim_start_failed, reason}}}` - the operating
+      system could not start the shim, for example `:eacces` or `:enoexec`.
     * `{:error, {:spawn, reason}}` where `reason` is a string - the shim
       reported the spawn failure, for example a missing or
       non-executable command.
@@ -150,7 +160,7 @@ defmodule Forcola do
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
 
-    case Shim.open() do
+    case Shim.open(opts) do
       {:ok, port} ->
         try do
           spawn_and_collect(port, argv, opts, timeout_ms, kill_grace_ms)
@@ -160,6 +170,9 @@ defmodule Forcola do
 
       {:error, :not_found} ->
         {:error, {:spawn, :shim_not_found}}
+
+      {:error, reason} ->
+        {:error, {:spawn, reason}}
     end
   end
 
@@ -237,15 +250,5 @@ defmodule Forcola do
     }
   end
 
-  defp close_port(port) do
-    if port_open?(port) do
-      Port.close(port)
-    end
-  catch
-    :error, :badarg -> :ok
-  end
-
-  defp port_open?(port) do
-    Port.info(port) != nil
-  end
+  defp close_port(port), do: Shim.close(port)
 end

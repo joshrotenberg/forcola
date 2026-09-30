@@ -26,6 +26,7 @@ defmodule Forcola.Daemon do
     * `:argv` - required, `[binary | args]` as in `Forcola.run/2`.
     * `:name` - optional GenServer registration name.
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
+    * `:shim_path` - trusted absolute shim path, as in `Forcola.run/2`.
     * `:user`, `:group` - run the child as a different user/group, as in
       `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
       privileged shim; failures fail closed and surface as the daemon's
@@ -112,6 +113,9 @@ defmodule Forcola.Daemon do
 
   See the module docs for options. Raises `ArgumentError` on invalid
   options (missing `:argv`, a `:timeout_ms`, a bad `:output` shape).
+  Shim path validation and synchronous port startup failures return
+  `{:error, {:spawn, reason}}`, including `{:invalid_shim_path, reason}`
+  for a bad override.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -129,7 +133,7 @@ defmodule Forcola.Daemon do
 
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
 
-    case Shim.open() do
+    case Shim.open(opts) do
       {:ok, port} ->
         argv = Keyword.fetch!(opts, :argv)
         payload = Shim.encode_spawn(argv, Keyword.put(opts, :kill_grace_ms, kill_grace_ms))
@@ -156,6 +160,9 @@ defmodule Forcola.Daemon do
 
       {:error, :not_found} ->
         {:stop, {:spawn, :shim_not_found}}
+
+      {:error, reason} ->
+        {:stop, {:spawn, reason}}
     end
   end
 
@@ -436,11 +443,5 @@ defmodule Forcola.Daemon do
 
   defp warn_unconfirmed_cleanup(_confirmed), do: :ok
 
-  defp close_port(port) do
-    if Port.info(port) != nil do
-      Port.close(port)
-    end
-  catch
-    :error, :badarg -> :ok
-  end
+  defp close_port(port), do: Shim.close(port)
 end

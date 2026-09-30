@@ -33,6 +33,11 @@ and verified against a SHA256 checksum at compile time. On other targets, or
 to opt out of the download, set `FORCOLA_BUILD=1` to build from source with
 cargo. See the [getting started guide](https://hexdocs.pm/forcola/getting_started.html).
 
+For Mix escripts, include Forcola's `priv` files, extract the bundled shim to
+a trusted executable path, and pass `shim_path: path` to any execution mode.
+The [escript installation example](https://hexdocs.pm/forcola/getting_started.html#mix-escripts)
+covers extraction, permissions, and cleanup.
+
 ## The problem
 
 The common Elixir timeout pattern leaks processes:
