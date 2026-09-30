@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.5](https://github.com/joshrotenberg/forcola/compare/v0.3.4...v0.3.5) (2026-09-30)
+
+
+### Bug Fixes
+
+* support trusted shim paths for escripts ([#76](https://github.com/joshrotenberg/forcola/issues/76)) ([51e1561](https://github.com/joshrotenberg/forcola/commit/51e1561ca6ef66a9ea588e98bee42397f040e87c))
+
 ## [0.3.4](https://github.com/joshrotenberg/forcola/compare/v0.3.3...v0.3.4) (2026-09-27)
 
 
