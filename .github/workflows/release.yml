@@ -44,7 +44,7 @@ jobs:
         working-directory: native/forcola_shim
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -103,7 +103,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Check tag matches mix.exs version
         run: |
