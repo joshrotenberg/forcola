@@ -62,6 +62,14 @@ defmodule Forcola.ShimDeathTest do
 
       assert_receive {:forcola_exit, ^session, :shim_exited}, 10_000
 
+      assert {:ok,
+              %Forcola.Duplex.Terminal{
+                status: nil,
+                confirmation: :transport_lost,
+                cause: :shim_lost,
+                scope: :unknown
+              }} = Forcola.Duplex.await_terminal(session, 10_000)
+
       # Unlike the run/2 case, this child usually dies on its own: its
       # stdin pipe was fed by the dead shim, so `read` hits EOF and the
       # shell exits. That is incidental (a stdin-independent child would
@@ -72,6 +80,7 @@ defmodule Forcola.ShimDeathTest do
 
       # close/1 after shim death is a no-op and still returns :ok.
       assert :ok = Forcola.Duplex.close(session)
+      assert :ok = Forcola.Duplex.forget_terminal(session)
     end
   end
 

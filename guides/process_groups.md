@@ -72,15 +72,18 @@ After the kill sequence it waits for the group to be reaped, then sends its
 EXIT frame, and the Elixir side blocks on that frame. A bounded run or idle
 stream timeout carries the confirmed child status. Early stream halt,
 `Forcola.Daemon` termination, and `Forcola.Duplex.close/1` block for the same
-bounded confirmation before returning.
+bounded report before returning. `Forcola.Duplex.shutdown/1` returns that
+report as structured terminal evidence.
 
 ### Confirmation exceptions
 
 The shim's TERM-to-KILL sequence is bounded. If the process group still exists
 after the final SIGKILL wait, or a contained cgroup does not drain before its
 deadline, the EXIT report is marked unconfirmed. Public result shapes surface
-that as `{:signal, :unconfirmed}` even though the direct child's original status
-may have been known. Treat it as leaked and investigate.
+that as `{:signal, :unconfirmed}` in the legacy exit status. Duplex terminal
+evidence keeps the direct child's observed status and the unconfirmed cleanup
+distinction separate. Treat unconfirmed cleanup as a possible leak and
+investigate.
 
 Early stream halt, daemon termination, and duplex close have no result value in
 which to carry that status. They return after their bounded backstop and emit a

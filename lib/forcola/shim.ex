@@ -375,6 +375,29 @@ defmodule Forcola.Shim do
     Map.get(:json.decode(payload), "contained", false)
   end
 
+  @doc """
+  Decodes the native EXIT report without discarding the observed child status
+  when cleanup was unconfirmed. `decode_exit/1` retains its legacy status shape.
+  """
+  @spec decode_exit_report(binary()) :: map()
+  def decode_exit_report(payload) do
+    decoded = :json.decode(payload)
+
+    status =
+      cond do
+        is_integer(decoded["status"]) -> decoded["status"]
+        is_integer(decoded["signal"]) -> {:signal, decoded["signal"]}
+        true -> nil
+      end
+
+    %{
+      status: status,
+      confirmed: Map.get(decoded, "confirmed", true),
+      timed_out: Map.get(decoded, "timed_out", false),
+      contained: Map.get(decoded, "contained", false)
+    }
+  end
+
   @doc "Decodes an ERROR frame payload into its reason string."
   @spec decode_error(binary()) :: String.t()
   def decode_error(payload) do

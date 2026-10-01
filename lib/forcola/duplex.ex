@@ -36,9 +36,15 @@ defmodule Forcola.Duplex do
   ## Kill discipline
 
   `close/1` kills the child's process group (SIGTERM, then SIGKILL after
-  the kill grace) and blocks for the shim's confirmation. Because `close/1`
-  remains idempotent and returns `:ok`, an unconfirmed cleanup on this explicit
-  shutdown path is emitted as a warning.
+  the kill grace) and blocks for the shim's confirmation. `shutdown/1` does
+  the same and returns a `Forcola.Duplex.Terminal` with the observed status,
+  confirmation, and active cleanup scope. `await_terminal/2` retrieves that
+  evidence after a spontaneous exit, including after the session process dies.
+  The owner may call `forget_terminal/1` when it no longer needs the result;
+  otherwise the small terminal record lives until the owner exits.
+  `terminal_recipient: pid` also sends `{:forcola_terminal, session, terminal}`
+  to another process, so an owner supervisor can retain the evidence if the
+  owner dies.
   The session monitors its owner: owner death takes the same path. If
   the session process itself is killed brutally, or the whole BEAM dies,
   the port closes, the shim sees stdin EOF, and the group is killed
@@ -74,11 +80,41 @@ defmodule Forcola.Duplex do
   # fires if the shim itself never reports back.
   @backstop_margin_ms 5_000
 
-  @enforce_keys [:pid, :ref]
-  defstruct [:pid, :ref]
+  defmodule Terminal do
+    @moduledoc """
+    Immutable evidence from a duplex session's terminal path.
+
+    `:status` is the native child exit code or signal, even when cleanup was
+    unconfirmed. It is `nil` if no EXIT frame arrived. `:confirmation` is one
+    of `:confirmed`, `:unconfirmed`, `:timeout`, `:transport_lost`, or
+    `:not_started`. `:scope` is `:process_group`, `:active_cgroup`, or
+    `:unknown`; it describes the mechanism the shim reported, not proof that
+    an escaped descendant outside that mechanism was confined.
+    """
+
+    @enforce_keys [:status, :confirmation, :cause, :scope]
+    defstruct [:status, :confirmation, :cause, :scope]
+
+    @type t :: %__MODULE__{
+            status: non_neg_integer() | {:signal, non_neg_integer()} | nil,
+            confirmation: :confirmed | :unconfirmed | :timeout | :transport_lost | :not_started,
+            cause:
+              :child_exit
+              | :timeout
+              | :explicit_close
+              | :owner_death
+              | :shim_lost
+              | :session_lost
+              | :spawn_error,
+            scope: :process_group | :active_cgroup | :unknown
+          }
+  end
+
+  @enforce_keys [:pid, :ref, :terminal_table]
+  defstruct [:pid, :ref, :terminal_table]
 
   @typedoc "An open duplex session."
-  @opaque session :: %__MODULE__{pid: pid(), ref: reference()}
+  @opaque session :: %__MODULE__{pid: pid(), ref: reference(), terminal_table: reference()}
 
   @doc """
   Open a duplex session running `argv`; the caller becomes the owner.
@@ -96,6 +132,9 @@ defmodule Forcola.Duplex do
       cgroup v2 subtree, and falls back to the process-group kill with a
       warning elsewhere. Default `false`.
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace, default `5_000`.
+    * `:terminal_recipient` - optional process to receive
+      `{:forcola_terminal, session, terminal}` on every terminal path,
+      including owner death. The recipient must retain the value itself.
     * `:pty` - run the child under a pseudo-terminal (default `false`). In
       pty mode stderr is merged into `:forcola_line` and no `:forcola_stderr`
       messages arrive; passing `merge_stderr: false` raises `ArgumentError`.
@@ -117,10 +156,17 @@ defmodule Forcola.Duplex do
   def open([binary | _] = argv, opts) when is_binary(binary) do
     validate_opts!(argv, opts)
     ref = make_ref()
+    # The owner owns the table, so the terminal record survives the session
+    # process but is reclaimed automatically when the owner exits.
+    table = :ets.new(:forcola_duplex_terminal, [:set, :public])
 
-    case GenServer.start(__MODULE__, {self(), ref, argv, opts}) do
-      {:ok, pid} -> {:ok, %__MODULE__{pid: pid, ref: ref}}
-      {:error, reason} -> {:error, reason}
+    case GenServer.start(__MODULE__, {self(), ref, table, argv, opts}) do
+      {:ok, pid} ->
+        {:ok, %__MODULE__{pid: pid, ref: ref, terminal_table: table}}
+
+      {:error, reason} ->
+        :ets.delete(table)
+        {:error, reason}
     end
   end
 
@@ -154,20 +200,84 @@ defmodule Forcola.Duplex do
   @doc """
   Close the session and kill the child's process group.
 
-  Blocks until the shim confirms the group is dead. Idempotent: closing
-  a session that is already over returns `:ok`.
+  Waits for the shim's bounded report and returns `:ok` for compatibility.
+  This releases any retained terminal record; use `shutdown/1` to receive
+  and retain the evidence. Idempotent when the session is already over.
   """
   @spec close(session()) :: :ok
-  def close(%__MODULE__{pid: pid}) do
+  def close(%__MODULE__{} = session) do
+    stop_session(session.pid)
+    forget_terminal(session)
+    :ok
+  end
+
+  defp stop_session(pid) do
     GenServer.stop(pid, :normal, :infinity)
   catch
     :exit, _ -> :ok
   end
 
+  @doc """
+  Close the session and return its terminal evidence. A completed session
+  returns the same stored result on repeated calls; the result is never
+  inferred from the mere absence of a live session process.
+  """
+  @spec shutdown(session()) :: {:ok, Terminal.t()} | {:error, :released}
+  def shutdown(%__MODULE__{} = session) do
+    stop_session(session.pid)
+    await_terminal(session, 0)
+  end
+
+  @doc """
+  Wait for terminal evidence from a naturally exiting or explicitly closed
+  session. `timeout` is milliseconds or `:infinity`. A timeout means only that
+  no result was available yet; it makes no claim about cleanup.
+  """
+  @spec await_terminal(session(), timeout()) ::
+          {:ok, Terminal.t()} | {:error, :timeout | :released}
+  def await_terminal(%__MODULE__{pid: pid} = session, timeout \\ :infinity) do
+    case terminal_result(session) do
+      {:error, :pending} ->
+        monitor = Process.monitor(pid)
+
+        try do
+          case terminal_result(session) do
+            {:error, :pending} ->
+              receive do
+                {:DOWN, ^monitor, :process, ^pid, _reason} -> terminal_result(session)
+              after
+                timeout -> {:error, :timeout}
+              end
+
+            result ->
+              result
+          end
+        after
+          Process.demonitor(monitor, [:flush])
+        end
+
+      result ->
+        result
+    end
+  end
+
+  @doc "Release the retained terminal record after the session has ended."
+  @spec forget_terminal(session()) :: :ok | {:error, :active}
+  def forget_terminal(%__MODULE__{pid: pid, terminal_table: table}) do
+    if Process.alive?(pid) do
+      {:error, :active}
+    else
+      :ets.delete(table)
+      :ok
+    end
+  catch
+    :error, :badarg -> :ok
+  end
+
   ## GenServer callbacks
 
   @impl true
-  def init({owner, ref, argv, opts}) do
+  def init({owner, ref, terminal_table, argv, opts}) do
     # Trap exits so the port's link notification arrives as a message
     # instead of killing the server without terminate/2.
     Process.flag(:trap_exit, true)
@@ -184,11 +294,14 @@ defmodule Forcola.Duplex do
          %{
            port: port,
            owner: owner,
-           session: %__MODULE__{pid: self(), ref: ref},
+           session: %__MODULE__{pid: self(), ref: ref, terminal_table: terminal_table},
            kill_grace_ms: kill_grace_ms,
            buffers: %{stdout: "", stderr: ""},
            stdin_open: true,
-           exit: nil
+           exit: nil,
+           terminal: nil,
+           terminal_recipient: Keyword.get(opts, :terminal_recipient),
+           shutdown_cause: :explicit_close
          }}
 
       {:error, :not_found} ->
@@ -240,7 +353,15 @@ defmodule Forcola.Duplex do
     # cannot be confirmed from here.
     state = flush_buffers(state)
     notify_exit(state, :shim_exited)
-    {:stop, :normal, %{state | exit: :shim_exited}}
+
+    terminal = %Terminal{
+      status: nil,
+      confirmation: :transport_lost,
+      cause: :shim_lost,
+      scope: :unknown
+    }
+
+    {:stop, :normal, %{state | exit: :shim_exited, terminal: terminal}}
   end
 
   def handle_info({:EXIT, port, _reason}, %{port: port} = state) do
@@ -251,7 +372,7 @@ defmodule Forcola.Duplex do
 
   def handle_info({:DOWN, _ref, :process, owner, _reason}, %{owner: owner} = state) do
     # Owner death; terminate/2 kills the group.
-    {:stop, :normal, state}
+    {:stop, :normal, %{state | shutdown_cause: :owner_death}}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -259,7 +380,12 @@ defmodule Forcola.Duplex do
   @impl true
   def terminate(_reason, state) do
     flush_buffers(state)
-    shutdown(state)
+    terminal = settle(state)
+    publish_terminal(state.session.terminal_table, terminal)
+
+    if is_pid(state.terminal_recipient) do
+      send(state.terminal_recipient, {:forcola_terminal, state.session, terminal})
+    end
   end
 
   ## Option validation
@@ -278,6 +404,12 @@ defmodule Forcola.Duplex do
 
     unless Enum.all?(argv, &is_binary/1) do
       raise ArgumentError, "argv must be a non-empty list of binaries, got: #{inspect(argv)}"
+    end
+
+    recipient = Keyword.get(opts, :terminal_recipient)
+
+    unless is_nil(recipient) or is_pid(recipient) do
+      raise ArgumentError, ":terminal_recipient must be a pid"
     end
 
     :ok
@@ -299,15 +431,24 @@ defmodule Forcola.Duplex do
     # The shim drains the child's pipes before sending EXIT, so every
     # output frame has already been handled; only partial lines remain.
     {status, _timed_out} = Shim.decode_exit(payload)
+    terminal = exit_terminal(payload, :child_exit)
     state = flush_buffers(state)
     notify_exit(state, status)
-    %{state | exit: status}
+    %{state | exit: status, terminal: terminal}
   end
 
   defp spawn_failed(state, payload) do
     reason = Shim.decode_error(payload)
     notify_exit(state, {:spawn_error, reason})
-    %{state | exit: {:spawn_error, reason}}
+
+    terminal = %Terminal{
+      status: nil,
+      confirmation: :not_started,
+      cause: :spawn_error,
+      scope: :unknown
+    }
+
+    %{state | exit: {:spawn_error, reason}, terminal: terminal}
   end
 
   defp notify_exit(state, status) do
@@ -358,27 +499,28 @@ defmodule Forcola.Duplex do
 
   ## Kill discipline
 
-  # The child may still be running: kill the group and wait for the
-  # shim's EXIT frame (the shim confirms group death before sending it).
-  defp shutdown(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms}) do
-    confirmation =
+  # The child may still be running: kill the group and wait for the native
+  # EXIT frame. Preserve its observed status separately from its cleanup
+  # confirmation; a missing frame never becomes a confirmed result.
+  defp settle(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms} = state) do
+    result =
       try do
         Shim.send_frame(port, Shim.tag_kill())
         await_exit(port, kill_grace_ms + @backstop_margin_ms)
       catch
-        # The port raced us shut (shim already gone); its death killed the
-        # group by the shim's stdin-EOF rule, so there is nothing to wait on.
-        :error, :badarg -> :ok
+        :error, :badarg -> :transport_lost
       end
 
-    warn_unconfirmed_cleanup(confirmation)
-
+    terminal = shutdown_terminal(result, state.shutdown_cause)
+    warn_unconfirmed_cleanup(terminal.confirmation)
     close_port(port)
+    terminal
   end
 
   # The shim already accounted for the child; nothing left to kill.
-  defp shutdown(%{port: port}) do
+  defp settle(%{port: port, terminal: terminal}) do
     close_port(port)
+    terminal
   end
 
   defp await_exit(port, timeout_ms) do
@@ -392,23 +534,73 @@ defmodule Forcola.Duplex do
     receive do
       {^port, {:data, <<tag, payload::binary>>}} ->
         cond do
-          tag == Shim.tag_exit() -> exit_confirmation(payload)
-          tag == Shim.tag_error() -> :ok
+          tag == Shim.tag_exit() -> {:exit, payload}
+          tag == Shim.tag_error() -> {:spawn_error, payload}
           true -> do_await_exit(port, deadline)
         end
 
       {^port, {:exit_status, _status}} ->
-        :ok
+        :transport_lost
     after
       max(remaining, 0) -> :timeout
     end
   end
 
-  defp exit_confirmation(payload) do
-    case Shim.decode_exit(payload) do
-      {{:signal, :unconfirmed}, _timed_out} -> :unconfirmed
-      _confirmed -> :ok
+  defp exit_terminal(payload, cause) do
+    report = Shim.decode_exit_report(payload)
+
+    %Terminal{
+      status: report.status,
+      confirmation: if(report.confirmed, do: :confirmed, else: :unconfirmed),
+      cause: if(report.timed_out, do: :timeout, else: cause),
+      scope: if(report.contained, do: :active_cgroup, else: :process_group)
+    }
+  end
+
+  defp shutdown_terminal({:exit, payload}, cause), do: exit_terminal(payload, cause)
+
+  defp shutdown_terminal({:spawn_error, _payload}, _cause) do
+    %Terminal{status: nil, confirmation: :not_started, cause: :spawn_error, scope: :unknown}
+  end
+
+  defp shutdown_terminal(:timeout, cause) do
+    %Terminal{status: nil, confirmation: :timeout, cause: cause, scope: :unknown}
+  end
+
+  defp shutdown_terminal(:transport_lost, cause) do
+    %Terminal{status: nil, confirmation: :transport_lost, cause: cause, scope: :unknown}
+  end
+
+  defp publish_terminal(table, terminal) do
+    :ets.insert_new(table, {:terminal, terminal})
+  catch
+    # Owner death also deletes its table. Teardown must still complete.
+    :error, :badarg -> :ok
+  end
+
+  defp terminal_result(%__MODULE__{pid: pid, terminal_table: table}) do
+    case :ets.lookup(table, :terminal) do
+      [{:terminal, terminal}] ->
+        {:ok, terminal}
+
+      [] ->
+        if Process.alive?(pid) do
+          {:error, :pending}
+        else
+          terminal = %Terminal{
+            status: nil,
+            confirmation: :transport_lost,
+            cause: :session_lost,
+            scope: :unknown
+          }
+
+          :ets.insert_new(table, {:terminal, terminal})
+          [{:terminal, stored}] = :ets.lookup(table, :terminal)
+          {:ok, stored}
+        end
     end
+  catch
+    :error, :badarg -> {:error, :released}
   end
 
   defp warn_unconfirmed_cleanup(:unconfirmed) do
@@ -417,6 +609,10 @@ defmodule Forcola.Duplex do
 
   defp warn_unconfirmed_cleanup(:timeout) do
     Logger.warning("forcola: duplex cleanup timed out before shim confirmation")
+  end
+
+  defp warn_unconfirmed_cleanup(:transport_lost) do
+    Logger.warning("forcola: duplex transport closed before cleanup confirmation")
   end
 
   defp warn_unconfirmed_cleanup(_confirmed), do: :ok
