@@ -113,7 +113,8 @@ to snapshot the process tree during a live run and flag any descendant whose
 `pgid` differs from the CLI's. All of them keep their entire tree in the
 child's process group and die to the group kill.
 
-The escapes fall into three classes, and no client-side mechanism closes them:
+Group kill misses three classes. An active Linux cgroup can contain the first;
+the other two require the external daemon's or scheduler's own teardown:
 
 ### Deliberate daemonizers
 
@@ -136,20 +137,26 @@ the process-group kill, not in place of it: the SIGTERM-then-SIGKILL group
 sequence still runs, and `cgroup.kill` is the backstop for anything that left
 the group.
 
-`cgroup: true` requires cgroup delegation. The BEAM must run inside a
-delegatable unit: under systemd, set `Delegate=yes` on the service, or wrap the
-run in `systemd-run --user --scope`. Without a delegated, writable subtree the
-shim cannot create a child cgroup.
+`cgroup: true` requires cgroup delegation to become active. The BEAM must run
+inside a delegatable unit: under systemd, set `Delegate=yes` on the service,
+or wrap the run in `systemd-run --user --scope`. Without a delegated, writable
+subtree the shim cannot create a child cgroup.
 
 It is Linux-only and always degrades gracefully, never erroring. On macOS, on
 non-cgroup-v2 systems, and when the subtree is not delegated, `cgroup: true`
 falls back to the ordinary process-group kill and logs a warning; ordinary
 in-group grandchildren still die exactly as before. The EXIT report carries a
-`contained` flag reporting which mechanism was used, surfaced as a
-`Logger.debug` line when containment was active. That line comes from
-`Forcola.run/2` and `Forcola.Daemon`; `Forcola.Stream` and `Forcola.Duplex`
-report their exit through messages or a raise and do not emit it. See
-`Forcola.run/2` for the option.
+`contained` flag reporting which mechanism was used. `Forcola.Duplex.Terminal`
+exposes this as `scope: :active_cgroup` or `:process_group`; it describes the
+active mechanism, not proof that any externally owned work was contained. A
+`Logger.debug` line is also emitted when containment was active. That line
+comes from `Forcola.run/2` and `Forcola.Daemon`; `Forcola.Stream` and
+`Forcola.Duplex` report their exit through messages or a raise and do not
+emit it. See `Forcola.run/2` for the option.
+
+There is no setting that refuses to start a child when cgroup placement is
+unavailable. That opt-in requirement is tracked in
+[#84](https://github.com/joshrotenberg/forcola/issues/84).
 
 ### Client/daemon control channels
 

@@ -12,7 +12,7 @@ Add `forcola` to your dependencies:
 ```elixir
 def deps do
   [
-    {:forcola, "~> 0.3"}
+    {:forcola, "~> 0.4"}
   ]
 end
 ```
@@ -232,10 +232,10 @@ order. Key properties:
 The process-group kill reaches every descendant that stays in the child's
 process group, but a target that deliberately daemonizes (double-fork plus
 `setsid`, or a `--daemon` flag) leaves the group and survives. On Linux,
-`cgroup: true` adds a backstop: the child runs in a dedicated cgroup v2 cgroup,
-so descendants it forks inherit the cgroup, and on kill the shim writes
-`cgroup.kill` to SIGKILL the whole subtree at once. It is layered on top of the
-process-group kill, never in place of it, and works the same in every mode.
+`cgroup: true` can add a backstop: when placement succeeds, the child runs in a
+dedicated cgroup v2 cgroup. Descendants it forks inherit the cgroup, and on
+kill the shim writes `cgroup.kill` to SIGKILL the whole subtree at once. It is
+layered on top of the process-group kill and works the same in every mode.
 
 ```elixir
 Forcola.run(["some-daemonizing-tool"], timeout_ms: 5_000, cgroup: true)
@@ -255,7 +255,12 @@ Key properties:
   `Logger.debug` line is emitted when containment was actually active; this
   line comes from `run/2` and `Forcola.Daemon` (`Forcola.Stream` and
   `Forcola.Duplex` report their exit through messages or a raise and do not
-  emit it).
+  emit it). When an EXIT report arrives, `Forcola.Duplex.Terminal.scope`
+  reports `:active_cgroup` when placement was active or `:process_group` on
+  fallback. A caller that must refuse to start without containment cannot
+  enforce that with `cgroup: true`
+  today; the required-mode proposal is tracked in
+  [#84](https://github.com/joshrotenberg/forcola/issues/84).
 
 See the [process groups guide](process_groups.html#deliberate-daemonizers) for
 the mechanism.

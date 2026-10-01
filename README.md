@@ -9,8 +9,8 @@ Leak-free external process execution for the BEAM.
 
 Forcola runs OS processes through a small Rust shim that puts each child in
 its own process group and kills the whole group, SIGTERM then SIGKILL, when
-the run times out or the BEAM dies. Children and grandchildren die with the
-command.
+the run times out or the BEAM dies. Children and grandchildren that remain in
+the group die with the command.
 
 Named for the forcola, the carved oarlock of a Venetian gondola.
 
@@ -21,7 +21,7 @@ Add `forcola` to your dependencies:
 ```elixir
 def deps do
   [
-    {:forcola, "~> 0.3"}
+    {:forcola, "~> 0.4"}
   ]
 end
 ```
@@ -99,11 +99,11 @@ options, and return/message shapes for each mode.
 The group kill covers the child and everything it keeps in its process group:
 ordinary grandchildren die with the command. Deliberate daemonizers (double-fork
 plus `setsid`) leave the group; on Linux the opt-in `cgroup: true` layer
-contains them. Daemon control channels like docker and work handed to system
-schedulers stay out of reach of any process-based mechanism. The [process groups
-guide](https://hexdocs.pm/forcola/process_groups.html) covers the kill sequence, the cgroup containment
-layer, the death-confirmed-before-return guarantee and its exception, and the
-full "What group kill cannot reach" audit.
+contains them when active. Daemon control channels like docker and work handed
+to system schedulers stay out of reach of any process-based mechanism. The
+[process groups guide](https://hexdocs.pm/forcola/process_groups.html) covers
+the kill sequence, cgroup containment, the confirmation guarantee and its
+exceptions, and the full "What group kill cannot reach" audit.
 
 ## Adopting in a wrapper library
 
@@ -117,11 +117,12 @@ wrappers.
 
 ## Prior art
 
-- [erlexec](https://github.com/saleyn/erlexec) has process-group kill (opt-in
-  per command via `kill_group`) but compiles C++ on the consumer's machine.
+- [erlexec](https://github.com/saleyn/erlexec) has opt-in process-group kill
+  and best-effort Linux cgroup attachment, but compiles C++ on the consumer's
+  machine.
 - [MuonTrap](https://github.com/fhunleth/muontrap) has the port-program
-  architecture, but full process-tree kill requires Linux cgroups; on macOS
-  only the direct child is signaled.
+  architecture, default stdout/stderr flow control, and cgroup v2 controls;
+  without a cgroup, it signals only the direct child.
 - [Rambo](https://github.com/jayjun/rambo) proved a Rust shim works in a hex
   package; its x86-64-only binary distribution is the cautionary tale the
   release workflow here is designed around.
