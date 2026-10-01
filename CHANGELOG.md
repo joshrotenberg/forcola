@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/joshrotenberg/forcola/compare/v0.4.0...v0.5.0) (2026-10-01)
+
+
+### Features
+
+* bound Stream stderr and partial lines ([#88](https://github.com/joshrotenberg/forcola/issues/88)) ([ca15eca](https://github.com/joshrotenberg/forcola/commit/ca15eca6d41230681071e8c008371c2ea2d9bdc5))
+* require cgroup containment before exec ([#87](https://github.com/joshrotenberg/forcola/issues/87)) ([3890bd1](https://github.com/joshrotenberg/forcola/commit/3890bd10c237c3ae78b18cf6a3681f46e144a8a5))
+
 ## [0.4.0](https://github.com/joshrotenberg/forcola/compare/v0.3.5...v0.4.0) (2026-10-01)
 
 
