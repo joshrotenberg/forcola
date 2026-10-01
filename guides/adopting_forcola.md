@@ -48,12 +48,12 @@ Three pieces:
 # mix.exs of the wrapper library
 defp deps do
   [
-    {:forcola, "~> 0.3", optional: true}
+    {:forcola, "~> 0.4", optional: true}
   ]
 end
 ```
 
-Consumers who want leak-free execution add `{:forcola, "~> 0.3"}` to their
+Consumers who want leak-free execution add `{:forcola, "~> 0.4"}` to their
 own deps and set one config line. Everyone else is untouched.
 
 ## Worked example: git_wrapper_ex
@@ -229,9 +229,11 @@ Per-mode notes:
   escapes the process group (see "What group kill cannot reach" in the
   [process groups guide](process_groups.html)).
 - `Forcola.Duplex`: no `:timeout_ms` (passing one raises `ArgumentError`);
-  the session is bounded by its owner process and `close/1`. Lines go in
-  with `send_line/2`, arrive as `{:forcola_line, session, line}` messages,
-  and `send_eof/1` closes stdin for CLIs that exit when input ends.
+  the session is bounded by its owner process and `close/1` or `shutdown/1`.
+  Lines go in with `send_line/2`. By default output arrives as owner messages;
+  `delivery: :pull` instead uses `recv/2` and bounds stdout and stderr delivery.
+  `shutdown/1` and `await_terminal/2` retain child status and cleanup evidence
+  separately. `send_eof/1` closes stdin for CLIs that exit when input ends.
 
 One caveat for docker-shaped wrappers: the docker CLI is a control channel
 for a daemon. Forcola kills the client reliably, but that never stops the
@@ -249,7 +251,7 @@ to choose each.
 For a wrapper that uses erlexec today for the same contract (group kill on
 timeout, cleanup on BEAM death), the migration is mechanical:
 
-1. Add `{:forcola, "~> 0.3"}` and swap the erlexec calls for their Forcola
+1. Add `{:forcola, "~> 0.4"}` and swap the erlexec calls for their Forcola
    counterparts; bounded runs become `Forcola.run/2` with `:timeout_ms`.
 2. Run your existing test suite; it is the acceptance bar. Forcola's own
    suite covers the group-kill contract cases, including the
@@ -257,3 +259,7 @@ timeout, cleanup on BEAM death), the migration is mechanical:
 3. Drop the erlexec dependency. This removes the C++ compile erlexec runs on
    each consumer's machine; Forcola ships precompiled shim binaries with
    checksum verification instead.
+
+This mapping covers the shared group-kill contract, not erlexec's broader
+PTY, privilege, cgroup resource-limit, or shared-port APIs. Check those needs
+against the [alternatives guide](alternatives.html) before migrating.
