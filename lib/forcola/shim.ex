@@ -284,9 +284,9 @@ defmodule Forcola.Shim do
   `:window_bytes` opts into demand-driven backpressure on the child's stdout
   (see `Forcola.Stream.lines/2`). Only added to the payload when present, so
   the default SPAWN payload is unchanged; the shim gates its stdout pump when
-  the field is present and reads eagerly otherwise. Duplex pull mode also
-  supplies `:stderr_window_bytes` and `:strict_output` so both pumps stay
-  gated until output is consumed or explicitly discarded.
+  the field is present and reads eagerly otherwise. Duplex pull and bounded
+  Stream modes also supply `:stderr_window_bytes` and `:strict_output` so both
+  pumps stay gated until output is consumed or explicitly discarded.
   """
   @spec encode_spawn(term(), keyword()) :: binary()
   def encode_spawn(argv, opts) do

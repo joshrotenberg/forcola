@@ -291,12 +291,19 @@ shim's confirming EXIT frame; it uses `{:signal, :unconfirmed}` only when that
 confirmation is missing, malformed, or itself reports unconfirmed cleanup.
 
 `:window_bytes` (optional) opts into demand-driven backpressure. By default the
-shim forwards the child's stdout as fast as the pipes allow, so a consumer slower
-than the producer buffers unconsumed output on the BEAM and can grow memory
-without bound. With a window the shim reads the child only while the stream has
-granted read credit; a slow consumer blocks the producer instead of buffering.
-The buffering bound is roughly one window in flight plus a frame in transit.
-`backpressure: true` is shorthand for a 64 KiB window.
+shim forwards output as fast as the pipes allow, so a slow consumer can grow
+BEAM memory without bound. With a window, the shim reads stdout only while the
+stream grants credit. Stderr has a separate finite budget, including with
+`merge_stderr: true`. `backpressure: true` is shorthand for a 64 KiB stdout
+window. Bounded mode defaults to `max_line_bytes: 65_536` for any
+unterminated line and `max_stderr_bytes: 1_048_576` for total stderr; both can
+be set to another positive integer. The options require backpressure.
+
+The BEAM buffering bound is approximately one stdout window, the stderr budget
+plus one detection byte, one partial line, and protocol frames. Each OS pipe
+may hold additional bytes outside BEAM memory. If a limit is crossed, Stream
+kills the process group and raises `Forcola.Stream.Error` with a typed `:limit`
+and `output_truncated: true`; it does not report a complete stream.
 
 ```elixir
 # Stream gigabytes to a slow consumer with bounded memory.
@@ -307,8 +314,7 @@ Forcola.Stream.lines(["produce-huge-output"], timeout_ms: 600_000, window_bytes:
 
 A consumer-driven pause does not trip `:idle_timeout_ms` (the idle clock is reset
 each time the stream grants credit); a genuinely hung producer still does, and
-`:timeout_ms` still bounds a consumer that never consumes. Backpressure gates the
-child's stdout only; stderr always rides eagerly.
+`:timeout_ms` still bounds a consumer that never consumes.
 
 Termination:
 
