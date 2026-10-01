@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/joshrotenberg/forcola/compare/v0.3.5...v0.4.0) (2026-10-01)
+
+
+### Features
+
+* **duplex:** add bounded pull delivery ([7d62c09](https://github.com/joshrotenberg/forcola/commit/7d62c0967586d6e28418c4a67cf60f2db40769ad))
+* **duplex:** expose terminal evidence after shutdown ([b96bec6](https://github.com/joshrotenberg/forcola/commit/b96bec698cc63428b50e30b431cd1ea65dbc6f52))
+
 ## [0.3.5](https://github.com/joshrotenberg/forcola/compare/v0.3.4...v0.3.5) (2026-09-30)
 
 
