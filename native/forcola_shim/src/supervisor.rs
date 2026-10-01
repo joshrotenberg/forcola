@@ -5,7 +5,7 @@ use crate::cgroup::{self, Cgroup};
 use crate::credit::{Credit, Permit};
 use crate::frame::{
     self, Frame, TAG_CREDIT, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_KILL, TAG_SPAWN, TAG_STDERR,
-    TAG_STDIN, TAG_STDOUT,
+    TAG_STDERR_CREDIT, TAG_STDIN, TAG_STDOUT,
 };
 use crate::privdrop::{self, DropPlan};
 use crate::protocol::{ErrorReport, ExitReport, SpawnRequest};
@@ -38,8 +38,8 @@ struct ChildOutcome {
     signal: Option<i32>,
 }
 
-/// How long to wait, after the child has been reaped, for the output pump
-/// threads to hit EOF on the child's pipes before writing the EXIT frame.
+/// How long to wait in eager mode (or after a strict drain was cancelled),
+/// after the child has been reaped, for output pumps to hit EOF before EXIT.
 /// In the normal case the writers are already dead and EOF is immediate;
 /// the bound exists so a surviving process that inherited the pipe (e.g.
 /// a backgrounded grandchild the kill path never ran against) cannot
@@ -90,6 +90,7 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
     // the default path is byte-for-byte unchanged. The budget starts at zero,
     // so the pump parks until the BEAM's first CREDIT frame.
     let credit = request.window_bytes.map(|_| Credit::new());
+    let stderr_credit = request.stderr_window_bytes.map(|_| Credit::new());
 
     let (tx, rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
 
@@ -142,15 +143,16 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
             } else {
                 TAG_STDERR
             };
-            // STDERR is never gated: backpressure bounds the child's stdout
-            // stream only. Under merge_stderr the stderr bytes ride the STDOUT
-            // tag but stay eager.
+            // Stderr is eager by default. Duplex pull mode supplies a
+            // separate read budget so one idle pipe cannot block the other.
+            // Under merge_stderr the stderr bytes ride the STDOUT tag;
+            // pull mode rejects that combination for pipe-backed children.
             pumps += spawn_output_pump(
                 child.stderr.take(),
                 stderr_tag,
                 Arc::clone(&out),
                 pump_done_tx,
-                None,
+                stderr_credit.clone(),
             );
         }
     }
@@ -176,6 +178,8 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         &pump_done_rx,
         cgroup.as_ref(),
         credit.as_ref(),
+        stderr_credit.as_ref(),
+        request.strict_output,
     );
 
     // Backpressure linger: the child is reaped and the EXIT frame is written,
@@ -186,7 +190,7 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
     // stdin reader running and the pipe open) until the BEAM closes the port
     // after it has consumed EXIT. Skipped when the BEAM is already gone, and
     // never entered on the eager path, so the default behavior is unchanged.
-    if credit.is_some() && !beam_gone {
+    if (credit.is_some() || stderr_credit.is_some()) && !beam_gone {
         drain_inbound_until_closed(&rx);
     }
 
@@ -442,6 +446,7 @@ fn pump_gated<P: Read, W: Write>(
 ) {
     loop {
         let n = match credit.await_permit(buf.len()) {
+            Permit::Cancel => break,
             Permit::Uncork => match pipe.read(buf) {
                 Ok(0) => break,
                 Ok(n) => n,
@@ -530,6 +535,8 @@ fn supervise<W: Write>(
     pump_done: &Receiver<()>,
     cgroup: Option<&Cgroup>,
     credit: Option<&Credit>,
+    stderr_credit: Option<&Credit>,
+    strict_output: bool,
 ) -> bool {
     let mut timed_out = false;
     let mut beam_gone = false;
@@ -540,6 +547,7 @@ fn supervise<W: Write>(
     // window. A normal ChildExited event with no prior kill still runs the
     // sequence so background descendants cannot outlive their leader.
     let mut group_cleanup_started = false;
+    let mut discard_output = false;
 
     let outcome = loop {
         match rx.recv() {
@@ -552,6 +560,7 @@ fn supervise<W: Write>(
                 *child_stdin = None; // drop closes the pipe
             }
             Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
+                discard_output = true;
                 if !group_cleanup_started {
                     group_cleanup_started = true;
                     group_confirmed = kill_group(pgid, kill_grace, cgroup);
@@ -564,11 +573,18 @@ fn supervise<W: Write>(
                     c.grant(n);
                 }
             }
+            Ok(Event::Stdin(f)) if f.tag == TAG_STDERR_CREDIT => {
+                if let (Some(c), Some(n)) = (stderr_credit, crate::credit::parse_grant(&f.payload))
+                {
+                    c.grant(n);
+                }
+            }
             Ok(Event::Stdin(_)) => {
                 // Unknown/unexpected tag mid-session; ignore rather than
                 // tearing down a running child over a protocol wrinkle.
             }
             Ok(Event::StdinClosed) => {
+                discard_output = true;
                 // The BEAM is gone. Kill the group; keep waiting for the
                 // real exit event from the waiter thread so we reap the
                 // child properly, but there's no one left to report to.
@@ -579,6 +595,7 @@ fn supervise<W: Write>(
                 }
             }
             Ok(Event::StdinError(e)) => {
+                discard_output = true;
                 eprintln!("forcola_shim: stdin read error, treating as BEAM death: {e}");
                 beam_gone = true;
                 if !group_cleanup_started {
@@ -587,6 +604,7 @@ fn supervise<W: Write>(
                 }
             }
             Ok(Event::TimedOut) => {
+                discard_output = true;
                 timed_out = true;
                 if !group_cleanup_started {
                     group_cleanup_started = true;
@@ -617,8 +635,13 @@ fn supervise<W: Write>(
     // The child is reaped. Uncork the stdout pump so a credit-starved pump
     // wakes and drains whatever the child left in the pipe to EOF, instead of
     // parking until the drain grace elapses and losing that trailing output.
-    if let Some(c) = credit {
-        c.uncork();
+    if !strict_output {
+        if let Some(c) = credit {
+            c.uncork();
+        }
+        if let Some(c) = stderr_credit {
+            c.uncork();
+        }
     }
 
     // Tear the contained subtree down after the child is reaped, whether it
@@ -629,6 +652,12 @@ fn supervise<W: Write>(
     let cgroup_confirmed = cgroup.is_none_or(|cg| finish_cgroup(cg, kill_grace));
 
     if beam_gone {
+        if let Some(c) = credit {
+            c.cancel();
+        }
+        if let Some(c) = stderr_credit {
+            c.cancel();
+        }
         // Nothing to report to: the reader/writer on the other end of
         // stdout is the same dead BEAM that closed stdin. Attempting to
         // write would either block on a full pipe with no reader or
@@ -640,7 +669,28 @@ fn supervise<W: Write>(
     // EOF on its pipes yet; without this the EXIT frame can overtake
     // output the child wrote just before dying, and the BEAM (which
     // treats EXIT as the terminator) would drop it.
-    drain_pumps(pumps, pump_done);
+    let (output_truncated, disappeared_during_drain) = if strict_output {
+        if discard_output {
+            if let Some(c) = credit {
+                c.cancel();
+            }
+            if let Some(c) = stderr_credit {
+                c.cancel();
+            }
+            let _ = drain_pumps(pumps, pump_done);
+            (true, false)
+        } else {
+            let (drained, cancelled, disappeared) =
+                drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit);
+            (!drained || cancelled, disappeared)
+        }
+    } else {
+        (!drain_pumps(pumps, pump_done), false)
+    };
+
+    if disappeared_during_drain {
+        return true;
+    }
 
     let report = ExitReport {
         status: outcome.status,
@@ -648,6 +698,7 @@ fn supervise<W: Write>(
         timed_out,
         confirmed: group_confirmed && cgroup_confirmed,
         contained: cgroup.is_some(),
+        output_truncated,
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();
@@ -689,17 +740,80 @@ fn finish_cgroup(cg: &Cgroup, grace: Duration) -> bool {
 
 /// Waits (bounded by `OUTPUT_DRAIN_GRACE`) for `pumps` output pump
 /// threads to report EOF on the child's pipes.
-fn drain_pumps(pumps: usize, pump_done: &Receiver<()>) {
+fn drain_pumps(pumps: usize, pump_done: &Receiver<()>) -> bool {
     let deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
     for _ in 0..pumps {
         let now = Instant::now();
         if now >= deadline {
-            return;
+            return false;
         }
         if pump_done.recv_timeout(deadline - now).is_err() {
-            return;
+            return false;
         }
     }
+    true
+}
+
+/// In duplex pull mode, wait for explicit read credit even after child exit.
+/// A slow consumer therefore leaves the pumps parked rather than uncorking
+/// them into an unbounded BEAM mailbox. KILL or BEAM loss cancels the drain;
+/// the EXIT report then marks the output as truncated.
+fn drain_pumps_strict(
+    pumps: usize,
+    pump_done: &Receiver<()>,
+    rx: &Receiver<Event>,
+    stdout_credit: Option<&Credit>,
+    stderr_credit: Option<&Credit>,
+) -> (bool, bool, bool) {
+    let mut completed = 0;
+
+    while completed < pumps {
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                Event::Stdin(f) if f.tag == TAG_CREDIT => {
+                    if let (Some(c), Some(n)) =
+                        (stdout_credit, crate::credit::parse_grant(&f.payload))
+                    {
+                        c.grant(n);
+                    }
+                }
+                Event::Stdin(f) if f.tag == TAG_STDERR_CREDIT => {
+                    if let (Some(c), Some(n)) =
+                        (stderr_credit, crate::credit::parse_grant(&f.payload))
+                    {
+                        c.grant(n);
+                    }
+                }
+                Event::Stdin(f) if f.tag == TAG_KILL => {
+                    if let Some(c) = stdout_credit {
+                        c.cancel();
+                    }
+                    if let Some(c) = stderr_credit {
+                        c.cancel();
+                    }
+                    return (drain_pumps(pumps - completed, pump_done), true, false);
+                }
+                Event::StdinClosed | Event::StdinError(_) => {
+                    if let Some(c) = stdout_credit {
+                        c.cancel();
+                    }
+                    if let Some(c) = stderr_credit {
+                        c.cancel();
+                    }
+                    return (false, true, true);
+                }
+                _ => {}
+            }
+        }
+
+        match pump_done.recv_timeout(Duration::from_millis(10)) {
+            Ok(()) => completed += 1,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return (false, true, false),
+        }
+    }
+
+    (true, false, false)
 }
 
 /// SIGTERM the whole process group, then SIGKILL after `grace` if it

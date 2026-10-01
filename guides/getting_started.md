@@ -396,6 +396,11 @@ Options:
 - `:terminal_recipient`: optional process that receives
   `{:forcola_terminal, session, terminal}` even if the owner dies. This is
   useful when another process supervises the attempt.
+- `:delivery`: `:messages` (default) or `:pull`. Pull mode sends no line
+  messages and requires `recv/2` calls to grant output credit.
+- `:max_line_bytes`, `:max_output_bytes`, `:max_pending_bytes`: positive
+  bounds for pull mode, defaulting to 64 KiB, 16 MiB, and one line plus its
+  newline per stream. The pending bound must exceed the line bound.
 - `:pty`: run the child under a pseudo-terminal (default `false`), for CLIs
   that behave differently when they detect a tty. See
   [pseudo-terminal](#pseudo-terminal) below.
@@ -420,6 +425,9 @@ API:
   `{:error, :timeout}` and says nothing about cleanup.
 - `forget_terminal/1`: releases the retained result after the owner has
   accounted for it. Otherwise it remains available until the owner exits.
+- `recv/2`: in pull mode, demands one `{:stdout, line}` or `{:stderr, line}`.
+  It returns `{:done, terminal}` after all output, or typed output-limit
+  evidence if a limit stops the run.
 
 For example, a caller that must account for uncertain cleanup can use:
 
@@ -438,6 +446,38 @@ It describes what was observed, not proof that a descendant outside that
 mechanism was confined. An abrupt shim loss is `:transport_lost`; a shim
 that does not answer before the backstop is `:timeout`. The legacy
 `{:forcola_exit, session, status}` message remains unchanged.
+
+For a bounded consumer, use pull delivery and keep calling `recv/2` until
+it reports a terminal result:
+
+```elixir
+{:ok, session} =
+  Forcola.Duplex.open(argv,
+    delivery: :pull,
+    max_line_bytes: 65_536,
+    max_output_bytes: 16_777_216
+  )
+
+case Forcola.Duplex.recv(session, 5_000) do
+  {:ok, {:stdout, line}} -> handle_stdout(line)
+  {:ok, {:stderr, line}} -> handle_stderr(line)
+  {:done, terminal} -> handle_terminal(terminal)
+  {:error, {:output_limit, terminal}} -> handle_limit(terminal)
+  {:error, :timeout} -> Forcola.Duplex.shutdown(session)
+end
+```
+
+Both native pumps start without credit and stop reading when the consumer
+stops calling `recv/2`; the child's pipes then back up. The pending credit
+limit applies independently to stdout and stderr, including an unterminated
+line. A returned line is the only owner delivery outstanding; no line
+messages accumulate in the owner's mailbox. A line or total-output limit
+kills the group and records the limit in `terminal.output`, without masking
+the observed child status or cleanup confirmation. Shutting down before
+draining all output marks it `:truncated`. On natural child exit, continue
+calling `recv/2` to drain buffered output before awaiting terminal evidence.
+Pull mode rejects `merge_stderr: true` for pipes; a pty still yields a single
+merged stdout stream.
 
 Messages to the owner:
 

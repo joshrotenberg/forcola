@@ -12,6 +12,8 @@ pub const TAG_KILL: u8 = 0x04;
 /// Payload is an 8-byte big-endian byte count. Only sent when the BEAM
 /// opted into backpressure via `window_bytes`.
 pub const TAG_CREDIT: u8 = 0x05;
+/// Grants read credit to the stderr pump in duplex pull mode.
+pub const TAG_STDERR_CREDIT: u8 = 0x06;
 
 /// Outbound tag: shim -> BEAM.
 pub const TAG_STDOUT: u8 = 0x11;
