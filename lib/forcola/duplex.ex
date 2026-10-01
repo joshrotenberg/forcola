@@ -170,7 +170,8 @@ defmodule Forcola.Duplex do
     * `:cgroup` - opt-in Linux cgroup v2 containment of deliberate
       daemonizers, as in `Forcola.run/2`. Linux only, requires a delegated
       cgroup v2 subtree, and falls back to the process-group kill with a
-      warning elsewhere. Default `false`.
+      warning elsewhere. Set `:required` to fail before exec if containment
+      is unavailable. Default `false`.
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace, default `5_000`.
     * `:terminal_recipient` - optional process to receive
       `{:forcola_terminal, session, terminal}` on every terminal path,

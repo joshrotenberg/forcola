@@ -8,7 +8,7 @@ use crate::frame::{
     TAG_STDERR_CREDIT, TAG_STDIN, TAG_STDOUT,
 };
 use crate::privdrop::{self, DropPlan};
-use crate::protocol::{ErrorReport, ExitReport, SpawnRequest};
+use crate::protocol::{CgroupMode, ErrorReport, ExitReport, SpawnRequest};
 
 use rustix::process::{self, Pid, Signal};
 use std::fs::File;
@@ -215,8 +215,8 @@ fn drain_inbound_until_closed(rx: &Receiver<Event>) {
 /// before exec so it leads its own process group.
 ///
 /// Returns the child, the master side of the pty pair (pty mode only), and the
-/// prepared cgroup (when `cgroup: true` was requested and a delegated cgroup v2
-/// subtree was available). The caller reads child output from the master and
+/// prepared cgroup (when requested and a delegated cgroup v2 subtree was
+/// available). The caller reads child output from the master and
 /// writes STDIN frames to it. In pipe mode the second element is `None` and the
 /// child's stdio is the usual set of pipes on the `Child`. The third element is
 /// `None` on the default path, on fallback, and on non-Linux.
@@ -244,15 +244,15 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>, Op
     let plan = privdrop::resolve(request.user.as_ref(), request.group.as_ref())?;
 
     // Prepare the cgroup in the PARENT, before fork: detect cgroup v2, create a
-    // delegated child cgroup, and open its cgroup.procs fd. Never fails: a
-    // missing/undelegated cgroup returns None and the child runs with
-    // process-group kill only. The child moves ITSELF into the cgroup in
+    // delegated child cgroup, and open its cgroup.procs fd. Best-effort mode
+    // falls back to process-group kill when setup is unavailable; required
+    // mode fails before fork. The child moves ITSELF into the cgroup in
     // pre_exec (see below), so a fast double-fork cannot escape a
     // move-after-spawn window.
-    let cgroup = if request.cgroup {
-        cgroup::prepare()
-    } else {
-        None
+    let cgroup = match request.cgroup {
+        CgroupMode::BestEffort(false) => None,
+        CgroupMode::BestEffort(true) => cgroup::prepare(),
+        CgroupMode::Required(_) => Some(cgroup::prepare_required()?),
     };
     let placement = cgroup.as_ref().map(|cg| cg.placement());
 

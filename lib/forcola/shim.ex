@@ -276,10 +276,11 @@ defmodule Forcola.Shim do
   string name or an integer id) through to the shim so the child can be run as a
   different user; see `Forcola.run/2` for the semantics.
 
-  `:cgroup` opts into Linux cgroup v2 containment. Only added to the payload
-  when truthy, so the default SPAWN payload is unchanged; the shim defaults it
-  to false when the key is absent. See `Forcola.run/2` for the Linux-only,
-  delegation-required, graceful-fallback semantics.
+  `:cgroup` opts into Linux cgroup v2 containment. `true` allows a warning
+  and process-group fallback; `:required` refuses to spawn without placement.
+  The required value is encoded as a JSON string so an older shim rejects the
+  SPAWN frame rather than treating it as best-effort. The key is absent by
+  default, preserving the original payload.
 
   `:window_bytes` opts into demand-driven backpressure on the child's stdout
   (see `Forcola.Stream.lines/2`). Only added to the payload when present, so
@@ -311,14 +312,19 @@ defmodule Forcola.Shim do
     |> IO.iodata_to_binary()
   end
 
-  # The cgroup field is added only when containment is requested, so the SPAWN
-  # payload for the default path is byte-for-byte unchanged. The shim defaults
-  # cgroup to false when the key is absent.
   defp put_cgroup(map, opts) do
-    if Keyword.get(opts, :cgroup, false) do
-      Map.put(map, "cgroup", true)
-    else
-      map
+    case Keyword.get(opts, :cgroup, false) do
+      value when value in [false, nil] ->
+        map
+
+      true ->
+        Map.put(map, "cgroup", true)
+
+      :required ->
+        Map.put(map, "cgroup", "required")
+
+      other ->
+        raise ArgumentError, ":cgroup must be false, true, or :required, got: #{inspect(other)}"
     end
   end
 

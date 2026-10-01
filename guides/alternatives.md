@@ -31,9 +31,9 @@ Forcola has a narrower API and uses one shim per command rather than erlexec's
 shared port. Its group kill is the default, its precompiled shim avoids a C++
 build in supported installations, and `Forcola.Duplex.Terminal` separates the
 observed child status, cleanup confirmation, and active scope. Forcola's own
-`cgroup: true` also falls back when placement is unavailable; an opt-in mode
-that refuses to start without containment is tracked in
-[#84](https://github.com/joshrotenberg/forcola/issues/84).
+`cgroup: true` also falls back when placement is unavailable. Callers that
+require containment can use `cgroup: :required`, which refuses to execute
+unless the child can join a delegated cgroup with writable `cgroup.kill`.
 
 ## MuonTrap
 

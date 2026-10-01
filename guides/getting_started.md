@@ -185,7 +185,8 @@ Options:
 - `:user`: run the child as this user, a string username or an integer uid.
 - `:group`: run the child with this group as its primary gid, a string group
   name or an integer gid.
-- `:cgroup`: opt in to Linux cgroup v2 containment, default `false`. See
+- `:cgroup`: opt in to Linux cgroup v2 containment with `true`, or require it
+  before exec with `:required`; default `false`. See
   "cgroup containment" below.
 
 Return shapes:
@@ -239,6 +240,9 @@ layered on top of the process-group kill and works the same in every mode.
 
 ```elixir
 Forcola.run(["some-daemonizing-tool"], timeout_ms: 5_000, cgroup: true)
+
+# Refuse to run if Linux cgroup v2 containment cannot be established:
+Forcola.run(["some-daemonizing-tool"], timeout_ms: 5_000, cgroup: :required)
 ```
 
 Key properties:
@@ -249,7 +253,7 @@ Key properties:
   systemd, `Delegate=yes` on the service, or wrapping the run in
   `systemd-run --user --scope`. Without a delegated, writable cgroup v2 subtree
   the shim cannot create a child cgroup.
-- Graceful fallback, never an error. On macOS, on non-cgroup-v2 systems, or when
+- With `cgroup: true`, graceful fallback is never an error. On macOS, on non-cgroup-v2 systems, or when
   the subtree is not delegated, it degrades to the process-group kill and logs a
   warning; ordinary in-group grandchildren still die exactly as before. A
   `Logger.debug` line is emitted when containment was actually active; this
@@ -257,10 +261,10 @@ Key properties:
   `Forcola.Duplex` report their exit through messages or a raise and do not
   emit it). When an EXIT report arrives, `Forcola.Duplex.Terminal.scope`
   reports `:active_cgroup` when placement was active or `:process_group` on
-  fallback. A caller that must refuse to start without containment cannot
-  enforce that with `cgroup: true`
-  today; the required-mode proposal is tracked in
-  [#84](https://github.com/joshrotenberg/forcola/issues/84).
+  fallback. With `cgroup: :required`, the shim instead verifies placement and
+  writable `cgroup.kill` before starting the child; failure takes the mode's
+  normal spawn-error path, and the command never executes. Required mode is
+  Linux-only. It cannot contain work that a separate daemon or scheduler owns.
 
 See the [process groups guide](process_groups.html#deliberate-daemonizers) for
 the mechanism.

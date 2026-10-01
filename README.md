@@ -99,7 +99,8 @@ options, and return/message shapes for each mode.
 The group kill covers the child and everything it keeps in its process group:
 ordinary grandchildren die with the command. Deliberate daemonizers (double-fork
 plus `setsid`) leave the group; on Linux the opt-in `cgroup: true` layer
-contains them when active. Daemon control channels like docker and work handed
+contains them when active; `cgroup: :required` refuses to execute without it.
+Daemon control channels like docker and work handed
 to system schedulers stay out of reach of any process-based mechanism. The
 [process groups guide](https://hexdocs.pm/forcola/process_groups.html) covers
 the kill sequence, cgroup containment, the confirmation guarantee and its
