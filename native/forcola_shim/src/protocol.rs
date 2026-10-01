@@ -63,9 +63,19 @@ pub struct SpawnRequest {
     /// the pump stops reading, the OS pipe fills, and the child's next write
     /// blocks. The value is the BEAM's window size in bytes; it is
     /// informational on the shim side, since the BEAM controls the actual
-    /// credit. Absent leaves the eager pump unchanged. STDERR is never gated.
+    /// credit. Absent leaves the eager pump unchanged. Stderr is gated only
+    /// when `stderr_window_bytes` is also present.
     #[serde(default)]
     pub window_bytes: Option<u64>,
+    /// Opt-in read budget for the stderr pump. Duplex pull mode grants
+    /// stdout and stderr independently so an idle pipe cannot hold the
+    /// other pipe's budget while blocked in read(2).
+    #[serde(default)]
+    pub stderr_window_bytes: Option<u64>,
+    /// Keep output pumps gated after child exit. The BEAM must continue
+    /// granting credit to drain output or send KILL to discard it explicitly.
+    #[serde(default)]
+    pub strict_output: bool,
 }
 
 /// A user identity in a SPAWN payload: either a name to resolve or a raw
@@ -110,6 +120,9 @@ pub struct ExitReport {
     /// subtree was available; `false` on the default path, on fallback, and on
     /// non-Linux platforms. Reports which kill mechanism was used.
     pub contained: bool,
+    /// Some child output was discarded because the drain deadline expired or
+    /// the BEAM cancelled a strict output drain.
+    pub output_truncated: bool,
 }
 
 /// Payload of an outbound ERROR frame.
@@ -139,6 +152,8 @@ mod tests {
         assert_eq!(req.group, None);
         assert!(!req.cgroup);
         assert_eq!(req.window_bytes, None);
+        assert_eq!(req.stderr_window_bytes, None);
+        assert!(!req.strict_output);
     }
 
     #[test]
@@ -146,6 +161,16 @@ mod tests {
         let json = r#"{"argv": ["cat"], "window_bytes": 4096}"#;
         let req: SpawnRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.window_bytes, Some(4096));
+    }
+
+    #[test]
+    fn spawn_request_duplex_pull_fields() {
+        let json = r#"{"argv": ["cat"], "window_bytes": 4096,
+                        "stderr_window_bytes": 4096, "strict_output": true}"#;
+        let req: SpawnRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.window_bytes, Some(4096));
+        assert_eq!(req.stderr_window_bytes, Some(4096));
+        assert!(req.strict_output);
     }
 
     #[test]
@@ -206,6 +231,7 @@ mod tests {
             timed_out: false,
             confirmed: true,
             contained: false,
+            output_truncated: false,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"status\":0"));
@@ -222,6 +248,7 @@ mod tests {
             timed_out: true,
             confirmed: false,
             contained: false,
+            output_truncated: false,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"signal\":9"));

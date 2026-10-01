@@ -23,6 +23,7 @@ defmodule Forcola.Shim do
   @tag_eof 0x03
   @tag_kill 0x04
   @tag_credit 0x05
+  @tag_stderr_credit 0x06
 
   # Outbound tag: shim -> BEAM.
   @tag_stdout 0x11
@@ -45,6 +46,8 @@ defmodule Forcola.Shim do
   def tag_kill, do: @tag_kill
   @doc false
   def tag_credit, do: @tag_credit
+  @doc false
+  def tag_stderr_credit, do: @tag_stderr_credit
   @doc false
   def tag_stdout, do: @tag_stdout
   @doc false
@@ -256,9 +259,9 @@ defmodule Forcola.Shim do
   @doc """
   Encodes a CREDIT frame payload: an 8-byte big-endian byte count.
 
-  Grants the shim's stdout pump that many more bytes of read budget under
-  backpressure. Only sent when the stream opted into backpressure via
-  `:window_bytes`; see `Forcola.Stream.lines/2`.
+  Grants the pump selected by the frame tag that many more bytes of read
+  budget. `Forcola.Stream` uses stdout credit; bounded `Forcola.Duplex`
+  grants separate stdout and stderr credit.
   """
   @spec encode_credit(non_neg_integer()) :: binary()
   def encode_credit(bytes) when is_integer(bytes) and bytes >= 0 do
@@ -281,7 +284,9 @@ defmodule Forcola.Shim do
   `:window_bytes` opts into demand-driven backpressure on the child's stdout
   (see `Forcola.Stream.lines/2`). Only added to the payload when present, so
   the default SPAWN payload is unchanged; the shim gates its stdout pump when
-  the field is present and reads eagerly otherwise.
+  the field is present and reads eagerly otherwise. Duplex pull mode also
+  supplies `:stderr_window_bytes` and `:strict_output` so both pumps stay
+  gated until output is consumed or explicitly discarded.
   """
   @spec encode_spawn(term(), keyword()) :: binary()
   def encode_spawn(argv, opts) do
@@ -298,6 +303,8 @@ defmodule Forcola.Shim do
     |> maybe_put("user", Keyword.get(opts, :user))
     |> maybe_put("group", Keyword.get(opts, :group))
     |> maybe_put("window_bytes", Keyword.get(opts, :window_bytes))
+    |> maybe_put("stderr_window_bytes", Keyword.get(opts, :stderr_window_bytes))
+    |> maybe_put("strict_output", Keyword.get(opts, :strict_output))
     |> put_cgroup(opts)
     |> put_pty(opts)
     |> :json.encode()
@@ -394,7 +401,8 @@ defmodule Forcola.Shim do
       status: status,
       confirmed: Map.get(decoded, "confirmed", true),
       timed_out: Map.get(decoded, "timed_out", false),
-      contained: Map.get(decoded, "contained", false)
+      contained: Map.get(decoded, "contained", false),
+      output_truncated: Map.get(decoded, "output_truncated", false)
     }
   end
 

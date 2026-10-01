@@ -1,8 +1,7 @@
-//! Read-budget accounting for demand-driven backpressure on the child's
-//! stdout pump.
+//! Read-budget accounting for demand-driven backpressure on an output pump.
 //!
 //! When the BEAM opts into backpressure (a `window_bytes` field in the SPAWN
-//! payload), the stdout pump reads the child only while it holds credit. The
+//! payload), the output pump reads the child only while it holds credit. The
 //! BEAM grants credit with CREDIT frames as its consumer pulls lines; when the
 //! credit reaches zero the pump stops reading, the OS pipe fills, and the
 //! child's next write blocks. That block is the backpressure.
@@ -21,6 +20,9 @@ struct State {
     /// stops gating and drains whatever remains in the pipe to EOF, so
     /// buffered output is not lost.
     uncorked: bool,
+    /// Stop the pump without forwarding remaining output. Used only after
+    /// an explicit cancellation of a strict duplex drain.
+    cancelled: bool,
 }
 
 /// A shared read budget. Cloneable: the pump and the supervisor hold handles
@@ -36,6 +38,8 @@ pub enum Permit {
     Read(usize),
     /// Ignore the budget and drain the pipe to EOF; the child is gone.
     Uncork,
+    /// Discard remaining output and exit the pump.
+    Cancel,
 }
 
 impl Credit {
@@ -46,6 +50,7 @@ impl Credit {
                 Mutex::new(State {
                     available: 0,
                     uncorked: false,
+                    cancelled: false,
                 }),
                 Condvar::new(),
             )),
@@ -70,6 +75,13 @@ impl Credit {
         cvar.notify_all();
     }
 
+    pub fn cancel(&self) {
+        let (lock, cvar) = &*self.inner;
+        let mut st = lock.lock().unwrap();
+        st.cancelled = true;
+        cvar.notify_all();
+    }
+
     /// Block until there is budget to read or the budget has been uncorked.
     /// Returns how many bytes may be read (capped at `max`), or `Uncork`.
     ///
@@ -81,6 +93,9 @@ impl Credit {
         let (lock, cvar) = &*self.inner;
         let mut st = lock.lock().unwrap();
         loop {
+            if st.cancelled {
+                return Permit::Cancel;
+            }
             if st.uncorked {
                 return Permit::Uncork;
             }
@@ -136,12 +151,12 @@ mod tests {
         // Available (10) is below max (100): capped at available.
         match c.await_permit(100) {
             Permit::Read(n) => assert_eq!(n, 10),
-            Permit::Uncork => panic!("unexpected uncork"),
+            Permit::Uncork | Permit::Cancel => panic!("unexpected ungated permit"),
         }
         // Max (4) is below available (10): capped at max.
         match c.await_permit(4) {
             Permit::Read(n) => assert_eq!(n, 4),
-            Permit::Uncork => panic!("unexpected uncork"),
+            Permit::Uncork | Permit::Cancel => panic!("unexpected ungated permit"),
         }
     }
 
@@ -152,7 +167,7 @@ mod tests {
         c.consume(7);
         match c.await_permit(100) {
             Permit::Read(n) => assert_eq!(n, 3),
-            Permit::Uncork => panic!("unexpected uncork"),
+            Permit::Uncork | Permit::Cancel => panic!("unexpected ungated permit"),
         }
     }
 
@@ -187,5 +202,14 @@ mod tests {
         let handle = thread::spawn(move || matches!(c2.await_permit(100), Permit::Uncork));
         c.uncork();
         assert!(handle.join().unwrap(), "expected Uncork after uncork()");
+    }
+
+    #[test]
+    fn cancel_wakes_a_parked_pump_without_granting_output() {
+        let c = Credit::new();
+        let waiting = c.clone();
+        let handle = thread::spawn(move || matches!(waiting.await_permit(100), Permit::Cancel));
+        c.cancel();
+        assert!(handle.join().unwrap());
     }
 }

@@ -33,6 +33,33 @@ defmodule Forcola.Duplex do
       the shim died without reporting. The session is over; `close/1` is
       not required (but is harmless).
 
+  ## Bounded pull delivery
+
+  `delivery: :pull` replaces owner line messages with `recv/2`. Each call
+  demands one stdout or stderr line. Both native output pumps start with
+  zero read credit, so an idle or slow consumer stops the pumps, then the
+  child's OS pipes fill and its writes block. At most one `recv/2` caller
+  may wait at a time. A pending demand grants at most `:max_pending_bytes`
+  to each stream; no further credit is granted while complete lines wait
+  in the session queue. The queue and partial-line buffers are therefore
+  bounded by two credit windows plus two partial-line limits and frames
+  already in transit. The native pumps forward at most 8192 bytes per frame.
+  OS pipe capacity is
+  platform-dependent and lies outside the BEAM memory bound.
+
+  A line exceeding `:max_line_bytes` or cumulative output exceeding
+  `:max_output_bytes` kills the child group. `recv/2` returns typed limit
+  evidence in `Terminal.output`; its status and cleanup confirmation remain
+  separate. An intentional shutdown that discards unread output reports
+  `output: :truncated`. A transport loss reports `output: :unknown`.
+  After child exit the pumps stay gated until the caller drains output or
+  calls `shutdown/1`; `await_terminal/2` can therefore wait for a pull
+  consumer that has not finished reading.
+
+  Pull mode uses separate stdout and stderr pipes. `merge_stderr: true`
+  with pipes is rejected because it would hide which pump consumed credit;
+  a pty remains a single merged stream and needs only stdout credit.
+
   ## Kill discipline
 
   `close/1` kills the child's process group (SIGTERM, then SIGKILL after
@@ -75,6 +102,8 @@ defmodule Forcola.Duplex do
   require Logger
 
   @default_kill_grace_ms 5_000
+  @default_max_line_bytes 64 * 1024
+  @default_max_output_bytes 16 * 1024 * 1024
   # Margin on top of kill_grace_ms when waiting for the shim to confirm
   # group death: the shim confirms within kill_grace_ms, so this only
   # fires if the shim itself never reports back.
@@ -90,10 +119,13 @@ defmodule Forcola.Duplex do
     `:not_started`. `:scope` is `:process_group`, `:active_cgroup`, or
     `:unknown`; it describes the mechanism the shim reported, not proof that
     an escaped descendant outside that mechanism was confined.
+    `:output` is `:complete`, `:truncated`, `:unknown`, or a typed limit tuple
+    such as `{:limit, :line, :stdout, 65536}`. Cleanup confirmation and output
+    completeness are independent observations.
     """
 
     @enforce_keys [:status, :confirmation, :cause, :scope]
-    defstruct [:status, :confirmation, :cause, :scope]
+    defstruct [:status, :confirmation, :cause, :scope, output: :complete]
 
     @type t :: %__MODULE__{
             status: non_neg_integer() | {:signal, non_neg_integer()} | nil,
@@ -105,16 +137,24 @@ defmodule Forcola.Duplex do
               | :owner_death
               | :shim_lost
               | :session_lost
+              | :output_limit
               | :spawn_error,
-            scope: :process_group | :active_cgroup | :unknown
+            scope: :process_group | :active_cgroup | :unknown,
+            output:
+              :complete | :truncated | :unknown | {:limit, :line | :total, atom(), pos_integer()}
           }
   end
 
-  @enforce_keys [:pid, :ref, :terminal_table]
-  defstruct [:pid, :ref, :terminal_table]
+  @enforce_keys [:pid, :ref, :terminal_table, :delivery]
+  defstruct [:pid, :ref, :terminal_table, :delivery]
 
   @typedoc "An open duplex session."
-  @opaque session :: %__MODULE__{pid: pid(), ref: reference(), terminal_table: reference()}
+  @opaque session :: %__MODULE__{
+            pid: pid(),
+            ref: reference(),
+            terminal_table: reference(),
+            delivery: :messages | :pull
+          }
 
   @doc """
   Open a duplex session running `argv`; the caller becomes the owner.
@@ -140,6 +180,12 @@ defmodule Forcola.Duplex do
       messages arrive; passing `merge_stderr: false` raises `ArgumentError`.
     * `:pty_rows`, `:pty_cols` - initial pty window size, applied only when
       `pty: true`.
+    * `:delivery` - `:messages` (default) or opt-in `:pull`. Pull mode sends
+      no line messages; call `recv/2` to demand a stdout or stderr line.
+    * `:max_line_bytes`, `:max_output_bytes`, `:max_pending_bytes` - positive
+      bounds for pull mode. Defaults are 64 KiB, 16 MiB, and one line plus
+      its newline per stream. `:max_pending_bytes` must exceed
+      `:max_line_bytes` so a missing newline can be detected without a stall.
 
   There is no `:timeout_ms`; the session is bounded by its owner process
   and `close/1`. Passing `:timeout_ms` raises `ArgumentError`.
@@ -162,7 +208,13 @@ defmodule Forcola.Duplex do
 
     case GenServer.start(__MODULE__, {self(), ref, table, argv, opts}) do
       {:ok, pid} ->
-        {:ok, %__MODULE__{pid: pid, ref: ref, terminal_table: table}}
+        {:ok,
+         %__MODULE__{
+           pid: pid,
+           ref: ref,
+           terminal_table: table,
+           delivery: Keyword.get(opts, :delivery, :messages)
+         }}
 
       {:error, reason} ->
         :ets.delete(table)
@@ -195,6 +247,30 @@ defmodule Forcola.Duplex do
     GenServer.call(pid, :send_eof)
   catch
     :exit, _ -> {:error, :closed}
+  end
+
+  @doc """
+  Demand one line from an opt-in pull session.
+
+  Returns `{:ok, {:stdout, line}}` or `{:ok, {:stderr, line}}`, then
+  `{:done, terminal}` after all output has been consumed. A caller that stops
+  consuming should call `shutdown/1`; that result marks discarded output as
+  truncated. `{:error, {:output_limit, terminal}}` reports a line or total
+  output limit while retaining the child's status and cleanup result.
+  """
+  @spec recv(session(), timeout()) ::
+          {:ok, {:stdout | :stderr, binary()}}
+          | {:done, Terminal.t()}
+          | {:error, :timeout | :busy | :not_pull | :released | {:output_limit, Terminal.t()}}
+  def recv(session, timeout \\ :infinity)
+
+  def recv(%__MODULE__{delivery: :messages}, _timeout), do: {:error, :not_pull}
+
+  def recv(%__MODULE__{pid: pid} = session, timeout)
+      when timeout == :infinity or (is_integer(timeout) and timeout >= 0) do
+    GenServer.call(pid, {:recv, timeout}, :infinity)
+  catch
+    :exit, _ -> terminal_reply(session)
   end
 
   @doc """
@@ -283,10 +359,19 @@ defmodule Forcola.Duplex do
     Process.flag(:trap_exit, true)
 
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
+    delivery = Keyword.get(opts, :delivery, :messages)
+    max_line_bytes = Keyword.get(opts, :max_line_bytes, @default_max_line_bytes)
+    max_output_bytes = Keyword.get(opts, :max_output_bytes, @default_max_output_bytes)
+    max_pending_bytes = Keyword.get(opts, :max_pending_bytes, max_line_bytes + 1)
 
     case Shim.open(opts) do
       {:ok, port} ->
-        payload = Shim.encode_spawn(argv, Keyword.put(opts, :kill_grace_ms, kill_grace_ms))
+        spawn_opts =
+          opts
+          |> Keyword.put(:kill_grace_ms, kill_grace_ms)
+          |> put_pull_options(delivery, max_pending_bytes)
+
+        payload = Shim.encode_spawn(argv, spawn_opts)
         Shim.send_frame(port, Shim.tag_spawn(), payload)
         Process.monitor(owner)
 
@@ -294,14 +379,30 @@ defmodule Forcola.Duplex do
          %{
            port: port,
            owner: owner,
-           session: %__MODULE__{pid: self(), ref: ref, terminal_table: terminal_table},
+           session: %__MODULE__{
+             pid: self(),
+             ref: ref,
+             terminal_table: terminal_table,
+             delivery: delivery
+           },
            kill_grace_ms: kill_grace_ms,
            buffers: %{stdout: "", stderr: ""},
            stdin_open: true,
            exit: nil,
            terminal: nil,
            terminal_recipient: Keyword.get(opts, :terminal_recipient),
-           shutdown_cause: :explicit_close
+           shutdown_cause: :explicit_close,
+           delivery: delivery,
+           pty: Keyword.get(opts, :pty, false),
+           max_line_bytes: max_line_bytes,
+           max_output_bytes: max_output_bytes,
+           max_pending_bytes: max_pending_bytes,
+           total_output_bytes: 0,
+           outstanding: %{stdout: 0, stderr: 0},
+           queue: :queue.new(),
+           waiter: nil,
+           output_limit: nil,
+           halt: false
          }}
 
       {:error, :not_found} ->
@@ -337,14 +438,58 @@ defmodule Forcola.Duplex do
     {:reply, port_command(state.port, Shim.tag_eof(), ""), %{state | stdin_open: false}}
   end
 
+  def handle_call({:recv, _timeout}, _from, %{delivery: :messages} = state) do
+    {:reply, {:error, :not_pull}, state}
+  end
+
+  def handle_call({:recv, _timeout}, _from, %{waiter: waiter} = state)
+      when not is_nil(waiter) do
+    {:reply, {:error, :busy}, state}
+  end
+
+  def handle_call({:recv, timeout}, from, %{delivery: :pull} = state) do
+    case :queue.out(state.queue) do
+      {{:value, line}, queue} ->
+        state = %{state | queue: queue}
+
+        if not is_nil(state.exit) and :queue.is_empty(queue) do
+          {:stop, :normal, {:ok, line}, state}
+        else
+          {:reply, {:ok, line}, state}
+        end
+
+      {:empty, _queue} when not is_nil(state.exit) ->
+        {:stop, :normal, {:done, state.terminal}, state}
+
+      {:empty, _queue} ->
+        waiter_ref = make_ref()
+        timer = schedule_recv_timeout(waiter_ref, timeout)
+        state = %{state | waiter: {from, waiter_ref, timer}}
+        {:noreply, grant_pull_credit(state)}
+    end
+  end
+
+  defp schedule_recv_timeout(_ref, :infinity), do: nil
+
+  defp schedule_recv_timeout(ref, timeout) do
+    Process.send_after(self(), {:recv_timeout, ref}, timeout)
+  end
+
   @impl true
   def handle_info({port, {:data, <<tag, payload::binary>>}}, %{port: port} = state) do
     state = handle_frame(state, tag, payload)
 
-    case state.exit do
-      nil -> {:noreply, state}
-      _exit -> {:stop, :normal, state}
+    cond do
+      state.halt -> {:stop, :normal, state}
+      is_nil(state.exit) -> {:noreply, state}
+      state.delivery == :pull and not :queue.is_empty(state.queue) -> {:noreply, state}
+      true -> {:stop, :normal, state}
     end
+  end
+
+  def handle_info({:recv_timeout, ref}, %{waiter: {from, ref, _timer}} = state) do
+    GenServer.reply(from, {:error, :timeout})
+    {:noreply, %{state | waiter: nil}}
   end
 
   def handle_info({port, {:exit_status, _status}}, %{port: port} = state) do
@@ -358,10 +503,17 @@ defmodule Forcola.Duplex do
       status: nil,
       confirmation: :transport_lost,
       cause: :shim_lost,
-      scope: :unknown
+      scope: :unknown,
+      output: :unknown
     }
 
-    {:stop, :normal, %{state | exit: :shim_exited, terminal: terminal}}
+    state = %{state | exit: :shim_exited, terminal: terminal} |> reply_pull_waiter()
+
+    if state.delivery == :pull and not :queue.is_empty(state.queue) do
+      {:noreply, state}
+    else
+      {:stop, :normal, state}
+    end
   end
 
   def handle_info({:EXIT, port, _reason}, %{port: port} = state) do
@@ -375,12 +527,14 @@ defmodule Forcola.Duplex do
     {:stop, :normal, %{state | shutdown_cause: :owner_death}}
   end
 
+  def handle_info({:recv_timeout, _ref}, state), do: {:noreply, state}
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
-    flush_buffers(state)
-    terminal = settle(state)
+    if state.delivery == :messages, do: flush_buffers(state)
+    terminal = settle(state) |> finish_output_evidence(state)
     publish_terminal(state.session.terminal_table, terminal)
 
     if is_pid(state.terminal_recipient) do
@@ -391,28 +545,106 @@ defmodule Forcola.Duplex do
   ## Option validation
 
   defp validate_opts!(argv, opts) do
+    validate_timeout_opt!(opts)
+    validate_pty_opt!(opts)
+    validate_argv!(argv)
+    validate_recipient_opt!(opts)
+    validate_delivery_opts!(opts)
+    :ok
+  end
+
+  defp validate_timeout_opt!(opts) do
     if Keyword.has_key?(opts, :timeout_ms) do
       raise ArgumentError,
             "Forcola.Duplex takes no :timeout_ms; a session's bound is its owner and close/1"
     end
+  end
 
+  defp validate_pty_opt!(opts) do
     if Keyword.get(opts, :pty, false) and Keyword.get(opts, :merge_stderr, true) == false do
       raise ArgumentError,
             "Forcola.Duplex :pty inherently merges stderr into the terminal; " <>
               "merge_stderr: false is incompatible with pty: true"
     end
+  end
 
+  defp validate_argv!(argv) do
     unless Enum.all?(argv, &is_binary/1) do
       raise ArgumentError, "argv must be a non-empty list of binaries, got: #{inspect(argv)}"
     end
+  end
 
+  defp validate_recipient_opt!(opts) do
     recipient = Keyword.get(opts, :terminal_recipient)
 
     unless is_nil(recipient) or is_pid(recipient) do
       raise ArgumentError, ":terminal_recipient must be a pid"
     end
+  end
 
-    :ok
+  defp validate_delivery_opts!(opts) do
+    validate_internal_credit_opts!(opts)
+    delivery = Keyword.get(opts, :delivery, :messages)
+
+    unless delivery in [:messages, :pull] do
+      raise ArgumentError, ":delivery must be :messages or :pull"
+    end
+
+    if delivery == :pull do
+      max_line = positive_option!(opts, :max_line_bytes, @default_max_line_bytes)
+      positive_option!(opts, :max_output_bytes, @default_max_output_bytes)
+      pending = positive_option!(opts, :max_pending_bytes, max_line + 1)
+
+      if pending <= max_line do
+        raise ArgumentError, ":max_pending_bytes must exceed :max_line_bytes"
+      end
+
+      if Keyword.get(opts, :merge_stderr, false) and not Keyword.get(opts, :pty, false) do
+        raise ArgumentError, "pull delivery requires separate stderr (merge_stderr: false)"
+      end
+    else
+      validate_pull_only_opts!(opts)
+    end
+  end
+
+  defp validate_internal_credit_opts!(opts) do
+    if Enum.any?(
+         [:window_bytes, :stderr_window_bytes, :strict_output],
+         &Keyword.has_key?(opts, &1)
+       ) do
+      raise ArgumentError, "shim credit options are managed by delivery: :pull"
+    end
+  end
+
+  defp validate_pull_only_opts!(opts) do
+    if Enum.any?(
+         [:max_line_bytes, :max_output_bytes, :max_pending_bytes],
+         &Keyword.has_key?(opts, &1)
+       ) do
+      raise ArgumentError, "output bounds require delivery: :pull"
+    end
+  end
+
+  defp positive_option!(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value > 0 -> value
+      _ -> raise ArgumentError, "#{inspect(key)} must be a positive integer"
+    end
+  end
+
+  defp put_pull_options(opts, :messages, _pending), do: opts
+
+  defp put_pull_options(opts, :pull, pending) do
+    opts
+    |> Keyword.put(:window_bytes, pending)
+    |> Keyword.put(:strict_output, true)
+    |> maybe_put_stderr_window(pending)
+  end
+
+  defp maybe_put_stderr_window(opts, pending) do
+    if Keyword.get(opts, :pty, false),
+      do: opts,
+      else: Keyword.put(opts, :stderr_window_bytes, pending)
   end
 
   ## Frame handling
@@ -434,7 +666,7 @@ defmodule Forcola.Duplex do
     terminal = exit_terminal(payload, :child_exit)
     state = flush_buffers(state)
     notify_exit(state, status)
-    %{state | exit: status, terminal: terminal}
+    %{state | exit: status, terminal: terminal} |> reply_pull_waiter()
   end
 
   defp spawn_failed(state, payload) do
@@ -448,8 +680,10 @@ defmodule Forcola.Duplex do
       scope: :unknown
     }
 
-    %{state | exit: {:spawn_error, reason}, terminal: terminal}
+    %{state | exit: {:spawn_error, reason}, terminal: terminal} |> reply_pull_waiter()
   end
+
+  defp notify_exit(%{delivery: :pull}, _status), do: :ok
 
   defp notify_exit(state, status) do
     send(state.owner, {:forcola_exit, state.session, status})
@@ -457,10 +691,39 @@ defmodule Forcola.Duplex do
 
   ## Line reassembly and delivery
 
+  defp emit(%{delivery: :pull} = state, stream, chunk) do
+    total = state.total_output_bytes + byte_size(chunk)
+
+    if total > state.max_output_bytes do
+      mark_output_limit(state, {:limit, :total, stream, state.max_output_bytes})
+    else
+      emit_pull_within_total(state, stream, chunk, total)
+    end
+  end
+
   defp emit(state, stream, chunk) do
     {lines, rest} = split_lines(state.buffers[stream] <> chunk)
     Enum.each(lines, &deliver(state, stream, &1))
     %{state | buffers: Map.put(state.buffers, stream, rest)}
+  end
+
+  defp emit_pull_within_total(state, stream, chunk, total) do
+    {lines, rest} = split_lines(state.buffers[stream] <> chunk)
+
+    if byte_size(rest) > state.max_line_bytes or
+         Enum.any?(lines, &(byte_size(&1) > state.max_line_bytes)) do
+      mark_output_limit(state, {:limit, :line, stream, state.max_line_bytes})
+    else
+      queue =
+        Enum.reduce(lines, state.queue, fn line, queue -> :queue.in({stream, line}, queue) end)
+
+      state
+      |> Map.put(:total_output_bytes, total)
+      |> Map.put(:buffers, Map.put(state.buffers, stream, rest))
+      |> Map.put(:queue, queue)
+      |> account_pull_credit(stream, byte_size(chunk))
+      |> reply_pull_waiter()
+    end
   end
 
   defp deliver(state, :stdout, line) do
@@ -478,12 +741,90 @@ defmodule Forcola.Duplex do
   end
 
   # Deliver partial lines still buffered when the session ends.
+  defp flush_buffers(%{delivery: :pull} = state) do
+    queue =
+      Enum.reduce([:stdout, :stderr], state.queue, fn stream, queue ->
+        case state.buffers[stream] do
+          "" -> queue
+          buffer -> :queue.in({stream, buffer}, queue)
+        end
+      end)
+
+    %{state | buffers: %{stdout: "", stderr: ""}, queue: queue}
+  end
+
   defp flush_buffers(state) do
     for {stream, buffer} <- state.buffers, buffer != "" do
       deliver(state, stream, buffer)
     end
 
     %{state | buffers: %{stdout: "", stderr: ""}}
+  end
+
+  defp mark_output_limit(state, limit) do
+    %{state | halt: true, output_limit: limit, shutdown_cause: :output_limit}
+  end
+
+  defp account_pull_credit(state, stream, bytes) do
+    outstanding = Map.update!(state.outstanding, stream, &max(&1 - bytes, 0))
+    %{state | outstanding: outstanding}
+  end
+
+  defp grant_pull_credit(state) do
+    Enum.reduce([:stdout, :stderr], state, &grant_stream_credit/2)
+  end
+
+  defp grant_stream_credit(:stderr, %{pty: true} = state), do: state
+
+  defp grant_stream_credit(stream, state) do
+    grant = state.max_pending_bytes - state.outstanding[stream]
+
+    if grant > 0 do
+      tag = if stream == :stdout, do: Shim.tag_credit(), else: Shim.tag_stderr_credit()
+      Shim.send_frame(state.port, tag, Shim.encode_credit(grant))
+      %{state | outstanding: Map.put(state.outstanding, stream, state.max_pending_bytes)}
+    else
+      state
+    end
+  end
+
+  defp reply_pull_waiter(%{delivery: :messages} = state), do: state
+  defp reply_pull_waiter(%{waiter: nil} = state), do: state
+
+  defp reply_pull_waiter(%{waiter: {from, _ref, timer}} = state) do
+    case :queue.out(state.queue) do
+      {{:value, line}, queue} ->
+        cancel_recv_timer(timer)
+        GenServer.reply(from, {:ok, line})
+        %{state | queue: queue, waiter: nil}
+
+      {:empty, _queue} when not is_nil(state.exit) ->
+        cancel_recv_timer(timer)
+        GenServer.reply(from, {:done, state.terminal})
+        %{state | waiter: nil}
+
+      {:empty, _queue} ->
+        state
+    end
+  end
+
+  defp cancel_recv_timer(nil), do: :ok
+  defp cancel_recv_timer(timer), do: Process.cancel_timer(timer)
+
+  defp terminal_reply(session) do
+    case await_terminal(session, 0) do
+      {:ok, %Terminal{output: {:limit, _, _, _}} = terminal} ->
+        {:error, {:output_limit, terminal}}
+
+      {:ok, terminal} ->
+        {:done, terminal}
+
+      {:error, :released} ->
+        {:error, :released}
+
+      {:error, :timeout} ->
+        {:error, :timeout}
+    end
   end
 
   ## Port writes
@@ -553,7 +894,8 @@ defmodule Forcola.Duplex do
       status: report.status,
       confirmation: if(report.confirmed, do: :confirmed, else: :unconfirmed),
       cause: if(report.timed_out, do: :timeout, else: cause),
-      scope: if(report.contained, do: :active_cgroup, else: :process_group)
+      scope: if(report.contained, do: :active_cgroup, else: :process_group),
+      output: if(report.output_truncated, do: :truncated, else: :complete)
     }
   end
 
@@ -564,12 +906,39 @@ defmodule Forcola.Duplex do
   end
 
   defp shutdown_terminal(:timeout, cause) do
-    %Terminal{status: nil, confirmation: :timeout, cause: cause, scope: :unknown}
+    %Terminal{
+      status: nil,
+      confirmation: :timeout,
+      cause: cause,
+      scope: :unknown,
+      output: :unknown
+    }
   end
 
   defp shutdown_terminal(:transport_lost, cause) do
-    %Terminal{status: nil, confirmation: :transport_lost, cause: cause, scope: :unknown}
+    %Terminal{
+      status: nil,
+      confirmation: :transport_lost,
+      cause: cause,
+      scope: :unknown,
+      output: :unknown
+    }
   end
+
+  defp finish_output_evidence(terminal, %{output_limit: limit}) when not is_nil(limit) do
+    %{terminal | cause: :output_limit, output: limit}
+  end
+
+  defp finish_output_evidence(terminal, %{delivery: :pull} = state) do
+    if not :queue.is_empty(state.queue) or
+         Enum.any?(state.buffers, fn {_stream, bytes} -> bytes != "" end) do
+      %{terminal | output: :truncated}
+    else
+      terminal
+    end
+  end
+
+  defp finish_output_evidence(terminal, _state), do: terminal
 
   defp publish_terminal(table, terminal) do
     :ets.insert_new(table, {:terminal, terminal})
@@ -591,7 +960,8 @@ defmodule Forcola.Duplex do
             status: nil,
             confirmation: :transport_lost,
             cause: :session_lost,
-            scope: :unknown
+            scope: :unknown,
+            output: :unknown
           }
 
           :ets.insert_new(table, {:terminal, terminal})

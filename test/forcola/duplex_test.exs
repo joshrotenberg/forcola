@@ -401,6 +401,202 @@ defmodule Forcola.DuplexTest do
     end
   end
 
+  describe "bounded pull delivery" do
+    test "recv rejects a message-delivery session" do
+      {:ok, session} = Forcola.Duplex.open(["/bin/cat"], [])
+      assert {:error, :not_pull} = Forcola.Duplex.recv(session, 0)
+      assert :ok = Forcola.Duplex.close(session)
+      assert {:error, :not_pull} = Forcola.Duplex.recv(session, 0)
+    end
+
+    test "invalid pull bounds are rejected" do
+      assert_raise ArgumentError, ~r/max_pending_bytes must exceed/, fn ->
+        Forcola.Duplex.open(["/bin/cat"],
+          delivery: :pull,
+          max_line_bytes: 10,
+          max_pending_bytes: 10
+        )
+      end
+
+      assert_raise ArgumentError, ~r/separate stderr/, fn ->
+        Forcola.Duplex.open(["/bin/cat"], delivery: :pull, merge_stderr: true)
+      end
+    end
+
+    test "recv demands stdout and stderr without owner line messages" do
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", "echo out; echo err >&2"],
+          delivery: :pull,
+          max_line_bytes: 16,
+          max_pending_bytes: 17,
+          max_output_bytes: 100
+        )
+
+      assert {:ok, first} = Forcola.Duplex.recv(session, 5_000)
+      assert {:ok, second} = Forcola.Duplex.recv(session, 5_000)
+      assert Enum.sort([first, second]) == [stderr: "err", stdout: "out"]
+
+      assert {:done, %Forcola.Duplex.Terminal{status: 0, output: :complete}} =
+               Forcola.Duplex.recv(session, 5_000)
+
+      refute_receive {:forcola_line, ^session, _}, 50
+      refute_receive {:forcola_stderr, ^session, _}, 50
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a burst is drained one demanded line at a time" do
+      script = ~S|i=0; while [ "$i" -lt 100 ]; do i=$((i+1)); echo "$i"; done|
+
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", script],
+          delivery: :pull,
+          max_line_bytes: 4,
+          max_pending_bytes: 5,
+          max_output_bytes: 1_000
+        )
+
+      lines =
+        for _ <- 1..100 do
+          assert {:ok, {:stdout, line}} = Forcola.Duplex.recv(session, 5_000)
+          line
+        end
+
+      assert lines == Enum.map(1..100, &Integer.to_string/1)
+
+      assert {:done, %Forcola.Duplex.Terminal{status: 0, output: :complete}} =
+               Forcola.Duplex.recv(session, 5_000)
+
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a final unterminated line is delivered before completion" do
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", "printf partial"],
+          delivery: :pull,
+          max_line_bytes: 8,
+          max_pending_bytes: 9,
+          max_output_bytes: 100
+        )
+
+      assert {:ok, {:stdout, "partial"}} = Forcola.Duplex.recv(session, 5_000)
+
+      assert {:done, %Forcola.Duplex.Terminal{status: 0, output: :complete}} =
+               Forcola.Duplex.recv(session, 5_000)
+
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a recv timeout does not grant a growing read budget" do
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/cat"],
+          delivery: :pull,
+          max_line_bytes: 8,
+          max_pending_bytes: 9,
+          max_output_bytes: 100
+        )
+
+      for _ <- 1..5 do
+        assert {:error, :timeout} = Forcola.Duplex.recv(session, 0)
+      end
+
+      :ok = Forcola.Duplex.send_line(session, "hello")
+      assert {:ok, {:stdout, "hello"}} = Forcola.Duplex.recv(session, 5_000)
+      Forcola.Duplex.shutdown(session)
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "an unterminated line trips its limit before it is retained" do
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", "printf xxxxxxxxxx; sleep 60"],
+          delivery: :pull,
+          max_line_bytes: 4,
+          max_pending_bytes: 5,
+          max_output_bytes: 100,
+          kill_grace_ms: 100
+        )
+
+      assert {:error,
+              {:output_limit,
+               %Forcola.Duplex.Terminal{
+                 cause: :output_limit,
+                 output: {:limit, :line, :stdout, 4}
+               } = terminal}} = Forcola.Duplex.recv(session, 5_000)
+
+      assert terminal.status != nil
+      assert {:ok, ^terminal} = Forcola.Duplex.await_terminal(session, 0)
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "total output bound includes stderr" do
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", "while :; do echo err >&2; done"],
+          delivery: :pull,
+          max_line_bytes: 8,
+          max_pending_bytes: 9,
+          max_output_bytes: 20,
+          kill_grace_ms: 100
+        )
+
+      result =
+        Enum.reduce_while(1..20, nil, fn _, _ ->
+          case Forcola.Duplex.recv(session, 5_000) do
+            {:ok, _line} -> {:cont, nil}
+            terminal -> {:halt, terminal}
+          end
+        end)
+
+      assert {:error,
+              {:output_limit, %Forcola.Duplex.Terminal{output: {:limit, :total, :stderr, 20}}}} =
+               result
+
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a nonreading owner blocks the producer and cancellation records truncation", %{
+      tmp_dir: tmp_dir
+    } do
+      done_file = Path.join(tmp_dir, "done")
+      script = ~S(yes x | head -c 1048576 >&2; echo done > "$DONE_FILE")
+
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", script],
+          delivery: :pull,
+          max_line_bytes: 64,
+          max_pending_bytes: 65,
+          max_output_bytes: 2_000_000,
+          env: [{"DONE_FILE", done_file}],
+          kill_grace_ms: 100
+        )
+
+      Process.sleep(200)
+      refute File.exists?(done_file), "producer ran to completion without demand"
+
+      assert {:ok, %Forcola.Duplex.Terminal{output: :truncated}} =
+               Forcola.Duplex.shutdown(session)
+
+      refute File.exists?(done_file)
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "sink rejection can cancel after one received line" do
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", "echo first; while :; do echo later; done"],
+          delivery: :pull,
+          max_line_bytes: 16,
+          max_pending_bytes: 17,
+          max_output_bytes: 1_000_000,
+          kill_grace_ms: 100
+        )
+
+      assert {:ok, {:stdout, "first"}} = Forcola.Duplex.recv(session, 5_000)
+
+      assert {:ok, %Forcola.Duplex.Terminal{output: :truncated}} =
+               Forcola.Duplex.shutdown(session)
+
+      Forcola.Duplex.forget_terminal(session)
+    end
+  end
+
   defp terminal_fixture(tmp_dir) do
     source = Path.expand("../fixtures/duplex_terminal_shim.py", __DIR__)
     destination = Path.join(tmp_dir, "duplex_terminal_shim.py")
