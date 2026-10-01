@@ -217,7 +217,8 @@ mod imp {
     /// Required setup preserves the preparation error so the supervisor can
     /// refuse to spawn rather than silently falling back to a process group.
     pub fn prepare_required() -> io::Result<Cgroup> {
-        try_prepare(true).map_err(io::Error::other)
+        try_prepare(true)
+            .map_err(|reason| io::Error::other(format!("cgroup containment unavailable: {reason}")))
     }
 
     /// The fallible core of [`prepare`], separated so each failure carries a
