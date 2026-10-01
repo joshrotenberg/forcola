@@ -311,6 +311,168 @@ defmodule Forcola.StreamTest do
   end
 
   describe "backpressure" do
+    test "exact line and stderr limits still finish cleanly" do
+      lines =
+        ["/bin/sh", "-c", "printf '12345678'; printf 'abcd' >&2"]
+        |> Forcola.Stream.lines(
+          timeout_ms: 5_000,
+          window_bytes: 4,
+          max_line_bytes: 8,
+          max_stderr_bytes: 4
+        )
+        |> Enum.to_list()
+
+      assert lines == ["12345678"]
+    end
+
+    test "a stderr flood hits a typed bound and stops the group" do
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", "yes err >&2"]
+          |> Forcola.Stream.lines(
+            timeout_ms: 10_000,
+            window_bytes: 256,
+            max_stderr_bytes: 4096,
+            kill_grace_ms: 500
+          )
+          |> Enum.to_list()
+        end
+
+      assert error.limit == {:total, :stderr, 4096}
+      assert error.output_truncated
+      assert byte_size(error.stderr) == 4096
+      refute error.status == {:signal, :unconfirmed}
+    end
+
+    test "merged stderr obeys the same bound while still emitting lines" do
+      {:ok, seen} = Agent.start_link(fn -> [] end)
+
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", "yes err >&2"]
+          |> Forcola.Stream.lines(
+            timeout_ms: 10_000,
+            window_bytes: 256,
+            max_stderr_bytes: 4096,
+            merge_stderr: true,
+            kill_grace_ms: 500
+          )
+          |> Enum.each(fn line -> Agent.update(seen, &[line | &1]) end)
+        end
+
+      assert error.limit == {:total, :stderr, 4096}
+      assert error.output_truncated
+      assert error.stderr == ""
+      assert Agent.get(seen, & &1) != []
+      Agent.stop(seen)
+    end
+
+    test "an unterminated line hits its typed bound after the child exits" do
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", "printf '%02048d' 0"]
+          |> Forcola.Stream.lines(
+            timeout_ms: 10_000,
+            window_bytes: 64,
+            max_line_bytes: 128,
+            kill_grace_ms: 500
+          )
+          |> Enum.to_list()
+        end
+
+      assert error.limit == {:line, :stdout, 128}
+      assert error.output_truncated
+    end
+
+    test "a merged unterminated stderr line hits the line bound" do
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", "printf '%02048d' 0 >&2"]
+          |> Forcola.Stream.lines(
+            timeout_ms: 10_000,
+            window_bytes: 64,
+            max_line_bytes: 128,
+            merge_stderr: true
+          )
+          |> Enum.to_list()
+        end
+
+      assert error.limit == {:line, :merged, 128}
+      assert error.output_truncated
+    end
+
+    test "stderr activity still resets the idle deadline under bounded output" do
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", "echo err >&2; sleep 60"]
+          |> Forcola.Stream.lines(
+            timeout_ms: 10_000,
+            idle_timeout_ms: 300,
+            window_bytes: 256,
+            max_stderr_bytes: 4096,
+            kill_grace_ms: 500
+          )
+          |> Enum.to_list()
+        end
+
+      assert error.idle_timed_out
+      assert error.stderr == "err\n"
+    end
+
+    test "whole-run timeout still fires after a bounded consumer pause" do
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["/bin/sh", "-c", "echo ready; sleep 60"]
+          |> Forcola.Stream.lines(timeout_ms: 300, window_bytes: 256, kill_grace_ms: 500)
+          |> Stream.map(fn line ->
+            Process.sleep(700)
+            line
+          end)
+          |> Enum.to_list()
+        end
+
+      assert error.timed_out
+      refute error.idle_timed_out
+    end
+
+    test "stderr credit blocks a producer during a slow consumer and early halt reaps it",
+         %{tmp_dir: tmp_dir} do
+      progress = Path.join(tmp_dir, "progress")
+      pid_file = Path.join(tmp_dir, "pid")
+      parent = self()
+
+      consumer =
+        spawn(fn ->
+          result =
+            ["/bin/sh", "-c", stderr_producer_script()]
+            |> Forcola.Stream.lines(
+              timeout_ms: 30_000,
+              window_bytes: 256,
+              max_stderr_bytes: 4096,
+              kill_grace_ms: 500,
+              env: [{"PROGRESS", progress}, {"PID_FILE", pid_file}]
+            )
+            |> Stream.map(fn line ->
+              send(parent, {:stderr_warmed, self()})
+
+              receive do
+                :resume -> line
+              end
+            end)
+            |> Enum.take(1)
+
+          send(parent, {:bounded_done, result})
+        end)
+
+      assert_receive {:stderr_warmed, ^consumer}, 5_000
+      stalled = await_stall(progress)
+      assert stalled < 256_000
+      send(consumer, :resume)
+      assert_receive {:bounded_done, ["ready"]}, 5_000
+      pid = pid_file |> File.read!() |> String.trim()
+      refute alive?(pid)
+    end
+
     test "delivers every line byte-exact under a small window (multi-MB producer)" do
       # 2 MB of output through a 4 KB window: heavy backpressure, fast
       # consumer. `yes` reprints the line; `head` bounds it and exits 0.
@@ -471,6 +633,20 @@ defmodule Forcola.StreamTest do
     i=0
     while :; do
       printf '%s\n' "$CHUNK"
+      i=$((i + 1001))
+      printf '%s\n' "$i" >> "$PROGRESS"
+    done
+    """
+  end
+
+  defp stderr_producer_script do
+    ~S"""
+    echo $$ > "$PID_FILE"
+    echo ready
+    CHUNK=$(printf '%01000d' 0)
+    i=0
+    while :; do
+      printf '%s\n' "$CHUNK" >&2
       i=$((i + 1001))
       printf '%s\n' "$i" >> "$PROGRESS"
     done

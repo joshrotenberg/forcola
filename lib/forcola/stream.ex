@@ -60,10 +60,13 @@ defmodule Forcola.Stream do
   when the window is exhausted the shim stops reading, the OS pipe fills, and
   the child's next write blocks. That block is the backpressure: the producer
   runs no faster than the consumer drains it. The buffering bound is roughly
-  `window_bytes` in flight plus one frame in transit (plus a bounded
-  pipe-buffer flush when the child exits). Backpressure gates the child's
-  stdout only; stderr is never gated, and under `merge_stderr: true` the
-  merged stderr bytes ride eagerly.
+  `window_bytes` of stdout in flight, `max_stderr_bytes + 1` bytes of stderr,
+  a `max_line_bytes` partial line, and protocol frames. The OS pipes can each
+  hold additional data outside BEAM memory. Stderr gets a finite read budget
+  even with `merge_stderr: true`; the extra byte detects overflow. A line or
+  stderr limit kills the process group and raises `Forcola.Stream.Error` with
+  typed `:limit` and `output_truncated: true` evidence. The shim keeps both
+  pumps gated after child exit until output is consumed or cancelled.
 
   Interaction with `:idle_timeout_ms`: a gap between frames can be caused by
   the consumer not yet granting credit rather than a stalled producer. A
@@ -93,21 +96,39 @@ defmodule Forcola.Stream do
       * `:stderr` - stderr captured before termination (empty when
         `merge_stderr: true` routed it into the line stream)
       * `:reason` - spawn failure reason, `nil` for a run that started
+      * `:limit` - `{:line, :stdout | :merged, n}` or `{:total, :stderr, n}`
+        when bounded output exceeded its configured limit
+      * `:output_truncated` - whether output was deliberately discarded or
+        the shim reported an incomplete drain
     """
 
-    defexception [:status, :reason, stderr: "", timed_out: false, idle_timed_out: false]
+    defexception [
+      :status,
+      :reason,
+      :limit,
+      stderr: "",
+      timed_out: false,
+      idle_timed_out: false,
+      output_truncated: false
+    ]
 
     @type t :: %__MODULE__{
             status: non_neg_integer() | {:signal, atom() | non_neg_integer()} | nil,
             reason: String.t() | atom() | tuple() | nil,
+            limit: {:line | :total, atom(), pos_integer()} | nil,
             stderr: binary(),
             timed_out: boolean(),
-            idle_timed_out: boolean()
+            idle_timed_out: boolean(),
+            output_truncated: boolean()
           }
 
     @impl true
     def message(%__MODULE__{reason: reason}) when not is_nil(reason) do
       "stream spawn failed: #{inspect(reason)}"
+    end
+
+    def message(%__MODULE__{limit: limit}) when not is_nil(limit) do
+      "stream output limit exceeded: #{inspect(limit)}; process group killed"
     end
 
     def message(%__MODULE__{
@@ -148,6 +169,8 @@ defmodule Forcola.Stream do
   # Default read window when backpressure is enabled with `backpressure: true`
   # rather than an explicit `window_bytes`.
   @default_window_bytes 64 * 1024
+  @default_max_line_bytes 64 * 1024
+  @default_max_stderr_bytes 1024 * 1024
 
   @doc """
   Run `argv` and return its stdout as a lazy stream of lines.
@@ -180,6 +203,14 @@ defmodule Forcola.Stream do
   pump. See the module docs for the buffering bound and the interaction with
   `:idle_timeout_ms`.
 
+  With backpressure enabled, `:max_line_bytes` defaults to
+  #{@default_max_line_bytes} and `:max_stderr_bytes` to
+  #{@default_max_stderr_bytes}; both accept a positive integer. The first
+  bounds any unterminated line (including merged stderr), and the second
+  bounds total stderr bytes. Exceeding either limit raises `Error` with
+  `:limit` and `output_truncated: true` after group cleanup. These options
+  require backpressure; without it, the legacy eager behavior is unchanged.
+
   Lines are emitted without their trailing newline. A partial line held
   across frame boundaries is emitted once its newline arrives; a final
   partial line with no newline is emitted before the stream terminates.
@@ -192,9 +223,21 @@ defmodule Forcola.Stream do
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
     idle_timeout_ms = Keyword.get(opts, :idle_timeout_ms)
     window_bytes = resolve_window_bytes(opts)
+    {max_line_bytes, max_stderr_bytes} = resolve_bounds(opts, window_bytes)
 
     Stream.resource(
-      fn -> start(argv, opts, timeout_ms, kill_grace_ms, idle_timeout_ms, window_bytes) end,
+      fn ->
+        start(
+          argv,
+          opts,
+          timeout_ms,
+          kill_grace_ms,
+          idle_timeout_ms,
+          window_bytes,
+          max_line_bytes,
+          max_stderr_bytes
+        )
+      end,
       &next/1,
       &cleanup/1
     )
@@ -217,13 +260,46 @@ defmodule Forcola.Stream do
     end
   end
 
-  defp start(argv, opts, timeout_ms, kill_grace_ms, idle_timeout_ms, window_bytes) do
+  defp resolve_bounds(opts, nil) do
+    if Keyword.has_key?(opts, :max_line_bytes) or Keyword.has_key?(opts, :max_stderr_bytes) do
+      raise ArgumentError, ":max_line_bytes and :max_stderr_bytes require backpressure"
+    end
+
+    {nil, nil}
+  end
+
+  defp resolve_bounds(opts, _window_bytes) do
+    {positive_bound(opts, :max_line_bytes, @default_max_line_bytes),
+     positive_bound(opts, :max_stderr_bytes, @default_max_stderr_bytes)}
+  end
+
+  defp positive_bound(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      n when is_integer(n) and n > 0 ->
+        n
+
+      other ->
+        raise ArgumentError, "#{inspect(key)} must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  defp start(
+         argv,
+         opts,
+         timeout_ms,
+         kill_grace_ms,
+         idle_timeout_ms,
+         window_bytes,
+         max_line_bytes,
+         max_stderr_bytes
+       ) do
     case Shim.open(opts) do
       {:ok, port} ->
         spawn_opts =
           opts
           |> Keyword.put(:kill_grace_ms, kill_grace_ms)
           |> put_window_bytes(window_bytes)
+          |> put_bounded_stderr(max_stderr_bytes)
 
         payload = Shim.encode_spawn(argv, spawn_opts)
         Shim.send_frame(port, Shim.tag_spawn(), payload)
@@ -234,6 +310,14 @@ defmodule Forcola.Stream do
         # stdin.
         Shim.send_frame(port, Shim.tag_eof(), "")
 
+        if max_stderr_bytes do
+          Shim.send_frame(
+            port,
+            Shim.tag_stderr_credit(),
+            Shim.encode_credit(max_stderr_bytes + 1)
+          )
+        end
+
         now = System.monotonic_time(:millisecond)
         deadline = now + timeout_ms + kill_grace_ms + @backstop_margin_ms
 
@@ -241,6 +325,10 @@ defmodule Forcola.Stream do
           port: port,
           buffer: "",
           stderr: [],
+          stderr_bytes: 0,
+          max_line_bytes: max_line_bytes,
+          max_stderr_bytes: max_stderr_bytes,
+          merge_stderr: Keyword.get(opts, :merge_stderr, false),
           deadline: deadline,
           idle_timeout_ms: idle_timeout_ms,
           idle_deadline: idle_deadline(idle_timeout_ms, now),
@@ -263,6 +351,17 @@ defmodule Forcola.Stream do
 
   defp put_window_bytes(opts, nil), do: opts
   defp put_window_bytes(opts, window_bytes), do: Keyword.put(opts, :window_bytes, window_bytes)
+
+  defp put_bounded_stderr(opts, nil), do: opts
+
+  defp put_bounded_stderr(opts, max_stderr_bytes) do
+    opts
+    |> Keyword.put(:stderr_window_bytes, max_stderr_bytes + 1)
+    |> Keyword.put(:strict_output, true)
+    # Preserve each pipe's identity for separate accounting. Stream merges
+    # the received frames into the same line buffer below when requested.
+    |> Keyword.put(:merge_stderr, false)
+  end
 
   # nil idle_timeout_ms leaves the idle deadline nil (disabled). Otherwise
   # the deadline is now + interval and is reset on every liveness frame.
@@ -388,12 +487,13 @@ defmodule Forcola.Stream do
   defp handle_frame(tag, payload, state) do
     cond do
       tag == Shim.tag_stdout() ->
-        {lines, rest} = split_lines(state.buffer <> payload)
-        state = account_stdout(reset_idle(state), byte_size(payload))
-        {lines, %{state | buffer: rest}}
+        state
+        |> reset_idle()
+        |> account_stdout(byte_size(payload))
+        |> consume_lines(payload)
 
       tag == Shim.tag_stderr() ->
-        {[], %{reset_idle(state) | stderr: [state.stderr, payload]}}
+        consume_stderr(reset_idle(state), payload)
 
       tag == Shim.tag_exit() ->
         handle_exit(payload, state)
@@ -407,15 +507,89 @@ defmodule Forcola.Stream do
     end
   end
 
+  defp consume_stderr(%{max_stderr_bytes: nil} = state, payload) do
+    {[], %{state | stderr: [state.stderr, payload]}}
+  end
+
+  defp consume_stderr(state, payload) do
+    remaining = state.max_stderr_bytes - state.stderr_bytes
+    kept = binary_part(payload, 0, min(byte_size(payload), remaining))
+    exceeded = byte_size(payload) > remaining
+    state = %{state | stderr_bytes: state.stderr_bytes + byte_size(kept)}
+
+    {lines, state} =
+      if state.merge_stderr do
+        consume_lines(state, kept)
+      else
+        {[], %{state | stderr: [state.stderr, kept]}}
+      end
+
+    if exceeded and state.exit == nil do
+      {lines, stop_for_limit(state, {:total, :stderr, state.max_stderr_bytes})}
+    else
+      {lines, state}
+    end
+  end
+
+  defp consume_lines(%{max_line_bytes: nil} = state, payload) do
+    {lines, rest} = split_lines(state.buffer <> payload)
+    {lines, %{state | buffer: rest}}
+  end
+
+  defp consume_lines(state, payload) do
+    {lines, rest} = split_lines(state.buffer <> payload)
+    max_line = state.max_line_bytes
+    overlong = Enum.find_index(lines, &(byte_size(&1) > max_line))
+
+    cond do
+      not is_nil(overlong) ->
+        limit = {:line, line_source(state), max_line}
+        {Enum.take(lines, overlong), stop_for_limit(state, limit)}
+
+      byte_size(rest) > max_line ->
+        {lines, stop_for_limit(state, {:line, line_source(state), max_line})}
+
+      true ->
+        {lines, %{state | buffer: rest}}
+    end
+  end
+
+  defp line_source(%{merge_stderr: true}), do: :merged
+  defp line_source(_state), do: :stdout
+
+  defp stop_for_limit(state, limit) do
+    status =
+      case kill_and_confirm(state) do
+        {:exit, status, _timed_out} -> status
+        _unconfirmed -> {:signal, :unconfirmed}
+      end
+
+    error = %Error{
+      status: status,
+      limit: limit,
+      stderr: stderr(state),
+      output_truncated: true
+    }
+
+    %{state | buffer: "", exit: {:error, error}}
+  end
+
   defp handle_exit(payload, state) do
     {status, timed_out} = Shim.decode_exit(payload)
+    report = Shim.decode_exit_report(payload)
     final = if state.buffer == "", do: [], else: [state.buffer]
 
     outcome =
-      if status == 0 and not timed_out do
+      if status == 0 and not timed_out and not report.output_truncated do
         :ok
       else
-        {:error, %Error{status: status, timed_out: timed_out, stderr: stderr(state)}}
+        {:error,
+         %Error{
+           status: status,
+           timed_out: timed_out,
+           stderr: stderr(state),
+           output_truncated: report.output_truncated
+         }}
       end
 
     {final, %{state | buffer: "", exit: outcome}}

@@ -14,7 +14,7 @@ every new upstream release.
 | [Porcelain 2.0.3](https://hex.pm/packages/porcelain) + goon | Closing stdin and waiting does not kill the child; no tree kill | Stream and file APIs | Separate goon install; last Hex release in 2016 |
 | [Rambo 0.3.4](https://hex.pm/packages/rambo) | Shim kills the direct child on stdin EOF; no tree kill | One-shot | Bundled x86-64 binaries; last Hex release in 2021; Apple Silicon install failed in testing |
 | [exile 0.15.0](https://github.com/akash-akya/exile/releases/tag/v0.15.0) | Normal cleanup; BEAM `kill -9` orphaned the child in earlier macOS testing | Backpressure-first streaming | NIF-based IO; compiles native code; active |
-| [Forcola 0.4.0](https://github.com/joshrotenberg/forcola/releases/tag/v0.4.0) | BEAM-death process-group kill with explicit unconfirmed results; opt-in Linux cgroup v2 contains daemonizers when active | Opt-in stdout backpressure for Stream; opt-in bounded stdout and stderr pull for Duplex | Per-command Rust shim; five precompiled targets, cargo elsewhere |
+| [Forcola (main)](https://github.com/joshrotenberg/forcola) | BEAM-death process-group kill with explicit unconfirmed results; opt-in Linux cgroup v2 contains daemonizers when active | Opt-in bounded stdout/stderr Stream; opt-in bounded stdout and stderr pull for Duplex | Per-command Rust shim; five precompiled targets, cargo elsewhere |
 
 ## erlexec
 
@@ -48,8 +48,9 @@ cgroup containment for deliberate daemonizers on delegated Linux hosts.
 
 [MuonTrap's stdio flow control](https://github.com/fhunleth/muontrap#stdio-flow-control)
 predates 2.0. It bounds unacknowledged stdout and stderr by default (10 KiB).
-Backpressure in `Forcola.Stream.lines/2` is opt-in and gates stdout only;
-stderr still arrives eagerly. Forcola 0.4.0 adds `Forcola.Duplex.open/2` with
+Backpressure in `Forcola.Stream.lines/2` is opt-in and gates stdout while
+giving stderr a finite budget and limiting partial lines, including merged
+stderr. Forcola 0.4.0 adds `Forcola.Duplex.open/2` with
 `delivery: :pull`, where both output pumps wait for `recv/2` demand and line,
 total-output, and pending-byte limits bound delivery. Its original message
 mode remains the default. Forcola does not currently expose MuonTrap-style
@@ -83,8 +84,8 @@ child. Neither is a strong default for a new process-containment integration.
   BEAM-death cleanup is not the deciding constraint.
 - Choose Forcola for process-group cleanup across supported POSIX platforms,
   precompiled installation, and the focused run, stream, daemon, and Duplex
-  APIs. Use `delivery: :pull` for bounded Duplex output. `Forcola.run/2`
-  collects output, and `Forcola.Stream.lines/2` still handles stderr eagerly, so neither has
-  a general total-output memory bound.
+  APIs. Use `delivery: :pull` for bounded Duplex output or Stream backpressure
+  for bounded line-oriented output. `Forcola.run/2` still collects output, so
+  it has no general total-output memory bound.
 - Windows support remains open in
   [#34](https://github.com/joshrotenberg/forcola/issues/34).
