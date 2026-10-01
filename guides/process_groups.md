@@ -154,9 +154,10 @@ comes from `Forcola.run/2` and `Forcola.Daemon`; `Forcola.Stream` and
 `Forcola.Duplex` report their exit through messages or a raise and do not
 emit it. See `Forcola.run/2` for the option.
 
-There is no setting that refuses to start a child when cgroup placement is
-unavailable. That opt-in requirement is tracked in
-[#84](https://github.com/joshrotenberg/forcola/issues/84).
+Use `cgroup: :required` to refuse to execute a child unless it can join a
+delegated cgroup v2 subtree with writable `cgroup.kill`. Preparation failure
+or a failed join takes the normal spawn-error path, before the command runs.
+Required mode is Linux-only. It does not contain externally owned work.
 
 ### Client/daemon control channels
 

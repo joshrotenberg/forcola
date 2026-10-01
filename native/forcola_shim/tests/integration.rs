@@ -880,6 +880,48 @@ fn cgroup_reports_contained_flag() {
 }
 
 #[test]
+fn required_cgroup_never_executes_on_fallback() {
+    let marker = std::env::temp_dir().join(format!("forcola-required-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let payload = serde_json::json!({
+        "argv": ["sh", "-c", "printf executed > \"$MARKER\""],
+        "env": {"MARKER": marker.to_str().unwrap()},
+        "cgroup": "required"
+    });
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &serde_json::to_vec(&payload).unwrap(),
+    );
+
+    let (_, terminal) = drain_until_exit(&mut stdout);
+    let terminal = terminal.expect("required cgroup must report EXIT or ERROR");
+    let report: serde_json::Value = serde_json::from_slice(&terminal.payload).unwrap();
+
+    if terminal.tag == TAG_EXIT {
+        assert_eq!(report["contained"], true);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"executed");
+    } else {
+        assert_eq!(
+            terminal.tag, TAG_ERROR,
+            "unavailable cgroup must prevent exec"
+        );
+        assert!(report["reason"].as_str().unwrap().contains("cgroup"));
+        assert!(
+            !marker.exists(),
+            "child ran despite required containment failure"
+        );
+    }
+
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
 fn cgroup_reaps_daemonizer_that_escaped_the_process_group() {
     // The load-bearing containment proof. The child uses `setsid` to launch a
     // `sleep` in a brand-new session, so that sleep leaves the child's process

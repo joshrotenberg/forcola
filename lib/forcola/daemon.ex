@@ -37,7 +37,8 @@ defmodule Forcola.Daemon do
       the process-group kill with a warning elsewhere. A daemon is the
       typical place to want this: a long-running server that might spawn a
       helper which daemonizes away from the process group is reaped anyway
-      on shutdown. Default `false`.
+      on shutdown. Set `:required` to fail before exec if containment is
+      unavailable. Default `false`.
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace, default `5_000`.
     * `:output` - where child output goes; see below. Default `:logger`.
     * `:log_output` - `Logger` level for `output: :logger`, default `:info`.

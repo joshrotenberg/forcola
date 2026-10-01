@@ -47,16 +47,12 @@ pub struct SpawnRequest {
     /// gid. Absent leaves the gid derived from `user`, or unchanged.
     #[serde(default)]
     pub group: Option<GroupSpec>,
-    /// Opt in to Linux cgroup v2 containment. When true and a delegated cgroup
-    /// v2 subtree is available, the child is placed in a dedicated child cgroup
-    /// before exec so descendants that escape the process group (deliberate
-    /// daemonizers) are still reaped via `cgroup.kill`. Linux-only; on other
-    /// platforms, on non-cgroup-v2 systems, or when the subtree is not
-    /// delegated, it degrades to process-group kill with a warning. The EXIT
-    /// report's `contained` field says which mechanism was used. Default false
-    /// leaves the kill path unchanged.
+    /// `true` requests best-effort Linux cgroup v2 containment. `"required"`
+    /// refuses to spawn unless the child can join a dedicated cgroup before
+    /// exec. Keeping the required value distinct from a JSON boolean makes an
+    /// older shim reject it instead of silently falling back.
     #[serde(default)]
-    pub cgroup: bool,
+    pub cgroup: CgroupMode,
     /// Opt in to demand-driven backpressure on the child's stdout. When
     /// present, the stdout pump reads the child only while the BEAM has
     /// granted read credit via CREDIT frames; when the credit is exhausted
@@ -76,6 +72,25 @@ pub struct SpawnRequest {
     /// granting credit to drain output or send KILL to discard it explicitly.
     #[serde(default)]
     pub strict_output: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CgroupMode {
+    BestEffort(bool),
+    Required(RequiredCgroup),
+}
+
+impl Default for CgroupMode {
+    fn default() -> Self {
+        Self::BestEffort(false)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredCgroup {
+    Required,
 }
 
 /// A user identity in a SPAWN payload: either a name to resolve or a raw
@@ -116,7 +131,7 @@ pub struct ExitReport {
     /// processes were gone before this report was sent.
     pub confirmed: bool,
     /// Whether Linux cgroup v2 containment was actually active for this run.
-    /// `true` only when `cgroup: true` was requested and a delegated cgroup v2
+    /// `true` only when containment was requested and a delegated cgroup v2
     /// subtree was available; `false` on the default path, on fallback, and on
     /// non-Linux platforms. Reports which kill mechanism was used.
     pub contained: bool,
@@ -150,7 +165,7 @@ mod tests {
         assert_eq!(req.pty_cols, None);
         assert_eq!(req.user, None);
         assert_eq!(req.group, None);
-        assert!(!req.cgroup);
+        assert_eq!(req.cgroup, CgroupMode::BestEffort(false));
         assert_eq!(req.window_bytes, None);
         assert_eq!(req.stderr_window_bytes, None);
         assert!(!req.strict_output);
@@ -177,7 +192,18 @@ mod tests {
     fn spawn_request_cgroup_opt_in() {
         let json = r#"{"argv": ["sleep", "1"], "cgroup": true}"#;
         let req: SpawnRequest = serde_json::from_str(json).unwrap();
-        assert!(req.cgroup);
+        assert_eq!(req.cgroup, CgroupMode::BestEffort(true));
+    }
+
+    #[test]
+    fn spawn_request_cgroup_required() {
+        let json = r#"{"argv": ["sleep", "1"], "cgroup": "required"}"#;
+        let req: SpawnRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cgroup, CgroupMode::Required(RequiredCgroup::Required));
+        assert!(serde_json::from_str::<SpawnRequest>(
+            r#"{"argv": ["sleep", "1"], "cgroup": "unknown"}"#
+        )
+        .is_err());
     }
 
     #[test]

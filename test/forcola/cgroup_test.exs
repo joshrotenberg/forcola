@@ -23,6 +23,75 @@ defmodule Forcola.CgroupTest do
       decoded = decode(Shim.encode_spawn(["echo", "hi"], cgroup: true))
       assert decoded["cgroup"] == true
     end
+
+    test "cgroup: :required uses a distinct wire value that older shims reject" do
+      decoded = decode(Shim.encode_spawn(["echo", "hi"], cgroup: :required))
+      assert decoded["cgroup"] == "required"
+    end
+  end
+
+  describe "cgroup: :required" do
+    test "refuses to execute without placement, or runs in an active cgroup",
+         %{tmp_dir: tmp_dir} do
+      marker = Path.join(tmp_dir, "executed")
+      argv = ["/bin/sh", "-c", ~S(printf executed > "$MARKER")]
+      opts = [timeout_ms: 5_000, cgroup: :required, env: [{"MARKER", marker}]]
+
+      case Forcola.run(argv, opts) do
+        {:ok, %Forcola.Result{status: 0}} ->
+          assert File.read!(marker) == "executed"
+
+        {:error, {:spawn, reason}} ->
+          assert reason =~ "cgroup"
+          refute File.exists?(marker)
+      end
+    end
+
+    test "all execution modes surface an unavailable required cgroup as a spawn failure",
+         %{tmp_dir: tmp_dir} do
+      unless required_cgroup_available?() do
+        marker = Path.join(tmp_dir, "executed")
+        argv = ["/bin/sh", "-c", ~S(printf executed > "$MARKER")]
+        env = [{"MARKER", marker}]
+
+        assert {:error, {:spawn, reason}} =
+                 Forcola.run(argv, timeout_ms: 5_000, cgroup: :required, env: env)
+
+        assert reason =~ "cgroup"
+
+        stream = Forcola.Stream.lines(argv, timeout_ms: 5_000, cgroup: :required, env: env)
+
+        assert %Forcola.Stream.Error{reason: stream_reason} =
+                 assert_raise(Forcola.Stream.Error, fn -> Enum.to_list(stream) end)
+
+        assert stream_reason =~ "cgroup"
+
+        daemon_result =
+          Task.async(fn ->
+            Process.flag(:trap_exit, true)
+
+            Forcola.Daemon.start_link(
+              argv: argv,
+              cgroup: :required,
+              env: env,
+              ready: fn -> false end,
+              ready_poll_ms: 10
+            )
+          end)
+          |> Task.await(5_000)
+
+        assert {:error, {:exited_before_ready, {:spawn, daemon_reason}}} = daemon_result
+
+        assert daemon_reason =~ "cgroup"
+
+        assert {:ok, session} = Forcola.Duplex.open(argv, cgroup: :required, env: env)
+
+        assert {:ok, %Forcola.Duplex.Terminal{confirmation: :not_started, cause: :spawn_error}} =
+                 Forcola.Duplex.await_terminal(session, 5_000)
+
+        refute File.exists?(marker)
+      end
+    end
   end
 
   describe "decode_contained/1" do
@@ -138,6 +207,13 @@ defmodule Forcola.CgroupTest do
       {:error, _} ->
         false
     end
+  end
+
+  defp required_cgroup_available? do
+    match?(
+      {:ok, %Forcola.Result{status: 0}},
+      Forcola.run(["true"], timeout_ms: 5_000, cgroup: :required)
+    )
   end
 
   defp await_contained(port, deadline) do

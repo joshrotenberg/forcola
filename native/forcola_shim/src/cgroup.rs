@@ -16,8 +16,8 @@
 //!    `/proc/self/cgroup`, verify the subtree is delegated (a child dir can be
 //!    created), create `forcola-<pid>-<n>`, and open its `cgroup.procs` for
 //!    writing. All of this does allocation and fallible I/O, which is fine in
-//!    the parent. Any failure degrades cleanly to `None` (process-group kill
-//!    only) with a warning; it is never an error.
+//!    the parent. Best-effort mode degrades to process-group kill with a
+//!    warning; required mode returns an error before the child is spawned.
 //!
 //! 2. **Child, after fork, inside `pre_exec`** ([`Placement::join_in_child`]):
 //!    write the child's own pid to the parent-opened `cgroup.procs` fd. This is
@@ -49,14 +49,17 @@ mod imp {
 
     /// A prepared child cgroup: the directory the shim created plus the open
     /// `cgroup.procs` fd the child writes its pid to. Held by the supervisor
-    /// for the child's lifetime; dropping it (without [`Cgroup::remove`]) leaves
-    /// the directory behind, so the supervisor always removes it after drain.
+    /// for the child's lifetime. Drop also tries to remove an empty directory
+    /// if spawning fails after preparation.
     pub struct Cgroup {
         dir: PathBuf,
         /// Open write fd for `<dir>/cgroup.procs`. The child writes its own pid
         /// here inside `pre_exec`; the supervisor keeps it open so the fd is
         /// valid across the fork.
         procs: OwnedFd,
+        /// Required mode opens this before the child starts so an absent or
+        /// unwritable cgroup.kill cannot masquerade as usable containment.
+        kill_fd: Option<File>,
     }
 
     /// The child-side handle: just the raw `cgroup.procs` fd, moved into the
@@ -80,8 +83,13 @@ mod imp {
         /// kernel without `cgroup.kill`) is ignored, because the process-group
         /// kill has already run and is the primary mechanism.
         pub fn kill(&self) {
-            let path = self.dir.join("cgroup.kill");
-            if let Ok(mut f) = OpenOptions::new().write(true).open(path) {
+            if let Some(kill_fd) = &self.kill_fd {
+                let mut f = kill_fd;
+                let _ = f.write_all(b"1");
+            } else if let Ok(mut f) = OpenOptions::new()
+                .write(true)
+                .open(self.dir.join("cgroup.kill"))
+            {
                 let _ = f.write_all(b"1");
             }
         }
@@ -102,6 +110,15 @@ mod imp {
         /// or already-removed directory just leaves cleanup to the parent
         /// delegation owner. Called after [`Self::drained`] reports empty.
         pub fn remove(&self) {
+            let _ = std::fs::remove_dir(&self.dir);
+        }
+    }
+
+    impl Drop for Cgroup {
+        fn drop(&mut self) {
+            // A failed spawn has no child to drain. During normal operation
+            // the supervisor removes the drained directory first; rmdir of
+            // an already-removed or still-populated cgroup is harmless here.
             let _ = std::fs::remove_dir(&self.dir);
         }
     }
@@ -185,7 +202,7 @@ mod imp {
     /// warning on stderr) otherwise, so the caller falls back to process-group
     /// kill. Never errors.
     pub fn prepare() -> Option<Cgroup> {
-        match try_prepare() {
+        match try_prepare(false) {
             Ok(cg) => Some(cg),
             Err(reason) => {
                 eprintln!(
@@ -197,9 +214,15 @@ mod imp {
         }
     }
 
+    /// Required setup preserves the preparation error so the supervisor can
+    /// refuse to spawn rather than silently falling back to a process group.
+    pub fn prepare_required() -> io::Result<Cgroup> {
+        try_prepare(true).map_err(io::Error::other)
+    }
+
     /// The fallible core of [`prepare`], separated so each failure carries a
     /// reason for the warning.
-    fn try_prepare() -> Result<Cgroup, String> {
+    fn try_prepare(required: bool) -> Result<Cgroup, String> {
         if !is_cgroup2() {
             return Err("no cgroup v2 unified hierarchy".into());
         }
@@ -223,9 +246,23 @@ mod imp {
                 format!("cannot open cgroup.procs: {e}")
             })?;
 
+        let kill_fd = if required {
+            match OpenOptions::new().write(true).open(dir.join("cgroup.kill")) {
+                Ok(fd) => Some(fd),
+                Err(e) => {
+                    drop(procs);
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err(format!("cannot open cgroup.kill: {e}"));
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Cgroup {
             dir,
             procs: procs.into(),
+            kill_fd,
         })
     }
 
@@ -373,6 +410,11 @@ pub fn prepare() -> Option<Cgroup> {
     imp::prepare()
 }
 
+#[cfg(target_os = "linux")]
+pub fn prepare_required() -> std::io::Result<Cgroup> {
+    imp::prepare_required()
+}
+
 #[cfg(not(target_os = "linux"))]
 mod stub {
     /// Uninhabited on non-Linux: containment is never active, so no method of
@@ -423,4 +465,12 @@ pub use stub::{Cgroup, Placement};
 #[cfg(not(target_os = "linux"))]
 pub fn prepare() -> Option<Cgroup> {
     None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn prepare_required() -> std::io::Result<Cgroup> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "cgroup v2 containment requires Linux",
+    ))
 }

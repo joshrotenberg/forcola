@@ -90,7 +90,9 @@ defmodule Forcola do
       child runs in a dedicated cgroup so descendants that escape the
       process group by deliberately daemonizing are still reaped. Linux
       only, requires cgroup delegation, and falls back with a warning
-      otherwise. See ["cgroup containment"](#run/2-cgroup-containment).
+      otherwise. Use `:required` to refuse to execute the child unless
+      placement and `cgroup.kill` are available. See
+      ["cgroup containment"](#run/2-cgroup-containment).
 
   ## cgroup containment
 
@@ -108,11 +110,18 @@ defmodule Forcola do
   or wrapping the run in `systemd-run --user --scope`. See the [process
   groups guide](process_groups.html#deliberate-daemonizers).
 
-  It never turns into an error. On macOS, on non-cgroup-v2 systems, or
+  With `cgroup: true`, unavailability never turns into an error. On macOS, on non-cgroup-v2 systems, or
   when the subtree is not writable/delegated, `cgroup: true` degrades to
   the ordinary process-group kill and logs a warning from the shim; the
   group-kill guarantee (ordinary grandchildren still die) is unchanged. A
   `Logger.debug` line is emitted when containment was actually active.
+
+  Use `cgroup: :required` when fallback would be unsafe. The shim verifies a
+  delegated cgroup and writable `cgroup.kill` before spawning, and the child
+  joins that cgroup before exec. If either step fails, the command does not
+  execute and the normal spawn-error path reports the failure. This mode is
+  Linux-only. It contains descendants of the child, not work started through
+  a daemon or scheduler outside its process tree.
 
   ## Running as a different user
 
