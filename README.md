@@ -38,6 +38,31 @@ a trusted executable path, and pass `shim_path: path` to any execution mode.
 The [escript installation example](https://hexdocs.pm/forcola/getting_started.html#mix-escripts)
 covers extraction, permissions, and cleanup.
 
+## Observe a bounded run's output
+
+Pass `output_observer: {observer_pid, run_ref}` to `Forcola.run/2` to receive
+raw output while the command is still running:
+
+```elixir
+Forcola.run(["my-cli", "--json"],
+  timeout_ms: 60_000,
+  output_observer: {observer_pid, run_ref}
+)
+# observer_pid receives {run_ref, {:stdout, bytes}} or
+# {run_ref, {:stderr, bytes}} for each output frame.
+```
+
+The target must be a local PID and the tag a reference. The collector sends
+notifications before returning the same exact final `Forcola.Result` it
+would return without an observer. Exit, timeout, and cleanup behavior stay
+the same; a dead observer does not affect the run.
+
+Frames are bytes, not lines or decoded messages. A frame can split a line or
+UTF-8 character. Notifications are opt-in and unacknowledged; the observer
+must drain its mailbox. They provide neither backpressure nor durable
+delivery. With `merge_stderr: true`, merged stderr is observed as stdout;
+leave merging disabled when the original channel matters.
+
 ## The problem
 
 The common Elixir timeout pattern leaks processes:

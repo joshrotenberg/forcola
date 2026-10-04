@@ -72,6 +72,20 @@ defmodule Forcola do
     * `:cd` - working directory.
     * `:env` - list of `{name, value}` strings.
     * `:merge_stderr` - route stderr into stdout; default `false`.
+    * `:output_observer` - optional `{local_pid, reference}` receiving
+      `{reference, {:stdout, bytes}}` and `{reference, {:stderr, bytes}}`
+      as raw output frames arrive. Notifications are sent by the collector
+      before `run/2` returns; the final result and termination behavior are
+      unchanged. A dead recipient is harmless. Invalid observers raise
+      `ArgumentError` before the shim is opened.
+
+      Frame boundaries are arbitrary: bytes may contain partial lines,
+      multiple lines, or incomplete UTF-8 sequences. Notifications are
+      unacknowledged and do not provide backpressure or durable delivery;
+      the recipient is responsible for draining its mailbox. With
+      `merge_stderr: true`, the shim already merged stderr into stdout, so
+      those bytes are reported as `:stdout`. Keep merging disabled when
+      the original output channel matters.
     * `:shim_path` - trusted absolute path to a matching native shim,
       overriding normal discovery. Also accepted by Stream, Duplex, and
       Daemon. The caller owns installation, permissions, protection from
@@ -166,6 +180,7 @@ defmodule Forcola do
   """
   @spec run([String.t(), ...], keyword()) :: {:ok, Result.t()} | {:error, run_error()}
   def run([_binary | _] = argv, opts) do
+    validate_output_observer!(Keyword.get(opts, :output_observer))
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
 
@@ -202,7 +217,11 @@ defmodule Forcola do
     deadline =
       System.monotonic_time(:millisecond) + timeout_ms + kill_grace_ms + @backstop_margin_ms
 
-    collect(port, %{stdout: [], stderr: []}, deadline)
+    collect(
+      port,
+      %{stdout: [], stderr: [], output_observer: Keyword.get(opts, :output_observer)},
+      deadline
+    )
   end
 
   defp collect(port, acc, deadline) do
@@ -227,9 +246,11 @@ defmodule Forcola do
   defp handle_frame(port, tag, payload, acc, deadline) do
     cond do
       tag == Shim.tag_stdout() ->
+        notify_output(acc.output_observer, :stdout, payload)
         collect(port, %{acc | stdout: [acc.stdout, payload]}, deadline)
 
       tag == Shim.tag_stderr() ->
+        notify_output(acc.output_observer, :stderr, payload)
         collect(port, %{acc | stderr: [acc.stderr, payload]}, deadline)
 
       tag == Shim.tag_exit() ->
@@ -245,6 +266,22 @@ defmodule Forcola do
       true ->
         collect(port, acc, deadline)
     end
+  end
+
+  defp validate_output_observer!(nil), do: :ok
+
+  defp validate_output_observer!({pid, reference})
+       when is_pid(pid) and node(pid) == node() and is_reference(reference),
+       do: :ok
+
+  defp validate_output_observer!(_observer),
+    do: raise(ArgumentError, "output_observer must be {local_pid, reference} or nil")
+
+  defp notify_output(nil, _channel, _bytes), do: :ok
+
+  defp notify_output({pid, reference}, channel, bytes) do
+    send(pid, {reference, {channel, bytes}})
+    :ok
   end
 
   defp log_contained do
