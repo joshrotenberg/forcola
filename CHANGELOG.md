@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/joshrotenberg/forcola/compare/v0.5.0...v0.6.0) (2026-10-04)
+
+
+### Features
+
+* observe raw output during bounded runs (closes [#90](https://github.com/joshrotenberg/forcola/issues/90)) ([#91](https://github.com/joshrotenberg/forcola/issues/91)) ([3d2c55f](https://github.com/joshrotenberg/forcola/commit/3d2c55f60a50dbd5ae862f6678a0ff83fd8f1d45))
+
 ## [0.5.0](https://github.com/joshrotenberg/forcola/compare/v0.4.0...v0.5.0) (2026-10-01)
 
 
