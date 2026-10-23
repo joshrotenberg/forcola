@@ -8,7 +8,8 @@ defmodule Forcola.Shim do
   toolchain; a locally built binary in `priv/` takes precedence during
   development.
 
-  Wire protocol (BEAM <-> shim), v0, documented in full in
+  Wire protocol (BEAM <-> shim), legacy framing plus optional version 1
+  capability negotiation, documented in full in
   `native/forcola_shim/src/main.rs`:
 
   Frames are `{:packet, 4}`-style: a 4-byte big-endian length prefix
@@ -56,6 +57,71 @@ defmodule Forcola.Shim do
   def tag_exit, do: @tag_exit
   @doc false
   def tag_error, do: @tag_error
+
+  @doc false
+  def negotiate(port, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
+    send_frame(port, 0x07)
+
+    receive do
+      {^port, {:data, <<0x15, payload::binary>>}} ->
+        decode_capabilities(payload)
+
+      {^port, {:data, <<@tag_error, payload::binary>>}} ->
+        # Legacy shims explicitly reject HELLO because they expect SPAWN.
+        case decode_json(payload) do
+          {:ok, %{"reason" => reason}} when is_binary(reason) -> {:error, :incompatible_shim}
+          _ -> {:error, :invalid_handshake}
+        end
+
+      {^port, {:exit_status, status}} ->
+        {:error, {:shim_exited, status}}
+
+      {^port, :guard_closed} ->
+        {:error, {:shim_exited, :unknown}}
+
+      {^port, _event} ->
+        {:error, :invalid_handshake}
+    after
+      timeout_ms -> {:error, :handshake_timeout}
+    end
+  end
+
+  defp decode_capabilities(payload) do
+    case decode_json(payload) do
+      {:ok, %{"protocol" => protocol, "features" => features}}
+      when is_integer(protocol) and is_list(features) ->
+        cond do
+          not Enum.all?(features, &is_binary/1) -> {:error, :invalid_handshake}
+          protocol == 1 and "bounded_run_v1" in features -> :ok
+          true -> {:error, :incompatible_shim}
+        end
+
+      _ ->
+        {:error, :invalid_handshake}
+    end
+  end
+
+  @doc false
+  def reject_run_options!(opts, mode, supported \\ []) do
+    for key <- [
+          :idle_timeout_ms,
+          :max_output_bytes,
+          :env_mode,
+          :interrupt_signal,
+          :interrupt_grace_ms
+        ],
+        key not in supported,
+        Keyword.has_key?(opts, key) do
+      raise ArgumentError, "#{mode} does not support :#{key}; use Forcola.run/2"
+    end
+  end
+
+  @doc false
+  def decode_json(payload) do
+    {:ok, :json.decode(payload)}
+  rescue
+    _ -> {:error, :invalid_json}
+  end
 
   @doc """
   Absolute path to the shim binary for the current target.
@@ -271,6 +337,13 @@ defmodule Forcola.Shim do
   @doc """
   Encodes a SPAWN frame payload from `Forcola.run/2` options.
 
+  One-shot strict runs negotiate protocol 1 / `bounded_run_v1` before SPAWN.
+  `:env_mode` encodes inheritance or replacement; the paired
+  `:interrupt_signal`/`:interrupt_grace_ms` requests cooperative INT before
+  TERM/KILL, including on owner EOF. Only `Forcola.run/2` validates these new
+  public options and requires the capability exchange. Stream, Duplex, and
+  Daemon reject these one-shot options before opening a shim.
+
   Shared by all four modes. Besides `:cd`/`:env`/`:merge_stderr`/`:timeout_ms`/
   `:kill_grace_ms` and the pty options, it threads `:user` and `:group` (each a
   string name or an integer id) through to the shim so the child can be run as a
@@ -301,6 +374,9 @@ defmodule Forcola.Shim do
     |> maybe_put("env", encode_env(Keyword.get(opts, :env)))
     |> maybe_put("timeout_ms", Keyword.get(opts, :timeout_ms))
     |> maybe_put("kill_grace_ms", Keyword.get(opts, :kill_grace_ms))
+    |> maybe_put("env_mode", encode_atom(Keyword.get(opts, :env_mode)))
+    |> maybe_put("interrupt_signal", encode_atom(Keyword.get(opts, :interrupt_signal)))
+    |> maybe_put("interrupt_grace_ms", Keyword.get(opts, :interrupt_grace_ms))
     |> maybe_put("user", Keyword.get(opts, :user))
     |> maybe_put("group", Keyword.get(opts, :group))
     |> maybe_put("window_bytes", Keyword.get(opts, :window_bytes))
@@ -341,6 +417,9 @@ defmodule Forcola.Shim do
       map
     end
   end
+
+  defp encode_atom(nil), do: nil
+  defp encode_atom(value), do: Atom.to_string(value)
 
   defp encode_env(nil), do: nil
   defp encode_env(env), do: Map.new(env)

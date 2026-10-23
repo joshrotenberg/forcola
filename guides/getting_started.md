@@ -544,3 +544,54 @@ set the initial size only.
   existing CLI wrapper library.
 - The [alternatives guide](alternatives.html) compares Forcola with other
   external-process libraries for the BEAM.
+
+## One-shot output and idle bounds
+
+`Forcola.run(argv, timeout_ms: whole, idle_timeout_ms: idle,
+max_output_bytes: total)` enforces independent whole-run and idle deadlines
+and a cumulative stdout-plus-stderr byte limit. New integer options must be
+positive and at most `4_294_967_295`. The exact limit succeeds; the next byte
+returns `{:error, {:max_output_bytes, partial_result}}`. Idle expiry returns
+`{:error, {:idle_timeout, partial_result}}`. Output resets only the idle clock.
+Finite 8 KiB credits on each pipe bound pending output before accumulation and
+observer notification, including unterminated lines and the final drain.
+Without a cumulative byte option, capture can still grow until the time bound.
+
+Use `env_mode: :replace` to clear inherited variables before applying `env:`;
+`:inherit` remains the default. With new options, explicit environment input
+is a list of binary string pairs; names must be nonempty without `=` or NUL,
+and values must have no NUL. Without new options, legacy `nil`, maps, and atom
+names retain their existing encoding and native spawn-error behavior.
+
+Use `interrupt_signal: :int, interrupt_grace_ms: 500` for cooperative SIGINT
+before TERM/KILL on every native termination path, including owner/VM death.
+These two options must be supplied together. This reaches a separate-group
+child only if its parent cooperates; it does not contain escaped descendants.
+
+New options perform a capability handshake before
+SPAWN. A mismatch returns `{:error, {:spawn, :incompatible_shim}}` without
+executing a child. A stalled exchange uses `:handshake_timeout`, malformed
+replies use `:invalid_handshake`, and transport exit before SPAWN uses
+`{:shim_exited, status}` in the same spawn-reason tuple. With new options,
+`timeout_ms` must be an integer in `0..4_294_967_295`; opening and negotiation
+consume the same execution deadline. Cleanup has additional bounded time.
+`cgroup: :required` alone keeps its existing enforcement and legacy collector
+without negotiation. Stream, Duplex, and Daemon reject the new environment
+and interrupt options before opening a shim. Stream and Daemon also reject
+`max_output_bytes`; Duplex retains its existing support with `delivery: :pull`.
+Duplex and Daemon reject `idle_timeout_ms`; Stream retains its existing idle
+option. These existing mode options keep their own validation and semantics.
+Spawn errors after SPAWN with new options carry partial output in
+`{:error, {:spawn, {reason, partial_result}}}`. Malformed EXIT uses
+`{:error, {:spawn, {:invalid_exit, partial_result}}}`; missing EXIT uses the
+existing `{:error, {:spawn, {:shim_exited, partial_result}}}` shape. A timeout
+or limit already in progress retains its reason across later transport loss.
+
+Every returned `Forcola.Result` has an evidence map. Inspect its raw
+`child_status`/`child_signal`, `termination`, `reason`, `output_truncated`,
+`cleanup`, `scope`, and `guard_close` separately. Missing/malformed cleanup
+information is unknown. Confirmed process-group cleanup says nothing about a
+child that escaped the group. An early JSON response is never terminal proof.
+Strict drain waits for pipe closure after root exit. An escaped child holding
+a pipe can leave `child_status: 0` alongside `reason: :timeout` or
+`:idle_timeout`; consume both facts independently.

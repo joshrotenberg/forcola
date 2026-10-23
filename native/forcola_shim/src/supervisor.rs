@@ -8,7 +8,7 @@ use crate::frame::{
     TAG_STDERR_CREDIT, TAG_STDIN, TAG_STDOUT,
 };
 use crate::privdrop::{self, DropPlan};
-use crate::protocol::{CgroupMode, ErrorReport, ExitReport, SpawnRequest};
+use crate::protocol::{CgroupMode, EnvMode, ErrorReport, ExitReport, SpawnRequest};
 
 use rustix::process::{self, Pid, Signal};
 use std::fs::File;
@@ -54,10 +54,24 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
 ) -> io::Result<()> {
     let out = Arc::new(Mutex::new(stdout));
 
-    // The first frame must be SPAWN; anything else is a protocol error we
-    // report and exit on, since there is nothing else useful to do without
-    // a child to supervise.
-    let spawn_frame = match frame::read_frame(&mut stdin)? {
+    // SPAWN is mandatory, with an optional capability request before it.
+    // Optional capability exchange MUST finish before any child is spawned.
+    // Old shims reject this first tag instead of ignoring new SPAWN keys.
+    let first = frame::read_frame(&mut stdin)?;
+    let first = match first {
+        Some(f) if f.tag == 0x07 => {
+            let mut w = out.lock().unwrap();
+            frame::write_frame(
+                &mut *w,
+                0x15,
+                br#"{"protocol":1,"features":["bounded_run_v1"]}"#,
+            )?;
+            drop(w);
+            frame::read_frame(&mut stdin)?
+        }
+        other => other,
+    };
+    let spawn_frame = match first {
         Some(f) if f.tag == TAG_SPAWN => f,
         Some(_) => {
             write_error(&out, "expected SPAWN as the first frame");
@@ -73,6 +87,17 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
             return Ok(());
         }
     };
+
+    if !matches!(
+        (request.interrupt_signal, request.interrupt_grace_ms),
+        (None, None) | (Some(_), Some(1..=4_294_967_295))
+    ) {
+        write_error(
+            &out,
+            "interrupt_signal requires a positive interrupt_grace_ms (u32)",
+        );
+        return Ok(());
+    }
 
     let (mut child, pty_master, cgroup) = match spawn_child(&request) {
         Ok(c) => c,
@@ -180,6 +205,7 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         credit.as_ref(),
         stderr_credit.as_ref(),
         request.strict_output,
+        request.interrupt_grace_ms.map(Duration::from_millis),
     );
 
     // Backpressure linger: the child is reaped and the EXIT frame is written,
@@ -231,6 +257,9 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>, Op
 
     if let Some(cd) = &request.cd {
         cmd.current_dir(cd);
+    }
+    if request.env_mode == EnvMode::Replace {
+        cmd.env_clear();
     }
     if !request.env.is_empty() {
         cmd.envs(&request.env);
@@ -537,6 +566,7 @@ fn supervise<W: Write>(
     credit: Option<&Credit>,
     stderr_credit: Option<&Credit>,
     strict_output: bool,
+    interrupt_grace: Option<Duration>,
 ) -> bool {
     let mut timed_out = false;
     let mut beam_gone = false;
@@ -563,7 +593,7 @@ fn supervise<W: Write>(
                 discard_output = true;
                 if !group_cleanup_started {
                     group_cleanup_started = true;
-                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup, interrupt_grace);
                 }
             }
             Ok(Event::Stdin(f)) if f.tag == TAG_CREDIT => {
@@ -591,7 +621,7 @@ fn supervise<W: Write>(
                 beam_gone = true;
                 if !group_cleanup_started {
                     group_cleanup_started = true;
-                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup, interrupt_grace);
                 }
             }
             Ok(Event::StdinError(e)) => {
@@ -600,7 +630,7 @@ fn supervise<W: Write>(
                 beam_gone = true;
                 if !group_cleanup_started {
                     group_cleanup_started = true;
-                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup, interrupt_grace);
                 }
             }
             Ok(Event::TimedOut) => {
@@ -608,7 +638,7 @@ fn supervise<W: Write>(
                 timed_out = true;
                 if !group_cleanup_started {
                     group_cleanup_started = true;
-                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup, interrupt_grace);
                 }
             }
             Ok(Event::ChildExited(outcome)) => {
@@ -619,7 +649,7 @@ fn supervise<W: Write>(
                 // sequence before reporting EXIT so every ordinary descendant
                 // is gone when the BEAM sees the leader's status.
                 if !group_cleanup_started {
-                    group_confirmed = kill_group(pgid, kill_grace, cgroup);
+                    group_confirmed = kill_group(pgid, kill_grace, cgroup, interrupt_grace);
                 }
                 break Some(outcome);
             }
@@ -816,7 +846,8 @@ fn drain_pumps_strict(
     (true, false, false)
 }
 
-/// SIGTERM the whole process group, then SIGKILL after `grace` if it
+/// Optionally SIGINT the group with its own grace, then SIGTERM and SIGKILL
+/// after `grace` if it
 /// hasn't died. Confirms death via a signal-0 liveness probe before
 /// returning. Returns false when the hard post-SIGKILL deadline expires while
 /// the group still appears alive.
@@ -827,7 +858,21 @@ fn drain_pumps_strict(
 /// SIGTERM/SIGKILL group sequence is unchanged; the cgroup write is added at
 /// the end. The final drain-and-rmdir happens once, after the child is reaped,
 /// in `finish_cgroup`.
-fn kill_group(pgid: Pid, grace: Duration, cgroup: Option<&Cgroup>) -> bool {
+fn kill_group(
+    pgid: Pid,
+    grace: Duration,
+    cgroup: Option<&Cgroup>,
+    interrupt_grace: Option<Duration>,
+) -> bool {
+    if let Some(grace) = interrupt_grace {
+        let _ = process::kill_process_group(pgid, Signal::INT);
+        if wait_until(grace, Duration::from_millis(10), || !group_alive(pgid)) {
+            if let Some(cg) = cgroup {
+                cg.kill();
+            }
+            return true;
+        }
+    }
     let _ = process::kill_process_group(pgid, Signal::TERM);
 
     let mut confirmed = wait_until(grace, Duration::from_millis(20), || !group_alive(pgid));

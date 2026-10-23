@@ -186,3 +186,27 @@ above. On macOS nothing can contain a deliberate daemonizer, which is equally
 true of erlexec and MuonTrap, so `cgroup: true` falls back to the process-group
 kill there. Windows support is tracked separately in
 [#34](https://github.com/joshrotenberg/forcola/issues/34).
+
+## Cooperative interrupt and one-shot evidence
+
+`Forcola.run/2` can opt in to `interrupt_signal: :int` together with a positive
+`interrupt_grace_ms` (at most `4_294_967_295`). The native supervisor sends INT
+to its process group, waits that grace, and then runs the existing TERM/KILL
+sequence if the group is still alive. Timeout, explicit KILL, normal leader
+exit cleanup, and stdin EOF all use this single sequence. Defaults retain the
+existing behavior. Closing an owner's port or SIGKILLing a BEAM still reaches
+the native EOF path, with no second BEAM-side process killer.
+
+A cooperative parent can use INT to stop a child that changed process groups.
+An uncooperative escaped child cannot be positively contained by this mechanism
+on macOS. No descendant walking is performed. This is only the cooperative
+portion of issue #93, not complete containment of escaped descendants.
+
+One-shot results now retain raw child exit/signal alongside cleanup evidence.
+Only explicit valid confirmation can produce `cleanup: :confirmed`; scope is
+`:process_group` or `:active_cgroup` only when reported by the shim. Missing or
+malformed EXIT is unknown, and guard close has its own result. A confirmed
+process group can coexist with an escaped survivor, so evidence must never be
+promoted to whole-tree safety by an adapter. The terminal bounded reason
+remains authoritative even if stdout already contains apparently successful
+JSON or transport subsequently fails.

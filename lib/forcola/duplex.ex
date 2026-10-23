@@ -190,6 +190,10 @@ defmodule Forcola.Duplex do
 
   There is no `:timeout_ms`; the session is bounded by its owner process
   and `close/1`. Passing `:timeout_ms` raises `ArgumentError`.
+  The one-shot options `:idle_timeout_ms`, `:env_mode`,
+  `:interrupt_signal`, and `:interrupt_grace_ms` also raise `ArgumentError`
+  before a session or shim is started. The existing `:max_output_bytes`
+  option remains supported only with `delivery: :pull`.
 
   A spawn failure (e.g. a missing binary) is asynchronous: `open/2`
   still returns `{:ok, session}` and the failure arrives as
@@ -546,6 +550,7 @@ defmodule Forcola.Duplex do
   ## Option validation
 
   defp validate_opts!(argv, opts) do
+    Shim.reject_run_options!(opts, __MODULE__, [:max_output_bytes])
     validate_timeout_opt!(opts)
     validate_pty_opt!(opts)
     validate_argv!(argv)

@@ -17,7 +17,7 @@
 //! - EOF on the shim's stdin means the BEAM died; the shim kills the group
 //!   and exits
 //!
-//! Wire protocol (BEAM <-> shim), v0 draft:
+//! Wire protocol (BEAM <-> shim), legacy framing with optional v1 handshake:
 //!
 //! Frames are `{:packet, 4}`-style: a 4-byte big-endian length prefix, then
 //! a 1-byte tag, then the payload.
@@ -26,7 +26,8 @@
 //!   0x01 SPAWN   payload: JSON {argv, cd, env, merge_stderr, timeout_ms,
 //!                               kill_grace_ms, pty, pty_rows, pty_cols,
 //!                               user, group, cgroup, window_bytes,
-//!                               stderr_window_bytes, strict_output}
+//!                               stderr_window_bytes, strict_output, env_mode,
+//!                               interrupt_signal, interrupt_grace_ms}
 //!   0x02 STDIN   payload: bytes for the child's stdin (duplex mode)
 //!   0x03 EOF     close the child's stdin
 //!   0x04 KILL    kill the group now
@@ -35,7 +36,12 @@
 //!                (only when SPAWN carried window_bytes)
 //!   0x06 STDERR_CREDIT  same payload, for the separately gated stderr pump
 //!
+//!   0x07 HELLO   optional first frame, before SPAWN; no child runs yet
+//!
 //! shim -> BEAM:
+//!   0x15 HELLO   JSON {protocol: 1, features: ["bounded_run_v1"]}
+//!                Confirms strict credit drain, env replacement and INT grace.
+//!                An old shim rejects HELLO rather than ignoring SPAWN keys.
 //!   0x11 STDOUT  payload: bytes from the child's stdout
 //!   0x12 STDERR  payload: bytes from the child's stderr
 //!   0x13 EXIT    payload: JSON {status | signal, timed_out, confirmed,
