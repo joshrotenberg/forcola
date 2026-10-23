@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/joshrotenberg/forcola/compare/v0.6.0...v0.7.0) (2026-10-23)
+
+
+### Features
+
+* bound one-shot execution and preserve terminal evidence ([b6de760](https://github.com/joshrotenberg/forcola/commit/b6de760b6cdc3f9e316cff5754a603378930b1ee))
+
 ## [0.6.0](https://github.com/joshrotenberg/forcola/compare/v0.5.0...v0.6.0) (2026-10-04)
 
 
