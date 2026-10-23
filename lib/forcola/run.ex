@@ -378,7 +378,9 @@ defmodule Forcola.Run do
   defp validate_observer!(nil), do: :ok
 
   defp validate_observer!({pid, ref})
-       when is_pid(pid) and node(pid) == node() and is_reference(ref), do: :ok
+       when is_pid(pid) and node(pid) == node() and is_reference(ref) do
+    :ok
+  end
 
   defp validate_observer!(_),
     do: raise(ArgumentError, "output_observer must be {local_pid, reference} or nil")
