@@ -13,6 +13,14 @@ pub struct SpawnRequest {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub merge_stderr: bool,
+    /// Explicit replacement clears the inherited environment before envs.
+    #[serde(default)]
+    pub env_mode: EnvMode,
+    /// Optional cooperative group signal before the existing TERM/KILL path.
+    #[serde(default)]
+    pub interrupt_signal: Option<InterruptSignal>,
+    #[serde(default)]
+    pub interrupt_grace_ms: Option<u64>,
     /// Milliseconds before the child is killed for running too long. `None`
     /// (or absent) means no timeout is enforced by the shim.
     #[serde(default)]
@@ -72,6 +80,22 @@ pub struct SpawnRequest {
     /// granting credit to drain output or send KILL to discard it explicitly.
     #[serde(default)]
     pub strict_output: bool,
+}
+
+/// Environment handling; inheritance remains the wire default.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvMode {
+    #[default]
+    Inherit,
+    Replace,
+}
+
+/// Deliberately narrow cooperative signal contract.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptSignal {
+    Int,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -158,6 +182,9 @@ mod tests {
         assert_eq!(req.cd, None);
         assert!(req.env.is_empty());
         assert!(!req.merge_stderr);
+        assert_eq!(req.env_mode, EnvMode::Inherit);
+        assert_eq!(req.interrupt_signal, None);
+        assert_eq!(req.interrupt_grace_ms, None);
         assert_eq!(req.timeout_ms, None);
         assert_eq!(req.kill_grace_ms, 5_000);
         assert!(!req.pty);
@@ -169,6 +196,24 @@ mod tests {
         assert_eq!(req.window_bytes, None);
         assert_eq!(req.stderr_window_bytes, None);
         assert!(!req.strict_output);
+    }
+
+    #[test]
+    fn replacement_and_interrupt_fields_are_typed() {
+        let req: SpawnRequest = serde_json::from_str(
+            r#"{"argv":["true"],"env_mode":"replace","interrupt_signal":"int","interrupt_grace_ms":500}"#,
+        ).unwrap();
+        assert_eq!(req.env_mode, EnvMode::Replace);
+        assert_eq!(req.interrupt_signal, Some(InterruptSignal::Int));
+        assert_eq!(req.interrupt_grace_ms, Some(500));
+        assert!(
+            serde_json::from_str::<SpawnRequest>(r#"{"argv":["true"],"env_mode":"unknown"}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<SpawnRequest>(
+            r#"{"argv":["true"],"interrupt_signal":"term"}"#
+        )
+        .is_err());
     }
 
     #[test]

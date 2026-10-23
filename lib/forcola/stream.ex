@@ -11,6 +11,10 @@ defmodule Forcola.Stream do
       |> Stream.map(&:json.decode/1)
       |> Enum.to_list()
 
+  `:env_mode`, `:interrupt_signal`, `:interrupt_grace_ms`, and
+  `:max_output_bytes` are one-shot `Forcola.run/2` options. Passing them raises
+  `ArgumentError` when `lines/2` is called, before a shim is opened.
+
   ## Termination semantics
 
     * A zero exit ends the stream cleanly.
@@ -175,11 +179,13 @@ defmodule Forcola.Stream do
   @doc """
   Run `argv` and return its stdout as a lazy stream of lines.
 
-  Takes the same options as `Forcola.run/2`, including the trusted
+  Takes the common execution options from `Forcola.run/2`, including the trusted
   `:shim_path` override and `:user`/`:group`
   for running the child as a different user (POSIX-only, fail-closed,
   privileged shim required); `:timeout_ms` is required and bounds the
   whole run, not the gap between lines.
+  `:env_mode`, `:interrupt_signal`, `:interrupt_grace_ms`, and
+  `:max_output_bytes` raise `ArgumentError` before opening a shim.
 
   The child's stdin is closed immediately after spawn, as in `Forcola.run/2`:
   this mode has no way to write to it, so a child that reads until EOF sees
@@ -219,6 +225,7 @@ defmodule Forcola.Stream do
   """
   @spec lines([String.t(), ...], keyword()) :: Enumerable.t()
   def lines([_binary | _] = argv, opts) do
+    Shim.reject_run_options!(opts, __MODULE__, [:idle_timeout_ms])
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
     idle_timeout_ms = Keyword.get(opts, :idle_timeout_ms)

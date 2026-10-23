@@ -52,8 +52,8 @@ Forcola.run(["my-cli", "--json"],
 # {run_ref, {:stderr, bytes}} for each output frame.
 ```
 
-The target must be a local PID and the tag a reference. The collector sends
-notifications before returning the same exact final `Forcola.Result` it
+The target must be a local PID and the tag a reference. On legacy runs, the collector sends
+notifications before returning the same final `Forcola.Result` it
 would return without an observer. Exit, timeout, and cleanup behavior stay
 the same; a dead observer does not affect the run.
 
@@ -62,6 +62,67 @@ UTF-8 character. Notifications are opt-in and unacknowledged; the observer
 must drain its mailbox. They provide neither backpressure nor durable
 delivery. With `merge_stderr: true`, merged stderr is observed as stdout;
 leave merging disabled when the original channel matters.
+
+## Bound output, idle time, and environment
+
+```elixir
+Forcola.run(["/absolute/path/to/cli", "--json"],
+  timeout_ms: 60_000,
+  idle_timeout_ms: 10_000,
+  max_output_bytes: 1_048_576,
+  env_mode: :replace,
+  env: [{"PATH", "/usr/bin:/bin"}],
+  interrupt_signal: :int,
+  interrupt_grace_ms: 500
+)
+```
+
+The new integer options must be positive and at most `4_294_967_295`.
+Output bytes count stdout and stderr together, including partial lines. Exactly
+the limit is allowed; an additional byte cancels. The captured and observed
+prefix never exceeds it. Finite credits keep at most 8 KiB per output pipe in
+flight. The independent whole-run deadline never resets on output; the idle
+deadline does. Without `max_output_bytes`, captured output has no cumulative
+memory limit. `env_mode: :inherit` remains the default; `:replace` clears the
+environment before applying the validated `{name, value}` string pairs.
+Without a new strict option, legacy `env: nil`, maps, and atom names keep
+their existing encoding and spawn-error behavior.
+
+The optional signal/grace pair sends process-group SIGINT before the existing
+TERM/KILL sequence on timeout, explicit cancellation, and owner or BEAM death.
+A cooperative parent can use that opportunity to stop children in other groups.
+An uncooperative escaped child remains outside group cleanup on macOS.
+
+These options require a matching shim capability exchange before child
+execution. Older shims return `{:error, {:spawn, :incompatible_shim}}`.
+Handshake stalls return `{:error, {:spawn, :handshake_timeout}}`, malformed
+replies return `{:error, {:spawn, :invalid_handshake}}`, and transport exit
+before SPAWN returns `{:error, {:spawn, {:shim_exited, status}}}`. With new
+options, `timeout_ms` is an integer in `0..4_294_967_295` and includes startup
+negotiation; SPAWN receives only its remaining budget. Cleanup and guard close
+can extend beyond that execution deadline (see `Forcola.run/2`).
+`cgroup: :required` alone keeps legacy collection and errors without HELLO;
+its existing required-containment wire encoding remains enforced.
+Stream, Duplex, and Daemon reject the new one-shot environment and interrupt
+options before opening a shim. Stream and Daemon also reject `max_output_bytes`;
+Duplex keeps its existing support with `delivery: :pull`. Duplex and Daemon
+reject `idle_timeout_ms`; Stream keeps its existing idle option. These existing
+mode options keep their own validation and semantics.
+Bounded failures return `{:error, {reason, partial_result}}`, with reason
+`:timeout`, `:idle_timeout`, `:max_output_bytes`, or `:observer_overflow`.
+Strict observers cancel at 1,024 queued messages rather than growing the
+recipient's mailbox indefinitely; notifications remain unacknowledged.
+
+`result.evidence` keeps raw `child_status` and `child_signal`, `termination`,
+`reason`, `output_truncated`, `cleanup`, `scope`, and `guard_close` independent
+of the legacy status. Only explicit valid EXIT evidence confirms cleanup.
+Strict drain waits for pipe closure after root exit. An escaped descendant
+holding a pipe can cause `reason: :timeout` or `:idle_timeout` even with
+`child_status: 0`; wrappers must consume those facts independently.
+`:process_group` confirmation never proves whole-tree containment. Early JSON
+on stdout is partial output until the terminal result arrives. See
+[`Forcola.Result`](https://hexdocs.pm/forcola/Forcola.Result.html) for field values
+and [`Forcola.run/2`](https://hexdocs.pm/forcola/Forcola.html#run/2) for error shapes.
 
 ## The problem
 

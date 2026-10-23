@@ -263,3 +263,75 @@ timeout, cleanup on BEAM death), the migration is mechanical:
 This mapping covers the shared group-kill contract, not erlexec's broader
 PTY, privilege, cgroup resource-limit, or shared-port APIs. Check those needs
 against the [alternatives guide](alternatives.html) before migrating.
+
+## Bounded one-shot adapter contract
+
+`Forcola.run/2` keeps its existing `{:ok, %Forcola.Result{}}` shape for all child
+exit codes and signals, and its existing timeout/spawn tuples on legacy runs.
+`Result` adds a defaulted `evidence: nil` field; `run/2` fills it. Struct patterns
+continue to work; wrappers doing exact map comparisons should account for the
+new field.
+
+Adapters may pass positive `idle_timeout_ms` and `max_output_bytes` (combined
+stdout/stderr), `env_mode: :inherit | :replace`, and the paired
+`interrupt_signal: :int, interrupt_grace_ms: positive_integer`. Each new integer
+is at most `4_294_967_295`. Invalid options raise before opening a shim. The
+trusted `shim_path:` override remains available. Explicit new options
+require protocol 1 / `bounded_run_v1` capability support
+before SPAWN; incompatible shims cannot silently execute with ignored options.
+Stream, Duplex, and Daemon reject `env_mode` and the interrupt pair before
+opening a shim. Stream and Daemon also reject `max_output_bytes`; Duplex
+keeps its existing support with `delivery: :pull`. Duplex and Daemon reject
+`idle_timeout_ms`; Stream keeps its existing idle-timeout support. These
+existing mode options keep their own validation and semantics.
+With any new option, explicit `env:` must be a list of binary string pairs
+with nonempty names, no `=` in names, and no NUL in names or values. Without
+new options, legacy `env: nil`, maps, and atom keys retain their existing
+encoding and native spawn-error behavior.
+
+Handle `{:error, {reason, partial_result}}` for `:timeout`, `:idle_timeout`,
+`:max_output_bytes`, and `:observer_overflow`. With new options, a reported
+spawn failure after SPAWN is `{:error, {:spawn, {reason, partial_result}}}`.
+Malformed EXIT is `{:error, {:spawn, {:invalid_exit, partial_result}}}` and
+transport loss remains `{:error, {:spawn, {:shim_exited, partial_result}}}`.
+Pre-execution discovery/handshake errors keep `{:error, {:spawn, reason}}`:
+`:incompatible_shim` for a rejected HELLO or valid incompatible capabilities,
+`:handshake_timeout` for a stalled exchange, `:invalid_handshake` for malformed
+or unexpected replies, and `{:shim_exited, status}` for transport exit before
+SPAWN. Here `status` is an OS exit code, `{:shim_error, reason}` for a driver
+failure, or `:unknown` if unavailable; it is not a partial child result.
+`cgroup: :required` alone preserves legacy collection and spawn errors without
+HELLO. Its existing `"required"` wire encoding still refuses unsupported
+containment. Adding a new option requires capabilities as usual.
+A bounded failure retains its original reason even if transport is then lost.
+
+With new options, `timeout_ms` must be an integer in `0..4_294_967_295`.
+Its deadline starts before opening the shim; negotiation consumes that same
+budget and SPAWN receives only the remainder. Idle timing starts after
+negotiation. Port opening is synchronous, so its OS latency and final guard
+close may exceed the deadline. After SPAWN, cancellation allows interrupt
+grace plus kill grace and a 5-second collection backstop; final guard close
+has a separate 5-second bound. Handshake failure closes the guard without
+spawning a child and does not restart an execution allowance.
+
+Strict draining waits for both output pipes after root exit and remains
+bounded by the whole-run or idle cancellation deadline. If an escaped
+descendant retains a pipe after the root exits zero, the final run can report
+`reason: :timeout` or `:idle_timeout` with `child_status: 0`. Read these fields
+independently. Group cleanup evidence does not prove escaped descendants died.
+
+Treat `result.evidence` as independent fields, not a success flag. It records
+raw direct-child `child_status`/`child_signal`, protocol/transport `termination`,
+bounded `reason`, `output_truncated` (boolean or `:unknown`), `cleanup`
+(`:confirmed | :unconfirmed | :unknown`), `scope`
+(`:process_group | :active_cgroup | :unknown`), and `guard_close`
+(`:ok | {:error, :guard_close_timeout}`). Missing confirmation stays unknown
+even when a legacy status projects to success for compatibility. A raw child
+exit remains available when cleanup was explicitly unconfirmed.
+
+Observers receive only the retained prefix. Strict runs cancel with
+`:observer_overflow` when the recipient's total queue already has 1,024
+messages. Other senders can grow that queue independently. Delivery remains
+unacknowledged; wrappers needing durable output should consume the result.
+Never accept an early provider-like JSON frame as success before terminal
+evidence, or equate process-group confirmation with whole-tree safety.

@@ -20,6 +20,9 @@ defmodule Forcola.Daemon do
 
   Unlike bounded runs, a daemon has no `:timeout_ms`; its bound is its
   supervisor. Passing `:timeout_ms` raises `ArgumentError`.
+  The one-shot options `:idle_timeout_ms`, `:max_output_bytes`, `:env_mode`,
+  `:interrupt_signal`, and `:interrupt_grace_ms` also raise `ArgumentError`
+  before the GenServer or shim is started.
 
   ## Options
 
@@ -207,6 +210,8 @@ defmodule Forcola.Daemon do
   ## Option validation
 
   defp validate_opts!(opts) do
+    Shim.reject_run_options!(opts, __MODULE__)
+
     if Keyword.has_key?(opts, :timeout_ms) do
       raise ArgumentError,
             "Forcola.Daemon takes no :timeout_ms; a daemon's bound is its supervisor"

@@ -27,9 +27,7 @@ defmodule Forcola do
   guide](adopting_forcola.html).
   """
 
-  require Logger
-
-  alias Forcola.{Result, Shim}
+  alias Forcola.Result
 
   @typedoc """
   Errors a bounded run can return.
@@ -37,15 +35,9 @@ defmodule Forcola do
   The spawn reason describes shim discovery/startup, a failure reported
   by the shim, or `{:shim_exited, %Forcola.Result{}}`; see `run/2`.
   """
-  @type run_error :: {:timeout, Result.t()} | {:spawn, term()}
-
-  # Margin added on top of the shim's own kill_grace_ms when computing
-  # the Elixir-side backstop deadline: the shim already enforces
-  # timeout_ms and confirms group death within kill_grace_ms before
-  # sending EXIT, so this only fires if the shim itself never reports
-  # back (e.g. it's wedged or the BEAM<->shim pipe is stuck).
-  @backstop_margin_ms 5_000
-  @default_kill_grace_ms 5_000
+  @type run_error ::
+          {:timeout | :idle_timeout | :max_output_bytes | :observer_overflow, Result.t()}
+          | {:spawn, term()}
 
   @doc """
   Run `argv` (`[binary | args]`) to completion under the shim.
@@ -70,21 +62,49 @@ defmodule Forcola do
     * `:kill_grace_ms` - SIGTERM-to-SIGKILL grace in milliseconds,
       default `5_000`. Also accepted by `Forcola.Stream.lines/2`.
     * `:cd` - working directory.
-    * `:env` - list of `{name, value}` strings.
+    * `:idle_timeout_ms` - optional positive integer (at most `4_294_967_295`).
+      Cancels after this long without output, independently of `:timeout_ms`.
+      Returns `{:error, {:idle_timeout, partial_result}}`. Output never resets
+      the whole-run deadline.
+    * `:max_output_bytes` - optional positive integer (at most `4_294_967_295`),
+      counting stdout and stderr together. Exactly the limit is allowed; an
+      extra byte cancels with `{:error, {:max_output_bytes, partial_result}}`.
+      The captured and observed prefix never exceeds the limit, even for
+      unterminated output. Both pumps use finite 8 KiB credit windows, retained
+      through exit drain, bounding queued output as well as accumulation.
+    * `:interrupt_signal` / `:interrupt_grace_ms` - optional pair. The only
+      signal is `:int` (SIGINT); grace must be a positive integer at most
+      `4_294_967_295`. The native supervisor sends INT to the process group,
+      waits this grace, then applies the existing TERM/KILL escalation if
+      needed. This also applies on KILL requests and owner/BEAM EOF, including
+      a SIGKILLed VM. It lets a cooperative parent stop children in separate
+      groups; it cannot contain an uncooperative escaped descendant.
+    * `:env` - environment entries. Legacy calls accept `nil`, maps, and
+      lists of pairs, including atom names as supported by JSON encoding;
+      native spawn errors retain their ordinary spawn-reason tuple. With
+      any new strict option, explicit `:env` must be a list of `{name, value}`
+      binary strings. Names must be nonempty and contain no `=` or NUL;
+      values must contain no NUL.
+    * `:env_mode` - `:inherit` (default) or `:replace`. Replacement clears the
+      inherited environment before applying `:env`, including when it is empty.
+      Supply an absolute executable path when clearing PATH.
     * `:merge_stderr` - route stderr into stdout; default `false`.
     * `:output_observer` - optional `{local_pid, reference}` receiving
       `{reference, {:stdout, bytes}}` and `{reference, {:stderr, bytes}}`
       as raw output frames arrive. Notifications are sent by the collector
       before `run/2` returns; the final result and termination behavior are
-      unchanged. A dead recipient is harmless. Invalid observers raise
-      `ArgumentError` before the shim is opened.
+      unchanged on legacy runs. A dead recipient is harmless. Invalid observers
+      raise `ArgumentError` before the shim is opened.
 
       Frame boundaries are arbitrary: bytes may contain partial lines,
       multiple lines, or incomplete UTF-8 sequences. Notifications are
       unacknowledged and do not provide backpressure or durable delivery;
-      the recipient is responsible for draining its mailbox. With
-      `merge_stderr: true`, the shim already merged stderr into stdout, so
-      those bytes are reported as `:stdout`. Keep merging disabled when
+      the recipient is responsible for draining its mailbox. With any new
+      strict option, the collector checks the recipient's total queue before
+      each delivery and cancels at 1,024 queued messages with
+      `{:error, {:observer_overflow, partial_result}}`. Other senders can add
+      messages independently. Observation is not acknowledged or durable. With
+      `merge_stderr: true`, both channels are reported as `:stdout`. Keep merging disabled when
       the original output channel matters.
     * `:shim_path` - trusted absolute path to a matching native shim,
       overriding normal discovery. Also accepted by Stream, Duplex, and
@@ -107,6 +127,46 @@ defmodule Forcola do
       otherwise. Use `:required` to refuse to execute the child unless
       placement and `cgroup.kill` are available. See
       ["cgroup containment"](#run/2-cgroup-containment).
+
+  New options (`:idle_timeout_ms`, `:max_output_bytes`, `:env_mode`, or the
+  interrupt pair) require a versioned capability exchange before SPAWN.
+  `cgroup: :required` alone keeps legacy collection and error shapes without
+  negotiation; its existing string encoding enforces required containment.
+  An older shim rejecting HELLO or a valid incompatible capability reply returns
+  `{:error, {:spawn, :incompatible_shim}}` without executing the child.
+  Invalid new options raise `ArgumentError` before opening the shim.
+  Stream, Duplex, and Daemon reject `:env_mode` and the interrupt options
+  before opening a shim. Stream and Daemon also reject `:max_output_bytes`;
+  Duplex retains its existing support with `delivery: :pull`. Duplex and
+  Daemon reject `:idle_timeout_ms`; Stream retains its existing idle-timeout
+  support. These existing mode options keep their own validation and semantics.
+
+  With new strict options, `:timeout_ms` must be an integer in
+  `0..4_294_967_295`. Its deadline starts before opening the shim and includes
+  capability negotiation; only the remaining budget is sent in SPAWN. Idle
+  timing starts after negotiation. A stalled handshake returns
+  `{:error, {:spawn, :handshake_timeout}}`; malformed or unexpected replies
+  return `{:error, {:spawn, :invalid_handshake}}`. Transport exit before SPAWN
+  returns `{:error, {:spawn, {:shim_exited, status}}}` (an OS exit status,
+  `{:shim_error, reason}`, or `:unknown` when no status is available).
+  These pre-SPAWN errors have no partial child result. Port opening is
+  synchronous; its OS latency and final guard close can outlast the deadline.
+  After SPAWN, timeout cancellation allows the interrupt grace, kill grace,
+  and a 5-second collection backstop; guard close has its own 5-second bound.
+
+  Strict output draining keeps the run open after the root child exits until
+  both pipes close or a whole-run/idle deadline cancels draining. An escaped
+  descendant retaining a pipe can therefore produce `:timeout` or
+  `:idle_timeout` alongside `evidence.child_status: 0`. Wrappers must read the
+  child observation and the run reason independently; group cleanup does not
+  establish that escaped descendants are gone.
+
+  Every returned result includes `Forcola.Result` evidence. Spawn failures
+  after SPAWN with new options return `{:error, {:spawn, {reason, partial_result}}}`;
+  malformed EXIT returns `{:error, {:spawn, {:invalid_exit, partial_result}}}`.
+  Transport loss keeps the existing `{:shim_exited, partial_result}` shape.
+  A bounded failure keeps its original timeout/limit reason if transport is
+  subsequently lost. A missing native report never confirms cleanup.
 
   ## cgroup containment
 
@@ -179,122 +239,5 @@ defmodule Forcola do
       survive, reparented to pid 1.
   """
   @spec run([String.t(), ...], keyword()) :: {:ok, Result.t()} | {:error, run_error()}
-  def run([_binary | _] = argv, opts) do
-    validate_output_observer!(Keyword.get(opts, :output_observer))
-    timeout_ms = Keyword.fetch!(opts, :timeout_ms)
-    kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
-
-    case Shim.open(opts) do
-      {:ok, port} ->
-        try do
-          spawn_and_collect(port, argv, opts, timeout_ms, kill_grace_ms)
-        after
-          close_port(port)
-        end
-
-      {:error, :not_found} ->
-        {:error, {:spawn, :shim_not_found}}
-
-      {:error, reason} ->
-        {:error, {:spawn, reason}}
-    end
-  end
-
-  defp spawn_and_collect(port, argv, opts, timeout_ms, kill_grace_ms) do
-    payload = Shim.encode_spawn(argv, Keyword.put(opts, :kill_grace_ms, kill_grace_ms))
-    Shim.send_frame(port, Shim.tag_spawn(), payload)
-
-    # run/2 has no way to write to the child's stdin, so an open pipe with
-    # no writer only serves to hang a child that reads until EOF (`cat`,
-    # `codex exec`, anything that checks for piped input). Close it right
-    # away; Forcola.Duplex is the mode for interactive stdin.
-    Shim.send_frame(port, Shim.tag_eof(), "")
-
-    # Elixir-side backstop only: the shim itself enforces timeout_ms and
-    # confirms group death within kill_grace_ms before reporting EXIT, so
-    # under normal operation the shim's own EXIT frame arrives first.
-    # This deadline exists in case the shim never reports back at all.
-    deadline =
-      System.monotonic_time(:millisecond) + timeout_ms + kill_grace_ms + @backstop_margin_ms
-
-    collect(
-      port,
-      %{stdout: [], stderr: [], output_observer: Keyword.get(opts, :output_observer)},
-      deadline
-    )
-  end
-
-  defp collect(port, acc, deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
-
-    receive do
-      {^port, {:data, <<tag, payload::binary>>}} ->
-        handle_frame(port, tag, payload, acc, deadline)
-
-      {^port, {:exit_status, _status}} ->
-        # The shim exited without ever sending EXIT/ERROR (e.g. it
-        # crashed). Death is implied by the OS reaping the port program
-        # itself, but the child's own group state cannot be confirmed
-        # from here.
-        {:error, {:spawn, {:shim_exited, result(acc, {:signal, :unconfirmed})}}}
-    after
-      max(remaining, 0) ->
-        {:error, {:timeout, result(acc, {:signal, :unconfirmed})}}
-    end
-  end
-
-  defp handle_frame(port, tag, payload, acc, deadline) do
-    cond do
-      tag == Shim.tag_stdout() ->
-        notify_output(acc.output_observer, :stdout, payload)
-        collect(port, %{acc | stdout: [acc.stdout, payload]}, deadline)
-
-      tag == Shim.tag_stderr() ->
-        notify_output(acc.output_observer, :stderr, payload)
-        collect(port, %{acc | stderr: [acc.stderr, payload]}, deadline)
-
-      tag == Shim.tag_exit() ->
-        {status, timed_out} = Shim.decode_exit(payload)
-        if Shim.decode_contained(payload), do: log_contained()
-        res = result(acc, status)
-        if timed_out, do: {:error, {:timeout, res}}, else: {:ok, res}
-
-      tag == Shim.tag_error() ->
-        reason = Shim.decode_error(payload)
-        {:error, {:spawn, reason}}
-
-      true ->
-        collect(port, acc, deadline)
-    end
-  end
-
-  defp validate_output_observer!(nil), do: :ok
-
-  defp validate_output_observer!({pid, reference})
-       when is_pid(pid) and node(pid) == node() and is_reference(reference),
-       do: :ok
-
-  defp validate_output_observer!(_observer),
-    do: raise(ArgumentError, "output_observer must be {local_pid, reference} or nil")
-
-  defp notify_output(nil, _channel, _bytes), do: :ok
-
-  defp notify_output({pid, reference}, channel, bytes) do
-    send(pid, {reference, {channel, bytes}})
-    :ok
-  end
-
-  defp log_contained do
-    Logger.debug("forcola: run completed under Linux cgroup v2 containment")
-  end
-
-  defp result(acc, status) do
-    %Result{
-      status: status,
-      stdout: IO.iodata_to_binary(acc.stdout),
-      stderr: IO.iodata_to_binary(acc.stderr)
-    }
-  end
-
-  defp close_port(port), do: Shim.close(port)
+  def run([_binary | _] = argv, opts), do: Forcola.Run.run(argv, opts)
 end
