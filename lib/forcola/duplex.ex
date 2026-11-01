@@ -67,7 +67,8 @@ defmodule Forcola.Duplex do
   ## Kill discipline
 
   `close/1` kills the child's process group (SIGTERM, then SIGKILL after
-  the kill grace) and blocks for the shim's confirmation. `shutdown/1` does
+  the kill grace) and blocks for the shim's confirmation. With the interrupt
+  pair enabled, SIGINT and its grace come first. `shutdown/1` does
   the same and returns a `Forcola.Duplex.Terminal` with the observed status,
   confirmation, and active cleanup scope. `await_terminal/2` retrieves that
   evidence after a spontaneous exit, including after the session process dies.
@@ -108,10 +109,6 @@ defmodule Forcola.Duplex do
   @default_kill_grace_ms 5_000
   @default_max_line_bytes 64 * 1024
   @default_max_output_bytes 16 * 1024 * 1024
-  # Margin on top of kill_grace_ms when waiting for the shim to confirm
-  # group death: the shim confirms within kill_grace_ms, so this only
-  # fires if the shim itself never reports back.
-  @backstop_margin_ms 5_000
 
   defmodule Terminal do
     @moduledoc """
@@ -174,7 +171,21 @@ defmodule Forcola.Duplex do
 
   ## Options
 
-    * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
+    * `:cd`, `:merge_stderr` - as in `Forcola.run/2`.
+    * `:env` - environment entries as in `Forcola.run/2`. Binary values set
+      variables; `nil` or `false` removes them and requires `env_unset_v1`.
+      Other non-binary values raise `ArgumentError` before opening the shim.
+    * `:env_mode` - `:inherit` (default) or `:replace`; replacement clears
+      inherited variables before applying `:env`. Explicit `:env_mode` or
+      interrupt options require a list of binary environment names without
+      `=` or NUL and binary values without NUL, or `nil`/`false` unsets.
+      Explicit `:env_mode` requires `bounded_run_v1` negotiation.
+    * `:interrupt_signal`, `:interrupt_grace_ms` - optional pair, `:int` and
+      a positive integer grace at most `4_294_967_295`. Requires
+      `bounded_run_v1`; the shim sends SIGINT before TERM/KILL on shutdown,
+      owner death, or BEAM EOF. Cleanup waits include both grace intervals.
+      These capabilities compose with identity and structured errors, and
+      negotiate within five seconds. Incompatible shims fail before SPAWN.
     * `:shim_path` - trusted absolute shim path, as in `Forcola.run/2`.
     * `:structured_spawn_errors` - negotiate native `Forcola.SpawnError`
       reasons, default `false`. Failures retain the existing
@@ -215,8 +226,7 @@ defmodule Forcola.Duplex do
 
   There is no `:timeout_ms`; the session is bounded by its owner process
   and `close/1`. Passing `:timeout_ms` raises `ArgumentError`.
-  The one-shot options `:idle_timeout_ms`, `:env_mode`,
-  `:interrupt_signal`, and `:interrupt_grace_ms` also raise `ArgumentError`
+  The one-shot option `:idle_timeout_ms` also raises `ArgumentError`
   before a session or shim is started. The existing `:max_output_bytes`
   option remains supported only with `delivery: :pull`.
 
@@ -458,7 +468,7 @@ defmodule Forcola.Duplex do
              terminal_table: terminal_table,
              delivery: delivery
            },
-           kill_grace_ms: kill_grace_ms,
+           cleanup_timeout_ms: Shim.cleanup_timeout(opts),
            buffers: %{stdout: "", stderr: ""},
            stdin_open: true,
            exit: nil,
@@ -624,6 +634,7 @@ defmodule Forcola.Duplex do
     Shim.reject_spawn_observer!(opts, __MODULE__)
     Shim.validate_spawn_identity!(opts)
     Shim.validate_structured_spawn_errors!(opts)
+    Shim.validate_execution_options!(opts)
     Shim.reject_run_options!(opts, __MODULE__, [:max_output_bytes])
     validate_timeout_opt!(opts)
     validate_pty_opt!(opts)
@@ -945,11 +956,11 @@ defmodule Forcola.Duplex do
   # The child may still be running: kill the group and wait for the native
   # EXIT frame. Preserve its observed status separately from its cleanup
   # confirmation; a missing frame never becomes a confirmed result.
-  defp settle(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms} = state) do
+  defp settle(%{port: port, exit: nil, cleanup_timeout_ms: cleanup_timeout_ms} = state) do
     result =
       try do
         Shim.send_frame(port, Shim.tag_kill())
-        await_exit(state, kill_grace_ms + @backstop_margin_ms)
+        await_exit(state, cleanup_timeout_ms)
       catch
         :error, :badarg -> :transport_lost
       end
@@ -974,26 +985,30 @@ defmodule Forcola.Duplex do
   defp do_await_exit(%{port: port} = state, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
-    receive do
-      {^port, {:data, <<tag, payload::binary>>}} ->
-        cond do
-          tag == Shim.tag_exit() ->
-            {:exit, payload}
+    if remaining <= 0 do
+      :timeout
+    else
+      receive do
+        {^port, {:data, <<tag, payload::binary>>}} ->
+          cond do
+            tag == Shim.tag_exit() ->
+              {:exit, payload}
 
-          tag == Shim.tag_error() ->
-            {:spawn_error, Shim.decode_error(payload, state.structured_spawn_errors)}
+            tag == Shim.tag_error() ->
+              {:spawn_error, Shim.decode_error(payload, state.structured_spawn_errors)}
 
-          tag == Shim.tag_spawned() ->
-            do_await_exit(record_identity(state, payload), deadline)
+            tag == Shim.tag_spawned() ->
+              do_await_exit(record_identity(state, payload), deadline)
 
-          true ->
-            do_await_exit(state, deadline)
-        end
+            true ->
+              do_await_exit(state, deadline)
+          end
 
-      {^port, {:exit_status, _status}} ->
-        :transport_lost
-    after
-      max(remaining, 0) -> :timeout
+        {^port, {:exit_status, _status}} ->
+          :transport_lost
+      after
+        min(remaining, 4_294_967_295) -> do_await_exit(state, deadline)
+      end
     end
   end
 

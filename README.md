@@ -84,12 +84,19 @@ prefix never exceeds it. Finite credits keep at most 8 KiB per output pipe in
 flight. The independent whole-run deadline never resets on output; the idle
 deadline does. Without `max_output_bytes`, captured output has no cumulative
 memory limit. `env_mode: :inherit` remains the default; `:replace` clears the
-environment before applying the validated `{name, value}` string pairs.
-Without a new strict option, legacy `env: nil`, maps, and atom names keep
-their existing encoding and spawn-error behavior.
+environment before applying `env`. In every mode, `{name, nil}` and
+`{name, false}` remove a variable; other non-binary values raise `ArgumentError`
+before opening the shim. With strict Run options or explicit environment or
+interrupt options, `env` must be a list with binary names and binary, `nil`,
+or `false` values. Names must be nonempty without `=` or NUL, and string
+values must have no NUL. Plain calls retain `env: nil`, maps and atom names.
 
 The optional signal/grace pair sends process-group SIGINT before the existing
 TERM/KILL sequence on timeout, explicit cancellation, and owner or BEAM death.
+It applies to Duplex close and shutdown, Stream halt, owner or BEAM death,
+Stream timeout, idle and output limits, and Daemon stop or readiness timeout.
+Cleanup waits include both graces. The Daemon child spec also includes the
+confirmation and port-close bounds so supervisor shutdown can wait for cleanup.
 A cooperative parent can use that opportunity to stop children in other groups.
 An uncooperative escaped child remains outside group cleanup on macOS.
 
@@ -103,11 +110,14 @@ negotiation; SPAWN receives only its remaining budget. Cleanup and guard close
 can extend beyond that execution deadline (see `Forcola.run/2`).
 `cgroup: :required` alone keeps legacy collection and errors without HELLO;
 its existing required-containment wire encoding remains enforced.
-Stream, Duplex, and Daemon reject the new one-shot environment and interrupt
-options before opening a shim. Stream and Daemon also reject `max_output_bytes`;
-Duplex keeps its existing support with `delivery: :pull`. Duplex and Daemon
-reject `idle_timeout_ms`; Stream keeps its existing idle option. These existing
-mode options keep their own validation and semantics.
+Duplex, Stream and Daemon accept the same `env_mode` and interrupt pair,
+requiring the existing `bounded_run_v1` capability. Removals additionally
+require `env_unset_v1`; unsupported shims fail before SPAWN. These requirements
+compose with identity and structured spawn errors. Stream counts negotiation
+toward its timeout; Duplex and Daemon use a five-second handshake bound.
+Each mode keeps its own output and error shapes. Stream and Daemon reject
+`max_output_bytes`; Duplex supports it with `delivery: :pull`. Duplex and
+Daemon reject `idle_timeout_ms`; Stream keeps its existing idle option.
 Bounded failures return `{:error, {reason, partial_result}}`, with reason
 `:timeout`, `:idle_timeout`, `:max_output_bytes`, or `:observer_overflow`.
 Strict observers cancel at 1,024 queued messages rather than growing the

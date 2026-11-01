@@ -6,7 +6,8 @@ defmodule Forcola.Daemon do
   a dev proxy) but must never outlive their supervisor. The child runs in
   its own process group; when this GenServer terminates for any reason,
   including supervisor shutdown and owner crash, the shim kills the group
-  (SIGTERM, then SIGKILL after the kill grace) and the terminate blocks
+  (SIGTERM, then SIGKILL after the kill grace). When the interrupt pair is
+  enabled, SIGINT and its grace come first. The terminate callback blocks
   for the shim's bounded confirmation. If teardown cannot be confirmed,
   termination returns after the backstop and logs a warning. If the daemon
   process is killed brutally (no terminate), the port closes, the shim sees
@@ -20,15 +21,33 @@ defmodule Forcola.Daemon do
 
   Unlike bounded runs, a daemon has no `:timeout_ms`; its bound is its
   supervisor. Passing `:timeout_ms` raises `ArgumentError`.
-  The one-shot options `:idle_timeout_ms`, `:max_output_bytes`, `:env_mode`,
-  `:interrupt_signal`, and `:interrupt_grace_ms` also raise `ArgumentError`
+  The one-shot options `:idle_timeout_ms` and `:max_output_bytes` also raise `ArgumentError`
   before the GenServer or shim is started.
+
+  The generated `child_spec/1` allows both signal graces, the confirmation
+  and guard-close bounds, and a scheduling margin before the supervisor forces
+  termination. Its default shutdown budget is 16 seconds. See `child_spec/1`
+  for an explicit `Supervisor.child_spec/2` override.
 
   ## Options
 
     * `:argv` - required, `[binary | args]` as in `Forcola.run/2`.
     * `:name` - optional GenServer registration name.
-    * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
+    * `:cd`, `:merge_stderr` - as in `Forcola.run/2`.
+    * `:env` - environment entries as in `Forcola.run/2`. Binary values set
+      variables; `nil` or `false` removes them and requires `env_unset_v1`.
+      Other non-binary values raise `ArgumentError` before opening the shim.
+    * `:env_mode` - `:inherit` (default) or `:replace`; replacement clears
+      inherited variables before applying `:env`. Explicit `:env_mode` or
+      interrupt options require a list of binary environment names without
+      `=` or NUL and binary values without NUL, or `nil`/`false` unsets.
+      Explicit `:env_mode` requires `bounded_run_v1` negotiation.
+    * `:interrupt_signal`, `:interrupt_grace_ms` - optional pair, `:int` and
+      a positive integer grace at most `4_294_967_295`. Requires
+      `bounded_run_v1`; the shim sends SIGINT before TERM/KILL on shutdown,
+      owner death, or BEAM EOF. Cleanup waits include both grace intervals.
+      These capabilities compose with identity and structured errors, and
+      negotiate within five seconds. Incompatible shims fail before SPAWN.
     * `:shim_path` - trusted absolute shim path, as in `Forcola.run/2`.
     * `:structured_spawn_errors` - negotiate native `Forcola.SpawnError`
       reasons, default `false`. Spawn failures still stop the daemon with
@@ -118,10 +137,6 @@ defmodule Forcola.Daemon do
   alias Forcola.Shim
 
   @default_kill_grace_ms 5_000
-  # Margin on top of kill_grace_ms when waiting for the shim to confirm
-  # group death: the shim confirms within kill_grace_ms, so this only
-  # fires if the shim itself never reports back.
-  @backstop_margin_ms 5_000
   @default_ready_timeout_ms 5_000
   @default_ready_poll_ms 100
 
@@ -130,6 +145,37 @@ defmodule Forcola.Daemon do
           :logger
           | (:stdout | :stderr, binary() -> any())
           | {:send, pid()}
+
+  @doc """
+  Builds a supervisor child specification with time for bounded cleanup.
+
+  The shutdown budget includes the interrupt grace, kill grace, five seconds
+  for the native confirmation, five seconds for the port guard, and one second
+  of scheduling margin. With the default options this is 16,000 milliseconds.
+  When the sum exceeds the supervisor's maximum timeout of `4_294_967_295`
+  milliseconds, the child specification uses `:infinity`; the daemon still
+  enforces its own bounded cleanup deadline. This avoids truncating an accepted
+  interrupt grace or passing an invalid timeout to the supervisor.
+  Override the generated value with `Supervisor.child_spec/2` when needed:
+
+      Supervisor.child_spec({Forcola.Daemon, argv: ["my-server"]}, shutdown: 30_000)
+
+  A shorter override can stop waiting before cleanup finishes. Output and
+  readiness callbacks should return promptly; their duration is not included
+  in this cleanup budget.
+  """
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
+  def child_spec(opts) do
+    Shim.validate_execution_options!(opts)
+
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      type: :worker,
+      restart: :permanent,
+      shutdown: Shim.shutdown_timeout(opts)
+    }
+  end
 
   @doc """
   Starts a daemon running `opts[:argv]` under the shim.
@@ -194,7 +240,7 @@ defmodule Forcola.Daemon do
           output: Keyword.get(opts, :output, :logger),
           log_level: Keyword.get(opts, :log_output, :info),
           log_prefix: Keyword.get(opts, :log_prefix, ""),
-          kill_grace_ms: kill_grace_ms,
+          cleanup_timeout_ms: Shim.cleanup_timeout(opts),
           buffers: %{stdout: "", stderr: ""},
           exit: nil
         }
@@ -267,6 +313,7 @@ defmodule Forcola.Daemon do
   defp validate_opts!(opts) do
     Shim.validate_spawn_identity!(opts)
     Shim.validate_structured_spawn_errors!(opts)
+    Shim.validate_execution_options!(opts)
     Shim.validate_spawn_observer!(opts)
     Shim.reject_run_options!(opts, __MODULE__)
 
@@ -475,11 +522,11 @@ defmodule Forcola.Daemon do
 
   # The child may still be running: kill the group and wait for the
   # shim's EXIT frame (the shim confirms group death before sending it).
-  defp shutdown(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms} = state) do
+  defp shutdown(%{port: port, exit: nil, cleanup_timeout_ms: cleanup_timeout_ms} = state) do
     confirmation =
       try do
         Shim.send_frame(port, Shim.tag_kill())
-        await_exit(state, kill_grace_ms + @backstop_margin_ms)
+        await_exit(state, cleanup_timeout_ms)
       catch
         # The port raced us shut (shim already gone); its death killed the
         # group by the shim's stdin-EOF rule, so there is nothing to wait on.
@@ -504,19 +551,23 @@ defmodule Forcola.Daemon do
   defp do_await_exit(%{port: port} = state, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
-    receive do
-      {^port, {:data, <<tag, payload::binary>>}} ->
-        cond do
-          tag == Shim.tag_exit() -> exit_confirmation(payload)
-          tag == Shim.tag_error() -> :ok
-          tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
-          true -> do_await_exit(state, deadline)
-        end
+    if remaining <= 0 do
+      :timeout
+    else
+      receive do
+        {^port, {:data, <<tag, payload::binary>>}} ->
+          cond do
+            tag == Shim.tag_exit() -> exit_confirmation(payload)
+            tag == Shim.tag_error() -> :ok
+            tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
+            true -> do_await_exit(state, deadline)
+          end
 
-      {^port, {:exit_status, _status}} ->
-        :ok
-    after
-      max(remaining, 0) -> :timeout
+        {^port, {:exit_status, _status}} ->
+          :ok
+      after
+        min(remaining, 4_294_967_295) -> do_await_exit(state, deadline)
+      end
     end
   end
 

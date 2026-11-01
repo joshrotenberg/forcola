@@ -727,18 +727,55 @@ Finite 8 KiB credits on each pipe bound pending output before accumulation and
 observer notification, including unterminated lines and the final drain.
 Without a cumulative byte option, capture can still grow until the time bound.
 
+## Environment and interrupt options in every mode
+
 Use `env_mode: :replace` to clear inherited variables before applying `env:`;
-`:inherit` remains the default. With new options, explicit environment input
-is a list of binary string pairs; names must be nonempty without `=` or NUL,
-and values must have no NUL. Without new options, legacy `nil`, maps, and atom
-names retain their existing encoding and native spawn-error behavior.
+`:inherit` remains the default. All four modes accept these options. With
+strict Run options, or explicit `env_mode` or interrupt options in other modes,
+`env` must be a list with binary names and binary, `nil`, or `false` values.
+Names must be nonempty without `=` or NUL, and string values must have no NUL.
+In every mode, `nil` and `false` remove the named variable, and all other
+non-binary values raise `ArgumentError` before opening the shim. Plain calls
+retain `env: nil`, maps, and atom names.
+
+For example, strip parent session markers from an interactive child:
+
+```elixir
+{:ok, session} = Forcola.Duplex.open(["/absolute/path/to/cli"],
+  env: [{"PARENT_SESSION", nil}, {"ERL_FLAGS", false}],
+  interrupt_signal: :int,
+  interrupt_grace_ms: 500
+)
+:ok = Forcola.Duplex.close(session)
+```
+
+An unset is JSON `null` on the wire and calls `env_remove` in the shim.
+It requires `env_unset_v1`, independently of the `bounded_run_v1` requirement
+for explicit `env_mode` or interrupt options. An incompatible shim fails before
+SPAWN. Removals alone keep Run's legacy collector and error envelopes.
 
 Use `interrupt_signal: :int, interrupt_grace_ms: 500` for cooperative SIGINT
 before TERM/KILL on every native termination path, including owner/VM death.
-These two options must be supplied together. This reaches a separate-group
-child only if its parent cooperates; it does not contain escaped descendants.
+These two options must be supplied together; the grace is a positive integer
+at most `4_294_967_295`. All modes use the existing INT, TERM, KILL sequence.
+Duplex close/shutdown, Stream halt or consumer failure, owner death, and BEAM
+death through shim stdin EOF all use it. Stream whole-run and idle timeouts,
+Stream/Duplex output limits, and Daemon readiness timeout also use it. Duplex
+`recv/2` timeout only stops waiting, and `send_eof/1` only closes child stdin.
 
-New options perform a capability handshake before
+Each cleanup wait includes interrupt grace, kill grace and a five-second
+confirmation backstop; closing the guard has its own five-second bound.
+Daemon's generated child spec allows those bounds plus one scheduling second
+(default shutdown: 16 seconds). `Supervisor.child_spec/2` can override it;
+a shorter bound may interrupt confirmation, while native EOF cleanup continues.
+A blocking user output or readiness callback can delay the start of cleanup.
+
+This reaches a separate-group child only if its parent cooperates; it does not
+contain escaped descendants.
+
+## One-shot negotiation and result evidence
+
+New Run options perform a capability handshake before
 SPAWN. A mismatch returns `{:error, {:spawn, :incompatible_shim}}` without
 executing a child. A stalled exchange uses `:handshake_timeout`, malformed
 replies use `:invalid_handshake`, and transport exit before SPAWN uses
@@ -746,8 +783,10 @@ replies use `:invalid_handshake`, and transport exit before SPAWN uses
 `timeout_ms` must be an integer in `0..4_294_967_295`; opening and negotiation
 consume the same execution deadline. Cleanup has additional bounded time.
 `cgroup: :required` alone keeps its existing enforcement and legacy collector
-without negotiation. Stream, Duplex, and Daemon reject the new environment
-and interrupt options before opening a shim. Stream and Daemon also reject
+without negotiation. Stream also counts environment and interrupt negotiation
+toward its execution timeout. Duplex and Daemon use a five-second handshake
+bound and keep their existing error shapes. All capability requirements compose
+with spawn identity and structured spawn errors. Stream and Daemon reject
 `max_output_bytes`; Duplex retains its existing support with `delivery: :pull`.
 Duplex and Daemon reject `idle_timeout_ms`; Stream retains its existing idle
 option. These existing mode options keep their own validation and semantics.

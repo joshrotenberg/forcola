@@ -23,8 +23,10 @@ pub struct SpawnRequest {
     pub argv: Vec<String>,
     #[serde(default)]
     pub cd: Option<String>,
+    /// String values set variables; null removes them from the child's
+    /// inherited environment. Replacement mode starts with no inherited vars.
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: HashMap<String, Option<String>>,
     #[serde(default)]
     pub merge_stderr: bool,
     /// Explicit replacement clears the inherited environment before envs.
@@ -233,6 +235,21 @@ mod tests {
     }
 
     #[test]
+    fn env_values_are_strings_or_null() {
+        let req: SpawnRequest = serde_json::from_str(
+            r#"{"argv":["true"],"env":{"SET":"value","EMPTY":"","REMOVE":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.env.get("SET"), Some(&Some("value".to_string())));
+        assert_eq!(req.env.get("EMPTY"), Some(&Some(String::new())));
+        assert_eq!(req.env.get("REMOVE"), Some(&None));
+        for value in ["false", "true", "123", "[]", "{}"] {
+            let payload = format!(r#"{{"argv":["true"],"env":{{"INVALID":{value}}}}}"#);
+            assert!(serde_json::from_str::<SpawnRequest>(&payload).is_err());
+        }
+    }
+
+    #[test]
     fn spawn_request_window_bytes_opt_in() {
         let json = r#"{"argv": ["cat"], "window_bytes": 4096}"#;
         let req: SpawnRequest = serde_json::from_str(json).unwrap();
@@ -304,7 +321,7 @@ mod tests {
         }"#;
         let req: SpawnRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.cd.as_deref(), Some("/tmp"));
-        assert_eq!(req.env.get("FOO"), Some(&"bar".to_string()));
+        assert_eq!(req.env.get("FOO"), Some(&Some("bar".to_string())));
         assert!(req.merge_stderr);
         assert_eq!(req.timeout_ms, Some(100));
         assert_eq!(req.kill_grace_ms, 50);

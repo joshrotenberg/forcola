@@ -7,7 +7,6 @@ defmodule Forcola.Run do
 
   @window 8_192
   @observer_messages 1_024
-  @margin 5_000
   @strict_options [
     :idle_timeout_ms,
     :max_output_bytes,
@@ -60,7 +59,7 @@ defmodule Forcola.Run do
 
   defp execute(port, argv, opts, strict, deadline) do
     grace = Keyword.get(opts, :kill_grace_ms, 5_000)
-    interrupt_grace = Keyword.get(opts, :interrupt_grace_ms, 0)
+    cleanup_ms = Shim.cleanup_timeout(opts)
     now = now()
     timeout_at = deadline || now + Keyword.fetch!(opts, :timeout_ms)
     idle = opts[:idle_timeout_ms]
@@ -106,8 +105,8 @@ defmodule Forcola.Run do
       idle: idle,
       idle_at: if(idle, do: now + idle),
       timeout_at: timeout_at,
-      backstop: timeout_at + grace + interrupt_grace + @margin,
-      cleanup_ms: grace + interrupt_grace + @margin,
+      backstop: timeout_at + cleanup_ms,
+      cleanup_ms: cleanup_ms,
       reason: nil,
       truncated: false,
       identity_enabled: Shim.identity_requested?(opts),
@@ -386,8 +385,7 @@ defmodule Forcola.Run do
       if Keyword.has_key?(opts, key), do: positive!(key, opts[key])
     end
 
-    validate_env!(opts)
-    validate_interrupt!(opts)
+    Shim.validate_execution_options!(opts, strict?(opts))
     timeout = Keyword.fetch!(opts, :timeout_ms)
 
     if (strict?(opts) or Shim.negotiated?(opts)) and
@@ -409,48 +407,11 @@ defmodule Forcola.Run do
   defp validate_observer!(_),
     do: raise(ArgumentError, "output_observer must be {local_pid, reference} or nil")
 
-  defp validate_env!(opts) do
-    if Keyword.get(opts, :env_mode, :inherit) not in [:inherit, :replace],
-      do: raise(ArgumentError, "env_mode must be :inherit or :replace")
-
-    if strict?(opts) and Keyword.has_key?(opts, :env), do: validate_env_entries!(opts[:env])
-  end
-
-  defp validate_env_entries!(env) do
-    unless is_list(env) and Enum.all?(env, &valid_env?/1),
-      do:
-        raise(
-          ArgumentError,
-          "env must be a list of {name, value} strings without NUL; names must be nonempty and contain no ="
-        )
-  end
-
-  defp validate_interrupt!(opts) do
-    case {opts[:interrupt_signal], opts[:interrupt_grace_ms]} do
-      {nil, nil} ->
-        if Keyword.has_key?(opts, :interrupt_signal) or
-             Keyword.has_key?(opts, :interrupt_grace_ms),
-           do: raise(ArgumentError, "interrupt_signal :int requires interrupt_grace_ms")
-
-      {:int, grace} ->
-        positive!(:interrupt_grace_ms, grace)
-
-      _ ->
-        raise ArgumentError, "interrupt_signal must be :int with positive interrupt_grace_ms"
-    end
-  end
-
   defp positive!(key, value) do
     unless is_integer(value) and value > 0 and value <= 4_294_967_295,
       do: raise(ArgumentError, "#{key} must be a positive integer <= 4294967295")
   end
 
-  defp valid_env?({name, value}) when is_binary(name) and is_binary(value),
-    do:
-      name != "" and not String.contains?(name, ["=", <<0>>]) and
-        not String.contains?(value, <<0>>)
-
-  defp valid_env?(_), do: false
   defp strict?(opts), do: Enum.any?(@strict_options, &Keyword.has_key?(opts, &1))
   defp now, do: System.monotonic_time(:millisecond)
 end

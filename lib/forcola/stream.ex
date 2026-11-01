@@ -11,9 +11,10 @@ defmodule Forcola.Stream do
       |> Stream.map(&:json.decode/1)
       |> Enum.to_list()
 
-  `:env_mode`, `:interrupt_signal`, `:interrupt_grace_ms`, and
-  `:max_output_bytes` are one-shot `Forcola.run/2` options. Passing them raises
-  `ArgumentError` when `lines/2` is called, before a shim is opened.
+  Environment unsets, `:env_mode`, and the interrupt pair have the same
+  validation and capability negotiation as `Forcola.run/2`. `:max_output_bytes`
+  remains a one-shot option; passing it raises `ArgumentError` when `lines/2`
+  is called, before a shim is opened.
 
   ## Termination semantics
 
@@ -169,11 +170,8 @@ defmodule Forcola.Stream do
     defp format_status(status), do: "status #{inspect(status)}"
   end
 
-  # Same backstop scheme as Forcola.run/2: the shim enforces timeout_ms
-  # itself and confirms group death within kill_grace_ms before sending
-  # EXIT, so the Elixir-side deadline only fires if the shim never
-  # reports back at all.
-  @backstop_margin_ms 5_000
+  # The shim owns the timeout and signal sequence. The Elixir backstop
+  # includes both grace intervals and time for its confirmation.
   @default_kill_grace_ms 5_000
 
   # Default read window when backpressure is enabled with `backpressure: true`
@@ -190,8 +188,23 @@ defmodule Forcola.Stream do
   for running the child as a different user (POSIX-only, fail-closed,
   privileged shim required); `:timeout_ms` is required and bounds the
   whole run, not the gap between lines.
-  `:env_mode`, `:interrupt_signal`, `:interrupt_grace_ms`, and
-  `:max_output_bytes` raise `ArgumentError` before opening a shim.
+  `:max_output_bytes` raises `ArgumentError` before opening a shim.
+
+  Environment values must be binary strings, `nil`, or `false`. Both `nil`
+  and `false` remove a variable and require `env_unset_v1` negotiation.
+  `:env_mode` accepts `:inherit` (default) or `:replace`, clearing inherited
+  variables before applying `:env` in replacement mode. The optional interrupt
+  pair accepts only `interrupt_signal: :int` with a positive integer
+  `:interrupt_grace_ms` at most `4_294_967_295`. It sends SIGINT before the
+  TERM/KILL sequence on timeout, early halt, output limits, or owner/BEAM EOF.
+  Cleanup waits include the interrupt grace and kill grace.
+
+  Explicit `:env_mode` or interrupt options require `bounded_run_v1` and
+  strict environment entries: a list of binary names without `=` or NUL,
+  with binary values without NUL or `nil`/`false` unsets. All option validation
+  runs when `lines/2` is called. Negotiation runs when enumeration starts,
+  counts toward `:timeout_ms`, and composes with the other capabilities.
+  Incompatible shims fail before SPAWN without changing stream delivery.
 
   The child's stdin is closed immediately after spawn, as in `Forcola.run/2`:
   this mode has no way to write to it, so a child that reads until EOF sees
@@ -253,6 +266,7 @@ defmodule Forcola.Stream do
   def lines([_binary | _] = argv, opts) do
     Shim.validate_spawn_identity!(opts)
     Shim.validate_structured_spawn_errors!(opts)
+    Shim.validate_execution_options!(opts)
     Shim.validate_spawn_observer!(opts)
     validate_identity_observer!(opts)
     opts = if opts[:spawn_observer], do: Keyword.put(opts, :spawn_identity, true), else: opts
@@ -378,7 +392,8 @@ defmodule Forcola.Stream do
         end
 
         now = System.monotonic_time(:millisecond)
-        deadline = now + timeout_ms + kill_grace_ms + @backstop_margin_ms
+        cleanup_timeout_ms = Shim.cleanup_timeout(opts)
+        deadline = now + timeout_ms + cleanup_timeout_ms
 
         %{
           port: port,
@@ -395,7 +410,7 @@ defmodule Forcola.Stream do
           deadline: deadline,
           idle_timeout_ms: idle_timeout_ms,
           idle_deadline: idle_deadline(idle_timeout_ms, now),
-          kill_grace_ms: kill_grace_ms,
+          cleanup_timeout_ms: cleanup_timeout_ms,
           exit: nil,
           # Backpressure state. `window` nil = disabled (eager). `outstanding`
           # is the read budget granted to the shim but not yet accounted for by
@@ -450,14 +465,19 @@ defmodule Forcola.Stream do
   # `:exit` in the state and raise on the next call, so cleanup/1 always
   # sees a state that says whether the shim already accounted for the
   # child (and can skip the KILL/confirm handshake when it has).
-  defp next(%{exit: nil, port: port} = state) do
+  defp next(%{exit: nil} = state) do
     # Under backpressure, top the shim's read budget back up to one window
     # before waiting for the next frame. This is the demand signal: it runs
     # only when the consumer pulls, so a paused consumer stops granting credit
     # and the producer blocks. It also resets the idle deadline (see
     # grant_credit) so a consumer-driven pause is excluded from the idle clock.
-    state = grant_credit(state)
+    state |> grant_credit() |> receive_next()
+  end
 
+  defp next(%{exit: :ok} = state), do: {:halt, state}
+  defp next(%{exit: {:error, error}}), do: raise(error)
+
+  defp receive_next(%{port: port} = state) do
     now = System.monotonic_time(:millisecond)
     run_remaining = state.deadline - now
 
@@ -479,13 +499,12 @@ defmodule Forcola.Stream do
         error = %Error{status: {:signal, :unconfirmed}, stderr: stderr(state)}
         {[], %{state | exit: {:error, error}}}
     after
-      max(wait, 0) ->
-        {[], %{state | exit: {:error, timeout_error(state)}}}
+      min(max(wait, 0), 4_294_967_295) ->
+        if wait > 4_294_967_295,
+          do: receive_next(state),
+          else: {[], %{state | exit: {:error, timeout_error(state)}}}
     end
   end
-
-  defp next(%{exit: :ok} = state), do: {:halt, state}
-  defp next(%{exit: {:error, error}}), do: raise(error)
 
   # Backpressure disabled: nothing to grant, idle handling unchanged.
   defp grant_credit(%{window: nil} = state), do: state
@@ -555,9 +574,9 @@ defmodule Forcola.Stream do
   # early-halt path in cleanup/1. cleanup/1 will still close and flush the
   # port afterward; the exit is already set, so it takes the non-handshake
   # clause and does not KILL again.
-  defp kill_and_confirm(%{port: port, kill_grace_ms: kill_grace_ms} = state) do
+  defp kill_and_confirm(%{port: port, cleanup_timeout_ms: cleanup_timeout_ms} = state) do
     Shim.send_frame(port, Shim.tag_kill())
-    await_exit(state, kill_grace_ms + @backstop_margin_ms)
+    await_exit(state, cleanup_timeout_ms)
   catch
     :error, :badarg -> :shim_exited
   end
@@ -725,11 +744,11 @@ defmodule Forcola.Stream do
   # Early halt: the child may still be running. Kill the group and wait
   # for the shim's EXIT frame (the shim confirms group death before
   # sending it), so the halt does not return until the group is dead.
-  defp cleanup(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms} = state) do
+  defp cleanup(%{port: port, exit: nil, cleanup_timeout_ms: cleanup_timeout_ms} = state) do
     confirmation =
       try do
         Shim.send_frame(port, Shim.tag_kill())
-        await_exit(state, kill_grace_ms + @backstop_margin_ms)
+        await_exit(state, cleanup_timeout_ms)
       catch
         # The port raced us shut (shim already gone); its death killed the
         # group by the shim's stdin-EOF rule, so there is nothing to wait on.
@@ -753,19 +772,23 @@ defmodule Forcola.Stream do
   defp do_await_exit(%{port: port} = state, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
-    receive do
-      {^port, {:data, <<tag, payload::binary>>}} ->
-        cond do
-          tag == Shim.tag_exit() -> decode_terminal_exit(payload)
-          tag == Shim.tag_error() -> :error
-          tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
-          true -> do_await_exit(state, deadline)
-        end
+    if remaining <= 0 do
+      :timeout
+    else
+      receive do
+        {^port, {:data, <<tag, payload::binary>>}} ->
+          cond do
+            tag == Shim.tag_exit() -> decode_terminal_exit(payload)
+            tag == Shim.tag_error() -> :error
+            tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
+            true -> do_await_exit(state, deadline)
+          end
 
-      {^port, {:exit_status, _status}} ->
-        :shim_exited
-    after
-      max(remaining, 0) -> :timeout
+        {^port, {:exit_status, _status}} ->
+          :shim_exited
+      after
+        min(remaining, 4_294_967_295) -> do_await_exit(state, deadline)
+      end
     end
   end
 
