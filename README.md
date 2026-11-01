@@ -126,7 +126,7 @@ recipient's mailbox indefinitely; notifications remain unacknowledged.
 `result.evidence` keeps raw `child_status` and `child_signal`, `termination`,
 `reason`, `output_truncated`, `cleanup`, `scope`, and `guard_close` independent
 of the legacy status. Only explicit valid EXIT evidence confirms cleanup.
-Strict drain waits for pipe closure after root exit. An escaped descendant
+Strict drain waits for pipe closure after root exit. Without descendant tracking, an escaped descendant
 holding a pipe can cause `reason: :timeout` or `:idle_timeout` even with
 `child_status: 0`; wrappers must consume those facts independently.
 `:process_group` confirmation never proves whole-tree containment. Early JSON
@@ -214,9 +214,27 @@ The [identity example](https://hexdocs.pm/forcola/getting_started.html#record-pr
 shows how to record a Duplex child's identity before sending input.
 
 The group kill covers the child and everything it keeps in its process group:
-ordinary grandchildren die with the command. Deliberate daemonizers (double-fork
-plus `setsid`) leave the group; on Linux the opt-in `cgroup: true` layer
-contains them when active; `cgroup: :required` refuses to execute without it.
+ordinary grandchildren die with the command. Pass `track_descendants: true` in
+any mode to discover descendants that leave the group and apply the same
+INT/TERM/KILL sequence to their recorded groups on every cleanup path. Linux
+uses a child subreaper and reports `:tree_contained`; macOS samples the tree
+and reports `:tree_sampled`. A macOS descendant reparented before any sample
+can escape. Identity checks skip reused leaders, but checking and signalling
+are not atomic.
+
+An optional `track_observer: {pid, reference}` enables tracking and receives
+`{reference, {:tracked, identity}}` as groups appear, starting with the root,
+and `{reference, {:tracking_exit, %{scope: scope, confirmation: confirmation}}}`
+when the Elixir process survives to report completion. Native cleanup continues
+on brutal owner or BEAM death, but no final observer event is guaranteed then.
+Run results and Duplex terminals retain `tracked_groups`;
+Duplex and Daemon also expose `tracked/1` for polling. Tracking negotiates the
+`track_descendants_v1` capability before SPAWN and leaves defaults unchanged.
+The [tracking guide](https://hexdocs.pm/forcola/getting_started.html#track-descendant-groups)
+describes platform limits and evidence.
+
+On Linux, `cgroup: true` remains the stronger backstop when active;
+`cgroup: :required` refuses to execute without it.
 Daemon control channels like docker and work handed
 to system schedulers stay out of reach of any process-based mechanism. The
 [process groups guide](https://hexdocs.pm/forcola/process_groups.html) covers

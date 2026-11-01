@@ -113,14 +113,15 @@ to snapshot the process tree during a live run and flag any descendant whose
 `pgid` differs from the CLI's. All of them keep their entire tree in the
 child's process group and die to the group kill.
 
-Group kill misses three classes. An active Linux cgroup can contain the first;
+Default group kill misses three classes. Descendant tracking or an active Linux cgroup can reach the first;
 the other two require the external daemon's or scheduler's own teardown:
 
 ### Deliberate daemonizers
 
 A child that deliberately daemonizes, by double-forking plus `setsid` or via a
-flag like `redis-server --daemonize yes`, leaves the process group and survives
-the kill. It has explicitly asked to outlive its parent.
+flag like `redis-server --daemonize yes`, leaves the original process group and
+survives its kill. Opt-in descendant tracking discovers these new groups and
+cleans them on every kill path; its macOS sampling limit still applies.
 
 Run servers in foreground mode under `Forcola.Daemon`. Foreground operation is
 the same contract every process supervisor (systemd, runit, foreman) imposes:
@@ -147,8 +148,10 @@ non-cgroup-v2 systems, and when the subtree is not delegated, `cgroup: true`
 falls back to the ordinary process-group kill and logs a warning; ordinary
 in-group grandchildren still die exactly as before. The EXIT report carries a
 `contained` flag reporting which mechanism was used. `Forcola.Duplex.Terminal`
-exposes this as `scope: :active_cgroup` or `:process_group`; it describes the
-active mechanism, not proof that any externally owned work was contained. A
+exposes this as `scope: :active_cgroup` or `:process_group` when tracking is
+disabled. Tracking reports `:tree_contained` or `:tree_sampled` instead;
+the native `contained` flag independently records cgroup placement. Scope
+describes the mechanism, not proof that externally owned work was contained. A
 `Logger.debug` line is also emitted when containment was active. That line
 comes from `Forcola.run/2` and `Forcola.Daemon`; `Forcola.Stream` and
 `Forcola.Duplex` report their exit through messages or a raise and do not
@@ -182,9 +185,10 @@ On Linux, the opt-in cgroup v2 layer
 daemonizers by placing the child's whole subtree in a cgroup and writing
 `cgroup.kill`, rather than relying on the process group. It requires a delegated
 cgroup v2 subtree; see ["Deliberate daemonizers"](#deliberate-daemonizers)
-above. On macOS nothing can contain a deliberate daemonizer, which is equally
-true of erlexec and MuonTrap, so `cgroup: true` falls back to the process-group
-kill there. Windows support is tracked separately in
+above. On macOS `track_descendants: true` cleans observed escaped groups, but
+cannot discover a descendant reparented before any sample. Its scope is
+`:tree_sampled`; `cgroup: true` remains unavailable there. Windows support is
+tracked separately in
 [#34](https://github.com/joshrotenberg/forcola/issues/34).
 
 ## Cooperative interrupt and one-shot evidence
@@ -203,14 +207,24 @@ shutdown timeout can cut that confirmation wait short; the native EOF path
 still performs cleanup.
 
 A cooperative parent can use INT to stop a child that changed process groups.
-An uncooperative escaped child cannot be positively contained by this mechanism
-on macOS. No descendant walking is performed. This is only the cooperative
-portion of issue #93, not complete containment of escaped descendants.
+With `track_descendants: true`, the same sequence also reaches tracked escaped
+groups directly. Linux uses a child subreaper and continuously reaps adopted
+zombies; macOS samples through libproc on a 50 ms polling interval and on cleanup.
+Inventory work adds to that interval. macOS cannot
+confirm anything about a descendant reparented before it was first sampled.
+
+Tracking emits a root-first TRACKED identity for each observed group and
+retains process identities separately so a later group change can be detected.
+Before each signal, the current leader must match its recorded start time and
+group. If it does not, the numeric group is never signalled; independently
+verified retained members are signalled individually. Identity verification
+and POSIX signalling are not atomic. The [tracking guide](getting_started.html#track-descendant-groups)
+details observation APIs, bounds and failure evidence.
 
 One-shot results now retain raw child exit/signal alongside cleanup evidence.
 Only explicit valid confirmation can produce `cleanup: :confirmed`; scope is
-`:process_group` or `:active_cgroup` only when reported by the shim. Missing or
-malformed EXIT is unknown, and guard close has its own result. A confirmed
+`:process_group` or `:active_cgroup` by default, and `:tree_contained` on Linux
+or `:tree_sampled` on macOS with tracking. Missing or malformed EXIT is unknown, and guard close has its own result. A confirmed
 process group can coexist with an escaped survivor, so evidence must never be
 promoted to whole-tree safety by an adapter. The terminal bounded reason
 remains authoritative even if stdout already contains apparently successful

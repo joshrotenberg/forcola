@@ -21,6 +21,9 @@ defmodule Forcola.Duplex do
       the child's `%{pid: integer, pgid: integer, start_time: map}` before
       any output. This message also arrives in pull mode. See
       `Forcola.Result` for the platform-specific start-time fields.
+    * `{:forcola_tracked, session, identity}` - with descendant tracking,
+      each newly observed cleanup-group leader, root first. This also arrives
+      in pull mode and is sent in addition to an explicit `:track_observer`.
     * `{:forcola_line, session, line}` - a stdout line, without its
       trailing newline. A partial line held across frames is delivered
       once its newline arrives; a final partial line is delivered before
@@ -102,7 +105,7 @@ defmodule Forcola.Duplex do
 
   use GenServer
 
-  alias Forcola.Shim
+  alias Forcola.{Shim, Tracking}
 
   require Logger
 
@@ -117,12 +120,20 @@ defmodule Forcola.Duplex do
     `:status` is the native child exit code or signal, even when cleanup was
     unconfirmed. It is `nil` if no EXIT frame arrived. `:confirmation` is one
     of `:confirmed`, `:unconfirmed`, `:timeout`, `:transport_lost`, or
-    `:not_started`. `:scope` is `:process_group`, `:active_cgroup`, or
-    `:unknown`; it describes the mechanism the shim reported, not proof that
+    `:not_started`. `:scope` is `:process_group`, `:active_cgroup`,
+    `:tree_contained`, `:tree_sampled`, or `:unknown`;
+    it describes the mechanism the shim reported, not proof that
     an escaped descendant outside that mechanism was confined.
     `:output` is `:complete`, `:truncated`, `:unknown`, or a typed limit tuple
     such as `{:limit, :line, :stdout, 65536}`. Cleanup confirmation and output
     completeness are independent observations.
+
+    `:tracked_groups` retains the observed cleanup-group identities in order,
+    root first, including frames consumed during shutdown. It defaults to `[]`.
+    See `Forcola.Result` for the identity shape and Linux/macOS scope meanings.
+    A macOS descendant reparented before its first sample is outside the
+    sampled guarantee. Missing or malformed tracking history, overflow, and
+    unknown tree scope cannot produce positive confirmation.
 
     `:spawn_error` retains the native failure reason when `:cause` is
     `:spawn_error`: a `Forcola.SpawnError` when structured errors were
@@ -134,7 +145,15 @@ defmodule Forcola.Duplex do
     """
 
     @enforce_keys [:status, :confirmation, :cause, :scope]
-    defstruct [:status, :confirmation, :cause, :scope, spawn_error: nil, output: :complete]
+    defstruct [
+      :status,
+      :confirmation,
+      :cause,
+      :scope,
+      spawn_error: nil,
+      output: :complete,
+      tracked_groups: []
+    ]
 
     @type t :: %__MODULE__{
             status: non_neg_integer() | {:signal, non_neg_integer()} | nil,
@@ -148,7 +167,8 @@ defmodule Forcola.Duplex do
               | :session_lost
               | :output_limit
               | :spawn_error,
-            scope: :process_group | :active_cgroup | :unknown,
+            scope: :process_group | :active_cgroup | :tree_contained | :tree_sampled | :unknown,
+            tracked_groups: [Shim.identity()],
             spawn_error: Forcola.SpawnError.t() | String.t() | :invalid_error | nil,
             output:
               :complete | :truncated | :unknown | {:limit, :line | :total, atom(), pos_integer()}
@@ -193,6 +213,20 @@ defmodule Forcola.Duplex do
       `Terminal.spawn_error` retains the same reason for pull delivery and
       shutdown. Requires `structured_spawn_errors_v1` support; negotiation
       has a five-second bound and incompatible shims fail before SPAWN.
+    * `:track_descendants` - opt in to lifetime descendant-group tracking
+      and cleanup, default `false`. Requires `track_descendants_v1` before
+      SPAWN and composes with the other capabilities. `tracked/1` and
+      `Terminal.tracked_groups` retain at most 4,096 observed group identities,
+      root first. `:tree_contained` reports Linux subreaper tracking;
+      `:tree_sampled` reports macOS sampling, which cannot cover a descendant
+      reparented before its first sample. Incomplete tracking is unconfirmed.
+    * `:track_observer` - optional `{local_pid, reference}` receiving
+      `{reference, {:tracked, identity}}` and one terminal
+      `{reference, {:tracking_exit, %{scope: scope, confirmation: confirmation}}}`
+      when the session can report its end. A non-nil observer enables tracking
+      even with `track_descendants: false`; it supplements the owner's
+      `:forcola_tracked` messages. See `Forcola.run/2` for confirmation values.
+      A separate observer can retain notifications after owner death.
     * `:spawn_identity` - request the child's native identity, default
       `false`. Requires `spawn_identity_v1` negotiation before SPAWN, with
       a five-second handshake bound. An incompatible shim returns an error
@@ -240,6 +274,7 @@ defmodule Forcola.Duplex do
   """
   @spec open([String.t(), ...], keyword()) :: {:ok, session()} | {:error, term()}
   def open([binary | _] = argv, opts) when is_binary(binary) do
+    opts = Tracking.validate_opts!(opts)
     validate_opts!(argv, opts)
     ref = make_ref()
     # The owner owns the table, so the terminal record survives the session
@@ -247,6 +282,8 @@ defmodule Forcola.Duplex do
     table = :ets.new(:forcola_duplex_terminal, [:set, :public])
     identity_status = if Shim.identity_requested?(opts), do: :pending, else: :not_requested
     :ets.insert(table, {:spawn_identity, identity_status})
+    tracking_status = if opts[:track_descendants], do: [], else: :not_requested
+    :ets.insert(table, {:tracked_groups, tracking_status})
 
     case GenServer.start(__MODULE__, {self(), ref, table, argv, opts}) do
       {:ok, pid} ->
@@ -297,6 +334,26 @@ defmodule Forcola.Duplex do
 
       _ ->
         if Process.alive?(pid), do: {:error, :pending}, else: {:error, :closed}
+    end
+  catch
+    :error, :badarg -> {:error, :closed}
+  end
+
+  @doc """
+  Returns the recorded cleanup-group identities in first-observed order.
+
+  With tracking enabled, `{:ok, []}` means no valid TRACKED frame has arrived.
+  The history includes the root group, remains available after natural exit,
+  and is released by `close/1`, `forget_terminal/1`, or owner death. Entries
+  are observations, not a list of processes known to be alive. Disabled live
+  sessions return `{:error, :not_requested}`; released records return
+  `{:error, :closed}`.
+  """
+  @spec tracked(session()) :: {:ok, [Shim.identity()]} | {:error, :not_requested | :closed}
+  def tracked(%__MODULE__{pid: pid, terminal_table: table}) do
+    case :ets.lookup(table, :tracked_groups) do
+      [{:tracked_groups, groups}] when is_list(groups) -> {:ok, groups}
+      _ -> if Process.alive?(pid), do: {:error, :not_requested}, else: {:error, :closed}
     end
   catch
     :error, :badarg -> {:error, :closed}
@@ -475,6 +532,7 @@ defmodule Forcola.Duplex do
            identity_enabled: Shim.identity_requested?(opts),
            structured_spawn_errors: Keyword.get(opts, :structured_spawn_errors, false),
            identity: nil,
+           tracking: Tracking.new(opts),
            terminal: nil,
            terminal_recipient: Keyword.get(opts, :terminal_recipient),
            shutdown_cause: :explicit_close,
@@ -492,9 +550,11 @@ defmodule Forcola.Duplex do
          }}
 
       {:error, :not_found} ->
+        Tracking.startup_failed(opts)
         {:stop, :shim_not_found}
 
       {:error, reason} ->
+        Tracking.startup_failed(opts)
         {:stop, reason}
     end
   end
@@ -593,7 +653,11 @@ defmodule Forcola.Duplex do
       output: :unknown
     }
 
-    state = %{state | exit: :shim_exited, terminal: terminal} |> reply_pull_waiter()
+    state =
+      state
+      |> finish_tracking(terminal)
+      |> Map.merge(%{exit: :shim_exited, terminal: with_groups(terminal, state.tracking)})
+      |> reply_pull_waiter()
 
     if state.delivery == :pull and not :queue.is_empty(state.queue) do
       {:noreply, state}
@@ -745,10 +809,29 @@ defmodule Forcola.Duplex do
       tag == Shim.tag_stdout() -> emit(state, :stdout, payload)
       tag == Shim.tag_stderr() -> emit(state, :stderr, payload)
       tag == Shim.tag_spawned() -> record_identity(state, payload)
+      tag == Shim.tag_tracked() -> record_tracked(state, payload)
       tag == Shim.tag_exit() -> child_exited(state, payload)
       tag == Shim.tag_error() -> spawn_failed(state, payload)
       true -> state
     end
+  end
+
+  defp record_tracked(state, payload) do
+    {tracking, identity} = Tracking.record(state.tracking, payload)
+
+    if identity do
+      store_tracked(state.session.terminal_table, Tracking.groups(tracking))
+      Tracking.notify_record(tracking, identity)
+      send(state.owner, {:forcola_tracked, state.session, identity})
+    end
+
+    %{state | tracking: tracking}
+  end
+
+  defp store_tracked(table, groups) do
+    :ets.insert(table, {:tracked_groups, groups})
+  catch
+    :error, :badarg -> :ok
   end
 
   defp record_identity(%{identity_enabled: true, identity: nil} = state, payload) do
@@ -774,9 +857,10 @@ defmodule Forcola.Duplex do
   defp child_exited(state, payload) do
     # The shim drains the child's pipes before sending EXIT, so every
     # output frame has already been handled; only partial lines remain.
-    {status, _timed_out} = Shim.decode_exit(payload)
-    terminal = exit_terminal(payload, :child_exit)
-    state = flush_buffers(state)
+    report = Tracking.report(state.tracking, payload)
+    status = Tracking.status(report)
+    terminal = exit_terminal(report, :child_exit, state.tracking)
+    state = finish_tracking(state, terminal) |> flush_buffers()
     notify_exit(state, status)
     %{state | exit: status, terminal: terminal} |> reply_pull_waiter()
   end
@@ -793,7 +877,10 @@ defmodule Forcola.Duplex do
       spawn_error: reason
     }
 
-    %{state | exit: {:spawn_error, reason}, terminal: terminal} |> reply_pull_waiter()
+    state
+    |> finish_tracking(terminal)
+    |> Map.merge(%{exit: {:spawn_error, reason}, terminal: with_groups(terminal, state.tracking)})
+    |> reply_pull_waiter()
   end
 
   defp notify_exit(%{delivery: :pull}, _status), do: :ok
@@ -957,24 +1044,33 @@ defmodule Forcola.Duplex do
   # EXIT frame. Preserve its observed status separately from its cleanup
   # confirmation; a missing frame never becomes a confirmed result.
   defp settle(%{port: port, exit: nil, cleanup_timeout_ms: cleanup_timeout_ms} = state) do
-    result =
+    {result, state} =
       try do
         Shim.send_frame(port, Shim.tag_kill())
         await_exit(state, cleanup_timeout_ms)
       catch
-        :error, :badarg -> :transport_lost
+        :error, :badarg -> {:transport_lost, state}
       end
 
-    terminal = shutdown_terminal(result, state.shutdown_cause)
+    terminal = shutdown_terminal(result, state.shutdown_cause, state.tracking)
+    finish_tracking(state, terminal)
     warn_unconfirmed_cleanup(terminal.confirmation)
     close_port(port)
     terminal
   end
 
   # The shim already accounted for the child; nothing left to kill.
-  defp settle(%{port: port, terminal: terminal}) do
+  defp settle(%{port: port, terminal: terminal} = state) do
+    finish_tracking(state, terminal)
     close_port(port)
-    terminal
+    with_groups(terminal, state.tracking)
+  end
+
+  defp with_groups(terminal, tracking),
+    do: %{terminal | tracked_groups: Tracking.groups(tracking)}
+
+  defp finish_tracking(state, terminal) do
+    %{state | tracking: Tracking.finish(state.tracking, terminal.scope, terminal.confirmation)}
   end
 
   defp await_exit(state, timeout_ms) do
@@ -986,45 +1082,51 @@ defmodule Forcola.Duplex do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if remaining <= 0 do
-      :timeout
+      {:timeout, state}
     else
       receive do
         {^port, {:data, <<tag, payload::binary>>}} ->
           cond do
             tag == Shim.tag_exit() ->
-              {:exit, payload}
+              {{:exit, Tracking.report(state.tracking, payload)}, state}
 
             tag == Shim.tag_error() ->
-              {:spawn_error, Shim.decode_error(payload, state.structured_spawn_errors)}
+              {{:spawn_error, Shim.decode_error(payload, state.structured_spawn_errors)}, state}
 
             tag == Shim.tag_spawned() ->
               do_await_exit(record_identity(state, payload), deadline)
+
+            tag == Shim.tag_tracked() ->
+              do_await_exit(record_tracked(state, payload), deadline)
 
             true ->
               do_await_exit(state, deadline)
           end
 
         {^port, {:exit_status, _status}} ->
-          :transport_lost
+          {:transport_lost, state}
       after
         min(remaining, 4_294_967_295) -> do_await_exit(state, deadline)
       end
     end
   end
 
-  defp exit_terminal(payload, cause) do
-    report = Shim.decode_exit_report(payload)
-
+  defp exit_terminal(report, cause, tracking) do
     %Terminal{
       status: report.status,
       confirmation: if(report.confirmed, do: :confirmed, else: :unconfirmed),
       cause: if(report.timed_out, do: :timeout, else: cause),
-      scope: if(report.contained, do: :active_cgroup, else: :process_group),
-      output: if(report.output_truncated, do: :truncated, else: :complete)
+      scope: report.scope,
+      output: if(report.output_truncated, do: :truncated, else: :complete),
+      tracked_groups: Tracking.groups(tracking)
     }
   end
 
-  defp shutdown_terminal({:exit, payload}, cause), do: exit_terminal(payload, cause)
+  defp shutdown_terminal({:exit, report}, cause, tracking),
+    do: exit_terminal(report, cause, tracking)
+
+  defp shutdown_terminal(result, cause, tracking),
+    do: with_groups(shutdown_terminal(result, cause), tracking)
 
   defp shutdown_terminal({:spawn_error, reason}, _cause) do
     %Terminal{
@@ -1092,7 +1194,8 @@ defmodule Forcola.Duplex do
             confirmation: :transport_lost,
             cause: :session_lost,
             scope: :unknown,
-            output: :unknown
+            output: :unknown,
+            tracked_groups: stored_groups(table)
           }
 
           :ets.insert_new(table, {:terminal, terminal})
@@ -1102,6 +1205,13 @@ defmodule Forcola.Duplex do
     end
   catch
     :error, :badarg -> {:error, :released}
+  end
+
+  defp stored_groups(table) do
+    case :ets.lookup(table, :tracked_groups) do
+      [{:tracked_groups, groups}] when is_list(groups) -> groups
+      _ -> []
+    end
   end
 
   defp warn_unconfirmed_cleanup(:unconfirmed) do

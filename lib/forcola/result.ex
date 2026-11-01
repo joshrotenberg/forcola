@@ -22,6 +22,15 @@ defmodule Forcola.Result do
   to distinguish a reused PID. An identity is an observation at spawn,
   not proof that the child is still alive.
 
+  With `track_descendants: true`, `:tracked_groups` is the first-observed
+  history of cleanup-group leaders, including the root group. Each entry is
+  `%{pid: integer, pgid: integer, start_time: map}` with `pid == pgid` and the
+  same start-time shape above. Repeated identities are deduplicated; a reused
+  PID with a different start time is a distinct entry. The list defaults to
+  `[]`, is bounded at 4,096 entries, and survives in partial results. It is
+  not a list of processes known to be alive. Root identity in this history
+  does not populate `:pid`, `:pgid`, or `:start_time` without `:spawn_identity`.
+
   `:evidence` defaults to `nil` for source-compatible struct construction.
   `Forcola.run/2` populates a map with these independent observations:
 
@@ -34,9 +43,15 @@ defmodule Forcola.Result do
     * `:output_truncated` - `true`, `false`, or `:unknown` when not reported.
     * `:cleanup` - `:confirmed`, `:unconfirmed`, or `:unknown`. Only an explicit,
       valid native EXIT confirmation yields `:confirmed`.
-    * `:scope` - `:process_group`, `:active_cgroup`, or `:unknown`.
-      Process-group confirmation says nothing about descendants that escaped
-      that group. It never confirms an entire process tree on macOS.
+    * `:scope` - `:process_group`, `:active_cgroup`, `:tree_contained`,
+      `:tree_sampled`, or `:unknown`. Process-group confirmation says nothing
+      about descendants that escaped that group. Tracking uses an explicit
+      native tree scope: Linux subreaper adoption is `:tree_contained`, while
+      macOS sampling is `:tree_sampled`. A descendant reparented before its
+      first macOS sample is outside the sampled guarantee. Tracking never
+      infers a tree scope from the older `contained` flag. Missing root
+      history, malformed observations, overflow, or unknown scope prevent
+      positive tracking confirmation even if the native report says true.
     * `:guard_close` - `:ok` or `{:error, :guard_close_timeout}`. Closing the
       transport is separate from native cleanup confirmation.
 
@@ -53,18 +68,28 @@ defmodule Forcola.Result do
           reason: nil | :timeout | :idle_timeout | :max_output_bytes | :observer_overflow,
           output_truncated: boolean() | :unknown,
           cleanup: :confirmed | :unconfirmed | :unknown,
-          scope: :process_group | :active_cgroup | :unknown,
+          scope: :process_group | :active_cgroup | :tree_contained | :tree_sampled | :unknown,
           guard_close: :ok | {:error, :guard_close_timeout}
         }
 
   @enforce_keys [:status]
-  defstruct [:status, :pid, :pgid, :start_time, stdout: "", stderr: "", evidence: nil]
+  defstruct [
+    :status,
+    :pid,
+    :pgid,
+    :start_time,
+    stdout: "",
+    stderr: "",
+    evidence: nil,
+    tracked_groups: []
+  ]
 
   @type t :: %__MODULE__{
           status: non_neg_integer() | {:signal, atom() | non_neg_integer()},
           pid: pos_integer() | nil,
           pgid: pos_integer() | nil,
           start_time: Forcola.Shim.start_time() | nil,
+          tracked_groups: [Forcola.Shim.identity()],
           stdout: binary(),
           stderr: binary(),
           evidence: evidence() | nil

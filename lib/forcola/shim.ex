@@ -15,7 +15,7 @@ defmodule Forcola.Shim do
   Frames are `{:packet, 4}`-style: a 4-byte big-endian length prefix
   (handled by the Erlang port itself), then a 1-byte tag, then the
   payload. This module owns the tag constants and the JSON payload
-  shapes for SPAWN/EXIT/ERROR/SPAWNED. Each execution mode drives the protocol.
+  shapes for SPAWN/EXIT/ERROR/SPAWNED/TRACKED. Each execution mode drives the protocol.
   """
 
   # Inbound tag: BEAM -> shim.
@@ -32,6 +32,7 @@ defmodule Forcola.Shim do
   @tag_exit 0x13
   @tag_error 0x14
   @tag_spawned 0x16
+  @tag_tracked 0x17
 
   @typedoc "Native start identity, stable for the life of a process."
   @type start_time ::
@@ -71,6 +72,8 @@ defmodule Forcola.Shim do
   def tag_error, do: @tag_error
   @doc false
   def tag_spawned, do: @tag_spawned
+  @doc false
+  def tag_tracked, do: @tag_tracked
 
   @doc false
   def negotiate(port, timeout_ms, required_features \\ ["bounded_run_v1"])
@@ -236,6 +239,7 @@ defmodule Forcola.Shim do
     selected =
       for {option, feature} <- [
             spawn_identity: "spawn_identity_v1",
+            track_descendants: "track_descendants_v1",
             structured_spawn_errors: "structured_spawn_errors_v1"
           ],
           Keyword.get(opts, option, false),
@@ -288,8 +292,8 @@ defmodule Forcola.Shim do
   boot) paired with the kernel `:boot_id`. macOS uses `kp_proc.p_starttime`
   as Unix `:seconds` and `:microseconds`. Preserve every field when recording
   an identity; these values guard against PID reuse, and are not evidence
-  that the process is still alive. The same payload shape is reserved for
-  future tracked process-group identities.
+  that the process is still alive. TRACKED uses the same payload for
+  cleanup-group leaders, with `pid == pgid` validated by the tracking decoder.
   """
   @spec decode_identity(binary()) :: {:ok, identity()} | {:error, :invalid_identity}
   def decode_identity(payload) do

@@ -78,8 +78,10 @@
 //!                Linux ticks are /proc/<pid>/stat field 22 since boot;
 //!                macOS uses the native process-start timeval. Compare every
 //!                field when checking identity, including the Linux boot id.
-//!   0x17         reserved for future TRACKED frames with the same identity
-//!                payload and a separate capability selection.
+//!   0x17 TRACKED Same identity payload, selected by track_descendants_v1.
+//!                The root group is first, before output; newly discovered
+//!                descendant group leaders follow. Tracking adds EXIT scope
+//!                tree_contained (Linux subreaper) or tree_sampled (macOS).
 
 mod cgroup;
 mod credit;
@@ -89,6 +91,7 @@ mod privdrop;
 mod protocol;
 mod spawn_error;
 mod supervisor;
+mod tracking;
 
 use std::io;
 use std::process::ExitCode;

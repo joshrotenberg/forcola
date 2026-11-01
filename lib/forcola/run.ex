@@ -3,7 +3,7 @@ defmodule Forcola.Run do
   # One-shot collection only. The native supervisor remains the sole process
   # owner; this module requests cancellation and records what it reports.
   require Logger
-  alias Forcola.{Result, Shim}
+  alias Forcola.{Result, Shim, Tracking}
 
   @window 8_192
   @observer_messages 1_024
@@ -16,6 +16,7 @@ defmodule Forcola.Run do
   ]
 
   def run(argv, opts) do
+    opts = Tracking.validate_opts!(opts)
     validate!(opts)
     strict = strict?(opts)
 
@@ -28,10 +29,10 @@ defmodule Forcola.Run do
         put_guard_close(outcome, Shim.close(port))
 
       {:error, :not_found} ->
-        {:error, {:spawn, :shim_not_found}}
+        startup_error(opts, :shim_not_found)
 
       {:error, reason} ->
-        {:error, {:spawn, reason}}
+        startup_error(opts, reason)
     end
   end
 
@@ -52,9 +53,14 @@ defmodule Forcola.Run do
          true <- now() < deadline do
       execute(port, argv, opts, strict, deadline)
     else
-      false -> {:error, {:spawn, :handshake_timeout}}
-      {:error, reason} -> {:error, {:spawn, reason}}
+      false -> startup_error(opts, :handshake_timeout)
+      {:error, reason} -> startup_error(opts, reason)
     end
+  end
+
+  defp startup_error(opts, reason) do
+    Tracking.startup_failed(opts)
+    {:error, {:spawn, reason}}
   end
 
   defp execute(port, argv, opts, strict, deadline) do
@@ -111,7 +117,8 @@ defmodule Forcola.Run do
       truncated: false,
       identity_enabled: Shim.identity_requested?(opts),
       structured_spawn_errors: Keyword.get(opts, :structured_spawn_errors, false),
-      identity: nil
+      identity: nil,
+      tracking: Tracking.new(opts)
     }
 
     collect(port, acc)
@@ -132,6 +139,7 @@ defmodule Forcola.Run do
           handle_frame(port, tag, payload, acc)
 
         {^port, {:exit_status, status}} ->
+          Tracking.finish(acc.tracking, :unknown, :transport_lost)
           res = result(acc, {:signal, :unconfirmed}, evidence(acc, {:transport, status}))
 
           if acc.reason,
@@ -164,10 +172,18 @@ defmodule Forcola.Run do
       tag == Shim.tag_stdout() -> output(port, :stdout, payload, acc)
       tag == Shim.tag_stderr() -> output(port, :stderr, payload, acc)
       tag == Shim.tag_spawned() -> spawned(port, payload, acc)
+      tag == Shim.tag_tracked() -> tracked(port, payload, acc)
       tag == Shim.tag_exit() -> finish(payload, acc)
       tag == Shim.tag_error() -> spawn_error(payload, acc)
       true -> collect(port, acc)
     end
+  end
+
+  defp tracked(port, payload, acc) do
+    {tracking, identity} = Tracking.record(acc.tracking, payload)
+    acc = %{acc | tracking: tracking}
+    Tracking.notify_record(tracking, identity)
+    collect(port, acc)
   end
 
   defp spawned(port, payload, %{identity_enabled: true, identity: nil} = acc) do
@@ -240,9 +256,15 @@ defmodule Forcola.Run do
     if valid_exit?(report) do
       ev = report_evidence(report, acc)
       raw = raw_status(report)
-      status = project_status(raw, report["confirmed"], acc.strict)
 
-      if ev.scope == :active_cgroup,
+      status =
+        if acc.tracking.enabled,
+          do: project_status(raw, ev.cleanup == :confirmed, true),
+          else: project_status(raw, report["confirmed"], acc.strict)
+
+      Tracking.finish(acc.tracking, ev.scope, ev.cleanup)
+
+      if report["contained"] == true,
         do: Logger.debug("forcola: run completed under Linux cgroup v2 containment")
 
       res = result(acc, status, ev)
@@ -277,12 +299,15 @@ defmodule Forcola.Run do
   defp project_status(_raw, _confirmed, _strict), do: {:signal, :unconfirmed}
 
   defp report_evidence(report, acc) do
+    tracked = if acc.tracking.enabled, do: Tracking.report_map(acc.tracking, report)
+
     %{
       evidence(acc, :exit)
       | child_status: report["status"],
         child_signal: report["signal"],
-        cleanup: confirmation(report["confirmed"]),
-        scope: scope(report["contained"]),
+        cleanup:
+          if(tracked, do: Tracking.confirmation(tracked), else: confirmation(report["confirmed"])),
+        scope: if(tracked, do: tracked.scope, else: scope(report["contained"])),
         reason: acc.reason || timeout_reason(report["timed_out"]),
         output_truncated: truncation(acc.truncated, report["output_truncated"])
     }
@@ -302,6 +327,7 @@ defmodule Forcola.Run do
   defp truncation(_, _), do: :unknown
 
   defp malformed(acc, report \\ %{}) do
+    Tracking.finish(acc.tracking, :unknown, :unconfirmed)
     ev = evidence(acc, :malformed_exit)
     # Retain a syntactically valid raw child observation even if other fields
     # are malformed. It cannot make the cleanup evidence positive.
@@ -320,6 +346,7 @@ defmodule Forcola.Run do
   end
 
   defp spawn_error(payload, acc) do
+    Tracking.finish(acc.tracking, :unknown, :not_started)
     reason = Shim.decode_error(payload, acc.structured_spawn_errors)
 
     if acc.partial_errors or acc.reason != nil do
@@ -334,6 +361,7 @@ defmodule Forcola.Run do
   end
 
   defp failure(acc, termination, reason) do
+    Tracking.finish(acc.tracking, :unknown, :timeout)
     ev = %{evidence(acc, termination) | reason: reason}
     {:error, {reason, result(acc, {:signal, :unconfirmed}, ev)}}
   end
@@ -359,7 +387,8 @@ defmodule Forcola.Run do
       pid: if(acc.identity, do: acc.identity.pid),
       pgid: if(acc.identity, do: acc.identity.pgid),
       start_time: if(acc.identity, do: acc.identity.start_time),
-      evidence: evidence
+      evidence: evidence,
+      tracked_groups: Tracking.groups(acc.tracking)
     }
   end
 
