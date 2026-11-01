@@ -346,4 +346,44 @@ defmodule Forcola.DaemonTest do
         poll(fun, deadline)
     end
   end
+
+  describe "readiness under an output flood" do
+    test "the ready check and its deadline keep their cadence while the child floods stdout" do
+      Process.flag(:trap_exit, true)
+      test_pid = self()
+      started = System.monotonic_time(:millisecond)
+
+      result =
+        Forcola.Daemon.start_link(
+          argv: ["yes"],
+          ready: fn ->
+            send(test_pid, :ready_called)
+            false
+          end,
+          ready_poll_ms: 50,
+          ready_timeout_ms: 500,
+          output: fn _stream, _chunk -> :ok end,
+          kill_grace_ms: 200
+        )
+
+      elapsed = System.monotonic_time(:millisecond) - started
+      assert {:error, :ready_timeout} = result
+
+      # Ten polls fit the window. Scheduling slack aside, a check that ran only
+      # when the mailbox happened to be empty would land far below this.
+      assert count_messages(:ready_called) >= 5
+
+      # The deadline fired on time although frames never stopped arriving; the
+      # bound includes the TERM/KILL cleanup of the flooding child.
+      assert elapsed < 500 + 200 + 1_500
+    end
+  end
+
+  defp count_messages(message, count \\ 0) do
+    receive do
+      ^message -> count_messages(message, count + 1)
+    after
+      0 -> count
+    end
+  end
 end
