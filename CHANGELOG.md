@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.9.0](https://github.com/joshrotenberg/forcola/compare/v0.8.0...v0.9.0) (2026-11-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* env values must be binaries, nil or false. Other values, such as atoms, now raise ArgumentError before spawning instead of being encoded as strings.
+
+### Features
+
+* support env unsets and interrupt cleanup in every mode ([#108](https://github.com/joshrotenberg/forcola/issues/108)) ([0141f10](https://github.com/joshrotenberg/forcola/commit/0141f102475f5ea5969c16371c40213183d73b54))
+* track descendant processes through cleanup ([#110](https://github.com/joshrotenberg/forcola/issues/110)) ([4e9c142](https://github.com/joshrotenberg/forcola/commit/4e9c142d8653c982237202ce3e5ee9d77a1ef083))
+
+
+### Bug Fixes
+
+* **daemon:** keep the readiness check on schedule while the child floods output (closes [#116](https://github.com/joshrotenberg/forcola/issues/116)) ([#120](https://github.com/joshrotenberg/forcola/issues/120)) ([36ae35d](https://github.com/joshrotenberg/forcola/commit/36ae35d29e5ce29c3d912b4806c442bffbee55d1))
+* **duplex:** reject non-iodata in send_line/2 instead of crashing the session (closes [#115](https://github.com/joshrotenberg/forcola/issues/115)) ([#118](https://github.com/joshrotenberg/forcola/issues/118)) ([debd045](https://github.com/joshrotenberg/forcola/commit/debd0457db0ff1df95d2a3cf91087febf112734e))
+* include the cgroup drain in the Elixir cleanup budget (closes [#113](https://github.com/joshrotenberg/forcola/issues/113)) ([#121](https://github.com/joshrotenberg/forcola/issues/121)) ([11fc31d](https://github.com/joshrotenberg/forcola/commit/11fc31d2d288e09705412a6f8f98880f738b70b7))
+* make EXIT decoders total so a malformed frame never crashes a mode (closes [#112](https://github.com/joshrotenberg/forcola/issues/112)) ([#117](https://github.com/joshrotenberg/forcola/issues/117)) ([a16d773](https://github.com/joshrotenberg/forcola/commit/a16d773b3d5b559e4a2e3d56d297c033b2350de9))
+* **shim:** write child stdin from a dedicated thread so a stuck child cannot wedge cleanup (closes [#111](https://github.com/joshrotenberg/forcola/issues/111)) ([#123](https://github.com/joshrotenberg/forcola/issues/123)) ([49576c9](https://github.com/joshrotenberg/forcola/commit/49576c973749880e61d18693dfa50e2ef0fd3a7c))
+* validate timeout_ms on every run/2 and Stream.lines/2 call (closes [#114](https://github.com/joshrotenberg/forcola/issues/114)) ([#119](https://github.com/joshrotenberg/forcola/issues/119)) ([da6170c](https://github.com/joshrotenberg/forcola/commit/da6170cf5e27f8a50e1172a3496769f88785adb8))
+
 ## [0.8.0](https://github.com/joshrotenberg/forcola/compare/v0.7.0...v0.8.0) (2026-11-01)
 
 
