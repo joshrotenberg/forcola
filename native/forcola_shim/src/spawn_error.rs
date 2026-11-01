@@ -231,6 +231,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn both_report_pipe_ends_are_close_on_exec() {
+        let (reader, writer) = channel().unwrap();
+        assert!(rustix::io::fcntl_getfd(&reader.0)
+            .unwrap()
+            .contains(rustix::io::FdFlags::CLOEXEC));
+        assert!(rustix::io::fcntl_getfd(&writer.0)
+            .unwrap()
+            .contains(rustix::io::FdFlags::CLOEXEC));
+    }
+
+    #[test]
     fn only_an_explicit_exec_marker_attributes_exec() {
         let (reader, writer) = channel().unwrap();
         drop(writer);

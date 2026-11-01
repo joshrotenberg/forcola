@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -231,8 +232,8 @@ fn failure_before_child_hook_is_spawn_not_exec_and_does_not_block() {
     assert!(report["spawn_error"]["path"].is_null());
 }
 
-fn successful(request: Value, features: &[&str]) -> (Vec<u8>, Vec<u8>) {
-    let mut shim = Shim::new(Some(features));
+fn successful(request: Value, features: Option<&[&str]>) -> (Vec<u8>, Vec<u8>) {
+    let mut shim = Shim::new(features);
     shim.spawn(request);
     let mut tags = Vec::new();
     let mut output = Vec::new();
@@ -269,11 +270,11 @@ fn relative_executable_and_path_use_requested_cwd_including_replaced_env_and_pty
             for pty in [false, true] {
                 let (output, tags) = successful(
                     json!({"argv":[argv],"cd":dir.0,"env":{"PATH":"."},"env_mode":mode,"pty":pty}),
-                    &[
+                    Some(&[
                         "structured_spawn_errors_v1",
                         "spawn_identity_v1",
                         "bounded_run_v1",
-                    ],
+                    ]),
                 );
                 assert_eq!(output, b"relative-ok");
                 assert_eq!(tags.first(), Some(&SPAWNED));
@@ -285,11 +286,19 @@ fn relative_executable_and_path_use_requested_cwd_including_replaced_env_and_pty
 
 #[test]
 fn attribution_pipe_descriptors_are_not_inherited_by_the_executable() {
-    let (output, tags) = successful(
-        json!({"argv":["python3","-c","import os\nopened=[]\nfor fd in range(3,512):\n try: os.fstat(fd); opened.append(fd)\n except OSError: pass\nprint(opened)"]}),
-        &["structured_spawn_errors_v1"],
-    );
-    assert_eq!(String::from_utf8(output).unwrap().trim(), "[]");
+    // Runners may intentionally pass inheritable descriptors to the shim.
+    // Keep one open ourselves so this regression also exercises that case
+    // locally. The feature must add no fds to the unchanged legacy baseline.
+    let inherited = fs::File::open("/dev/null").unwrap();
+    rustix::io::fcntl_setfd(&inherited, rustix::io::FdFlags::empty()).unwrap();
+    let limit = (inherited.as_raw_fd() + 1).max(512).to_string();
+    let request = json!({"argv":["python3","-c","import os,sys\nopened=[]\nfor fd in range(3,int(sys.argv[1])):\n try: os.fstat(fd); opened.append(fd)\n except OSError: pass\nprint(opened)",limit]});
+    let (legacy, _) = successful(request.clone(), None);
+    let (output, tags) = successful(request, Some(&["structured_spawn_errors_v1"]));
+    let legacy: Vec<i32> = serde_json::from_slice(&legacy).unwrap();
+    let observed: Vec<i32> = serde_json::from_slice(&output).unwrap();
+    assert!(legacy.contains(&inherited.as_raw_fd()));
+    assert_eq!(observed, legacy);
     assert!(!tags.contains(&SPAWNED));
 }
 
