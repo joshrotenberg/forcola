@@ -186,8 +186,8 @@ defmodule Forcola.Stream do
   Takes the common execution options from `Forcola.run/2`, including the trusted
   `:shim_path` override and `:user`/`:group`
   for running the child as a different user (POSIX-only, fail-closed,
-  privileged shim required); `:timeout_ms` is required and bounds the
-  whole run, not the gap between lines.
+  privileged shim required); `:timeout_ms` is required, an integer in
+  `0..4_294_967_295`, and bounds the whole run, not the gap between lines.
   `:max_output_bytes` raises `ArgumentError` before opening a shim.
 
   Environment values must be binary strings, `nil`, or `false`. Both `nil`
@@ -272,7 +272,7 @@ defmodule Forcola.Stream do
     opts = if opts[:spawn_observer], do: Keyword.put(opts, :spawn_identity, true), else: opts
     Shim.reject_run_options!(opts, __MODULE__, [:idle_timeout_ms])
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
-    validate_negotiated_timeout!(opts, timeout_ms)
+    validate_timeout!(timeout_ms)
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
     idle_timeout_ms = Keyword.get(opts, :idle_timeout_ms)
     window_bytes = resolve_window_bytes(opts)
@@ -301,14 +301,9 @@ defmodule Forcola.Stream do
       do: raise(ArgumentError, "Forcola.Stream :spawn_identity requires :spawn_observer")
   end
 
-  defp validate_negotiated_timeout!(opts, timeout_ms) do
-    if Shim.negotiated?(opts) and
-         not (is_integer(timeout_ms) and timeout_ms >= 0 and timeout_ms <= 4_294_967_295),
-       do:
-         raise(
-           ArgumentError,
-           "timeout_ms must be an integer in 0..4294967295 with negotiated options"
-         )
+  defp validate_timeout!(timeout_ms) do
+    unless is_integer(timeout_ms) and timeout_ms >= 0 and timeout_ms <= 4_294_967_295,
+      do: raise(ArgumentError, "timeout_ms must be an integer in 0..4294967295")
   end
 
   # Backpressure is opt-in. `:window_bytes` sets the read budget in bytes and

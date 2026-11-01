@@ -105,7 +105,7 @@ execution. Older shims return `{:error, {:spawn, :incompatible_shim}}`.
 Handshake stalls return `{:error, {:spawn, :handshake_timeout}}`, malformed
 replies return `{:error, {:spawn, :invalid_handshake}}`, and transport exit
 before SPAWN returns `{:error, {:spawn, {:shim_exited, status}}}`. With new
-options, `timeout_ms` is an integer in `0..4_294_967_295` and includes startup
+options, `timeout_ms` (always an integer in `0..4_294_967_295`) includes startup
 negotiation; SPAWN receives only its remaining budget. Cleanup and guard close
 can extend beyond that execution deadline (see `Forcola.run/2`).
 `cgroup: :required` alone keeps legacy collection and errors without HELLO;
