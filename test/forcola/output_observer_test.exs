@@ -49,18 +49,19 @@ defmodule Forcola.OutputObserverTest do
   test "merged stderr retains the final bytes and is observed only as stdout" do
     reference = make_ref()
     command = ["/bin/sh", "-c", "printf out; printf err >&2"]
-    assert {:ok, expected} = Forcola.run(command, timeout_ms: 5_000, merge_stderr: true)
 
-    assert {:ok, ^expected} =
+    assert {:ok, result} =
              Forcola.run(command,
                timeout_ms: 5_000,
                merge_stderr: true,
                output_observer: {self(), reference}
              )
 
-    assert expected.stdout == "outerr"
-    assert expected.stderr == ""
-    assert drain(reference) == %{stdout: "outerr", stderr: ""}
+    # The native pumps read separate pipes; their relative order can vary.
+    assert result.status == 0
+    assert result.stdout in ["outerr", "errout"]
+    assert result.stderr == ""
+    assert drain(reference) == %{stdout: result.stdout, stderr: ""}
   end
 
   test "invalid observers are rejected before opening the shim or executing a child", %{

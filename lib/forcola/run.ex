@@ -19,7 +19,9 @@ defmodule Forcola.Run do
   def run(argv, opts) do
     validate!(opts)
     strict = strict?(opts)
-    deadline = if strict, do: now() + Keyword.fetch!(opts, :timeout_ms)
+
+    deadline =
+      if strict or Shim.identity_requested?(opts), do: now() + Keyword.fetch!(opts, :timeout_ms)
 
     case Shim.open(opts) do
       {:ok, port} ->
@@ -44,10 +46,12 @@ defmodule Forcola.Run do
 
   defp execute_checked(port, argv, opts, false, nil), do: execute(port, argv, opts, false, nil)
 
-  defp execute_checked(port, argv, opts, true, deadline) do
-    with :ok <- Shim.negotiate(port, max(deadline - now(), 0)),
+  defp execute_checked(port, argv, opts, strict, deadline) do
+    features = Shim.identity_features(opts, if(strict, do: ["bounded_run_v1"], else: []))
+
+    with :ok <- Shim.negotiate(port, max(deadline - now(), 0), features),
          true <- now() < deadline do
-      execute(port, argv, opts, true, deadline)
+      execute(port, argv, opts, strict, deadline)
     else
       false -> {:error, {:spawn, :handshake_timeout}}
       {:error, reason} -> {:error, {:spawn, reason}}
@@ -61,6 +65,11 @@ defmodule Forcola.Run do
     timeout_at = deadline || now + Keyword.fetch!(opts, :timeout_ms)
     idle = opts[:idle_timeout_ms]
     spawn_opts = Keyword.put(opts, :kill_grace_ms, grace)
+
+    spawn_opts =
+      if deadline,
+        do: Keyword.put(spawn_opts, :timeout_ms, max(deadline - now(), 0)),
+        else: spawn_opts
 
     # Merge in the collector so credit can be returned to the correct pipe.
     # On the wire both pumps stay independent, each with a finite window.
@@ -100,7 +109,9 @@ defmodule Forcola.Run do
       backstop: timeout_at + grace + interrupt_grace + @margin,
       cleanup_ms: grace + interrupt_grace + @margin,
       reason: nil,
-      truncated: false
+      truncated: false,
+      identity_enabled: Shim.identity_requested?(opts),
+      identity: nil
     }
 
     collect(port, acc)
@@ -152,11 +163,21 @@ defmodule Forcola.Run do
     cond do
       tag == Shim.tag_stdout() -> output(port, :stdout, payload, acc)
       tag == Shim.tag_stderr() -> output(port, :stderr, payload, acc)
+      tag == Shim.tag_spawned() -> spawned(port, payload, acc)
       tag == Shim.tag_exit() -> finish(payload, acc)
       tag == Shim.tag_error() -> spawn_error(payload, acc)
       true -> collect(port, acc)
     end
   end
+
+  defp spawned(port, payload, %{identity_enabled: true, identity: nil} = acc) do
+    case Shim.decode_identity(payload) do
+      {:ok, identity} -> collect(port, %{acc | identity: identity})
+      {:error, _reason} -> collect(port, acc)
+    end
+  end
+
+  defp spawned(port, _payload, acc), do: collect(port, acc)
 
   defp output(port, channel, payload, %{reason: nil} = acc) do
     size = byte_size(payload)
@@ -339,6 +360,9 @@ defmodule Forcola.Run do
       status: status,
       stdout: IO.iodata_to_binary(acc.stdout),
       stderr: IO.iodata_to_binary(acc.stderr),
+      pid: if(acc.identity, do: acc.identity.pid),
+      pgid: if(acc.identity, do: acc.identity.pgid),
+      start_time: if(acc.identity, do: acc.identity.start_time),
       evidence: evidence
     }
   end
@@ -356,6 +380,8 @@ defmodule Forcola.Run do
   defp put_guard_close(outcome, _close), do: outcome
 
   defp validate!(opts) do
+    Shim.reject_spawn_observer!(opts, "Forcola.run/2")
+    Shim.validate_spawn_identity!(opts)
     validate_observer!(opts[:output_observer])
 
     for key <- [:idle_timeout_ms, :max_output_bytes] do
@@ -366,12 +392,12 @@ defmodule Forcola.Run do
     validate_interrupt!(opts)
     timeout = Keyword.fetch!(opts, :timeout_ms)
 
-    if strict?(opts) and
+    if (strict?(opts) or Shim.identity_requested?(opts)) and
          not (is_integer(timeout) and timeout >= 0 and timeout <= 4_294_967_295),
        do:
          raise(
            ArgumentError,
-           "timeout_ms must be an integer in 0..4294967295 with strict options"
+           "timeout_ms must be an integer in 0..4294967295 with negotiated options"
          )
   end
 

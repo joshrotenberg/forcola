@@ -192,6 +192,18 @@ defmodule Forcola.Stream do
   EOF right away instead of blocking. Use `Forcola.Duplex` for interactive
   stdin.
 
+  `:spawn_observer` accepts `{local_pid, reference}` and sends
+  `{reference, {:spawned, identity}}` before the first output line is yielded.
+  The identity is `%{pid: integer, pgid: integer, start_time: map}`; see
+  `Forcola.Result` for the exact Linux and macOS start-time fields.
+  The observer enables `spawn_identity_v1` negotiation even if
+  `spawn_identity: false` is supplied. Setting `spawn_identity: true` without
+  a non-nil observer raises `ArgumentError` before opening a shim, because
+  a stream has no other identity result or query API. The whole-run timeout
+  includes the capability exchange; incompatible shims fail before SPAWN.
+  The default performs no identity negotiation or notification. Messages are
+  unacknowledged, and a dead observer does not affect execution.
+
   `:idle_timeout_ms` (optional, milliseconds; default `nil` = disabled)
   bounds the gap between output frames: if no STDOUT or STDERR data
   arrives within the interval the producer is treated as stalled, the
@@ -225,8 +237,13 @@ defmodule Forcola.Stream do
   """
   @spec lines([String.t(), ...], keyword()) :: Enumerable.t()
   def lines([_binary | _] = argv, opts) do
+    Shim.validate_spawn_identity!(opts)
+    Shim.validate_spawn_observer!(opts)
+    validate_identity_observer!(opts)
+    opts = if opts[:spawn_observer], do: Keyword.put(opts, :spawn_identity, true), else: opts
     Shim.reject_run_options!(opts, __MODULE__, [:idle_timeout_ms])
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
+    validate_identity_timeout!(opts, timeout_ms)
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
     idle_timeout_ms = Keyword.get(opts, :idle_timeout_ms)
     window_bytes = resolve_window_bytes(opts)
@@ -248,6 +265,21 @@ defmodule Forcola.Stream do
       &next/1,
       &cleanup/1
     )
+  end
+
+  defp validate_identity_observer!(opts) do
+    if Shim.identity_requested?(opts) and is_nil(opts[:spawn_observer]),
+      do: raise(ArgumentError, "Forcola.Stream :spawn_identity requires :spawn_observer")
+  end
+
+  defp validate_identity_timeout!(opts, timeout_ms) do
+    if Shim.identity_requested?(opts) and
+         not (is_integer(timeout_ms) and timeout_ms >= 0 and timeout_ms <= 4_294_967_295),
+       do:
+         raise(
+           ArgumentError,
+           "timeout_ms must be an integer in 0..4294967295 with spawn identity"
+         )
   end
 
   # Backpressure is opt-in. `:window_bytes` sets the read budget in bytes and
@@ -300,10 +332,15 @@ defmodule Forcola.Stream do
          max_line_bytes,
          max_stderr_bytes
        ) do
-    case Shim.open(opts) do
+    started_at = System.monotonic_time(:millisecond)
+
+    case Shim.open_with_identity(opts, timeout_ms) do
       {:ok, port} ->
+        timeout_ms = identity_timeout(port, opts, timeout_ms, started_at)
+
         spawn_opts =
           opts
+          |> Keyword.put(:timeout_ms, timeout_ms)
           |> Keyword.put(:kill_grace_ms, kill_grace_ms)
           |> put_window_bytes(window_bytes)
           |> put_bounded_stderr(max_stderr_bytes)
@@ -330,6 +367,9 @@ defmodule Forcola.Stream do
 
         %{
           port: port,
+          identity_enabled: Shim.identity_requested?(opts),
+          identity: nil,
+          spawn_observer: opts[:spawn_observer],
           buffer: "",
           stderr: [],
           stderr_bytes: 0,
@@ -353,6 +393,21 @@ defmodule Forcola.Stream do
 
       {:error, reason} ->
         raise Error, reason: reason
+    end
+  end
+
+  defp identity_timeout(port, opts, timeout_ms, started_at) do
+    if Shim.identity_requested?(opts) do
+      remaining = timeout_ms - (System.monotonic_time(:millisecond) - started_at)
+
+      if remaining <= 0 do
+        Shim.close(port)
+        raise Error, reason: :handshake_timeout
+      end
+
+      remaining
+    else
+      timeout_ms
     end
   end
 
@@ -484,9 +539,9 @@ defmodule Forcola.Stream do
   # early-halt path in cleanup/1. cleanup/1 will still close and flush the
   # port afterward; the exit is already set, so it takes the non-handshake
   # clause and does not KILL again.
-  defp kill_and_confirm(%{port: port, kill_grace_ms: kill_grace_ms}) do
+  defp kill_and_confirm(%{port: port, kill_grace_ms: kill_grace_ms} = state) do
     Shim.send_frame(port, Shim.tag_kill())
-    await_exit(port, kill_grace_ms + @backstop_margin_ms)
+    await_exit(state, kill_grace_ms + @backstop_margin_ms)
   catch
     :error, :badarg -> :shim_exited
   end
@@ -502,6 +557,9 @@ defmodule Forcola.Stream do
       tag == Shim.tag_stderr() ->
         consume_stderr(reset_idle(state), payload)
 
+      tag == Shim.tag_spawned() ->
+        {[], record_identity(state, payload)}
+
       tag == Shim.tag_exit() ->
         handle_exit(payload, state)
 
@@ -513,6 +571,23 @@ defmodule Forcola.Stream do
         {[], state}
     end
   end
+
+  defp record_identity(%{identity_enabled: true, identity: nil} = state, payload) do
+    case Shim.decode_identity(payload) do
+      {:ok, identity} ->
+        if state.spawn_observer do
+          {pid, ref} = state.spawn_observer
+          send(pid, {ref, {:spawned, identity}})
+        end
+
+        %{state | identity: identity}
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp record_identity(state, _payload), do: state
 
   defp consume_stderr(%{max_stderr_bytes: nil} = state, payload) do
     {[], %{state | stderr: [state.stderr, payload]}}
@@ -630,11 +705,11 @@ defmodule Forcola.Stream do
   # Early halt: the child may still be running. Kill the group and wait
   # for the shim's EXIT frame (the shim confirms group death before
   # sending it), so the halt does not return until the group is dead.
-  defp cleanup(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms}) do
+  defp cleanup(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms} = state) do
     confirmation =
       try do
         Shim.send_frame(port, Shim.tag_kill())
-        await_exit(port, kill_grace_ms + @backstop_margin_ms)
+        await_exit(state, kill_grace_ms + @backstop_margin_ms)
       catch
         # The port raced us shut (shim already gone); its death killed the
         # group by the shim's stdin-EOF rule, so there is nothing to wait on.
@@ -650,12 +725,12 @@ defmodule Forcola.Stream do
     close_port(port)
   end
 
-  defp await_exit(port, timeout_ms) do
+  defp await_exit(state, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    do_await_exit(port, deadline)
+    do_await_exit(state, deadline)
   end
 
-  defp do_await_exit(port, deadline) do
+  defp do_await_exit(%{port: port} = state, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     receive do
@@ -663,7 +738,8 @@ defmodule Forcola.Stream do
         cond do
           tag == Shim.tag_exit() -> decode_terminal_exit(payload)
           tag == Shim.tag_error() -> :error
-          true -> do_await_exit(port, deadline)
+          tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
+          true -> do_await_exit(state, deadline)
         end
 
       {^port, {:exit_status, _status}} ->

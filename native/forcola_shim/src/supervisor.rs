@@ -4,11 +4,14 @@
 use crate::cgroup::{self, Cgroup};
 use crate::credit::{Credit, Permit};
 use crate::frame::{
-    self, Frame, TAG_CREDIT, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_KILL, TAG_SPAWN, TAG_STDERR,
-    TAG_STDERR_CREDIT, TAG_STDIN, TAG_STDOUT,
+    self, Frame, TAG_CAPABILITIES, TAG_CREDIT, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_HELLO, TAG_KILL,
+    TAG_SPAWN, TAG_SPAWNED, TAG_STDERR, TAG_STDERR_CREDIT, TAG_STDIN, TAG_STDOUT,
 };
+use crate::identity;
 use crate::privdrop::{self, DropPlan};
-use crate::protocol::{CgroupMode, EnvMode, ErrorReport, ExitReport, SpawnRequest};
+use crate::protocol::{
+    Capabilities, CgroupMode, EnvMode, ErrorReport, ExitReport, HelloRequest, SpawnRequest,
+};
 
 use rustix::process::{self, Pid, Signal};
 use std::fs::File;
@@ -17,7 +20,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,23 +52,42 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// Runs the shim: read one SPAWN frame, supervise the child, and keep
 /// handling protocol frames until the child has exited.
 pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
-    mut stdin: R,
+    stdin: R,
     stdout: W,
 ) -> io::Result<()> {
+    run_with_capabilities(stdin, stdout, supported_features)
+}
+
+fn run_with_capabilities<R, W, F>(mut stdin: R, stdout: W, capabilities: F) -> io::Result<()>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+    F: FnOnce() -> Vec<&'static str>,
+{
     let out = Arc::new(Mutex::new(stdout));
 
     // SPAWN is mandatory, with an optional capability request before it.
     // Optional capability exchange MUST finish before any child is spawned.
     // Old shims reject this first tag instead of ignoring new SPAWN keys.
+    let mut selected = SelectedFeatures::default();
     let first = frame::read_frame(&mut stdin)?;
     let first = match first {
-        Some(f) if f.tag == 0x07 => {
+        Some(f) if f.tag == TAG_HELLO => {
+            let features = capabilities();
+            selected = match select_features(&f.payload, &features) {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    write_error(&out, &reason);
+                    return Ok(());
+                }
+            };
+            let capabilities = Capabilities {
+                protocol: 1,
+                features,
+            };
+            let payload = serde_json::to_vec(&capabilities)?;
             let mut w = out.lock().unwrap();
-            frame::write_frame(
-                &mut *w,
-                0x15,
-                br#"{"protocol":1,"features":["bounded_run_v1"]}"#,
-            )?;
+            frame::write_frame(&mut *w, TAG_CAPABILITIES, &payload)?;
             drop(w);
             frame::read_frame(&mut stdin)?
         }
@@ -109,6 +131,30 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
 
     let pgid = Pid::from_child(&child);
     let kill_grace = Duration::from_millis(request.kill_grace_ms);
+
+    if selected.spawn_identity {
+        // No output pumps or waiter exist yet. Fast exits remain unreaped,
+        // retaining their native start time and preventing pid reuse until the
+        // identity has been captured. The shared writer preserves this frame
+        // ahead of every stdout/stderr frame, including for pty children.
+        let identity = match identity::read(child.id()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                abort_spawn(child, cgroup.as_ref(), kill_grace);
+                write_error(&out, &format!("spawn identity failed: {error}"));
+                return Ok(());
+            }
+        };
+        let written = serde_json::to_vec(&identity)
+            .map_err(io::Error::other)
+            .and_then(|payload| {
+                frame::write_frame(&mut *out.lock().unwrap(), TAG_SPAWNED, &payload)
+            });
+        if let Err(error) = written {
+            abort_spawn(child, cgroup.as_ref(), kill_grace);
+            return Err(error);
+        }
+    }
 
     // Backpressure is opt-in: a `window_bytes` in the SPAWN payload gates the
     // stdout pump on a shared read budget. Absent, the pump reads eagerly and
@@ -221,6 +267,73 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
     }
 
     Ok(())
+}
+
+fn supported_features() -> Vec<&'static str> {
+    static IDENTITY_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    supported_features_with_probe(&IDENTITY_AVAILABLE, || {
+        identity::read(std::process::id()).map(|_| ())
+    })
+}
+
+fn supported_features_with_probe<F>(
+    identity_available: &OnceLock<bool>,
+    probe: F,
+) -> Vec<&'static str>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    let mut features = vec!["bounded_run_v1"];
+    // Probe the running shim when HELLO is handled, including an empty HELLO,
+    // rather than assuming that a supported OS makes its process metadata
+    // readable. This catches unavailable procfs or denied libproc access
+    // before SPAWN, but does not guarantee access to a child after a privilege
+    // change. The post-spawn read still fails closed and cleans up that child.
+    if *identity_available.get_or_init(|| probe().is_ok()) {
+        features.push("spawn_identity_v1");
+    }
+    features
+}
+
+/// Selected outbound extensions are independent of advertised capabilities.
+/// Future TRACKED selection can add its own field without changing SPAWNED.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SelectedFeatures {
+    spawn_identity: bool,
+}
+
+fn select_features(payload: &[u8], supported: &[&str]) -> Result<SelectedFeatures, String> {
+    let request = if payload.is_empty() {
+        HelloRequest::default()
+    } else {
+        serde_json::from_slice::<HelloRequest>(payload)
+            .map_err(|error| format!("invalid HELLO payload: {error}"))?
+    };
+    for feature in &request.features {
+        if !supported.contains(&feature.as_str()) {
+            return Err(format!("unsupported feature: {feature}"));
+        }
+    }
+    Ok(SelectedFeatures {
+        spawn_identity: request
+            .features
+            .iter()
+            .any(|feature| feature == "spawn_identity_v1"),
+    })
+}
+
+/// Startup reporting failed before the waiter took ownership. Stop the owned
+/// group immediately, including a cgroup backstop when present, then reap the
+/// child and remove its cgroup. No early error may leave a live child behind.
+fn abort_spawn(mut child: Child, cgroup: Option<&Cgroup>, grace: Duration) {
+    let _ = process::kill_process_group(Pid::from_child(&child), Signal::KILL);
+    if let Some(cgroup) = cgroup {
+        cgroup.kill();
+    }
+    let _ = child.wait();
+    if let Some(cgroup) = cgroup {
+        finish_cgroup(cgroup, grace);
+    }
 }
 
 /// Drains inbound events after EXIT so late CREDIT writes from the BEAM are
@@ -967,6 +1080,194 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn identity_capability_probe_caches_success_and_failure() {
+        use std::cell::Cell;
+        use std::io;
+        use std::sync::OnceLock;
+
+        for available in [false, true] {
+            let cache = OnceLock::new();
+            let calls = Cell::new(0);
+            let first = super::supported_features_with_probe(&cache, || {
+                calls.set(calls.get() + 1);
+                if available {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "metadata denied",
+                    ))
+                }
+            });
+            let again = super::supported_features_with_probe(&cache, || {
+                calls.set(calls.get() + 1);
+                // A different later result must not change this shim's offer.
+                if available {
+                    Err(io::Error::other("metadata became unavailable"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(calls.get(), 1);
+            assert_eq!(first, again);
+            assert!(first.contains(&"bounded_run_v1"));
+            assert_eq!(first.contains(&"spawn_identity_v1"), available);
+        }
+    }
+
+    #[test]
+    fn unavailable_identity_rejects_selection_without_reading_spawn() {
+        use crate::frame::{write_frame, TAG_ERROR, TAG_HELLO};
+        use std::io::{self, Read, Write};
+        use std::sync::OnceLock;
+
+        struct HelloOnly(Cursor<Vec<u8>>);
+        impl Read for HelloOnly {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                assert!(
+                    self.0.position() < self.0.get_ref().len() as u64,
+                    "an unavailable requested capability must fail before reading SPAWN"
+                );
+                self.0.read(bytes)
+            }
+        }
+
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut input = Vec::new();
+        write_frame(
+            &mut input,
+            TAG_HELLO,
+            br#"{"features":["spawn_identity_v1"]}"#,
+        )
+        .unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let cache = OnceLock::new();
+        super::run_with_capabilities(
+            HelloOnly(Cursor::new(input)),
+            Capture(Arc::clone(&output)),
+            || {
+                super::supported_features_with_probe(&cache, || {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "procfs unavailable",
+                    ))
+                })
+            },
+        )
+        .unwrap();
+
+        let mut frames = Cursor::new(output.lock().unwrap().clone());
+        let error = read_frame(&mut frames).unwrap().unwrap();
+        assert_eq!(error.tag, TAG_ERROR);
+        let error: serde_json::Value = serde_json::from_slice(&error.payload).unwrap();
+        assert_eq!(error["reason"], "unsupported feature: spawn_identity_v1");
+        assert!(read_frame(&mut frames).unwrap().is_none());
+    }
+
+    #[test]
+    fn selected_features_require_explicit_supported_selection() {
+        let supported = ["bounded_run_v1", "spawn_identity_v1"];
+        for payload in [
+            b"".as_slice(),
+            br#"{"features":[]}"#,
+            br#"{"features":["bounded_run_v1"]}"#,
+        ] {
+            assert_eq!(
+                super::select_features(payload, &supported).unwrap(),
+                super::SelectedFeatures::default()
+            );
+        }
+        for payload in [
+            br#"{"features":["spawn_identity_v1"]}"#.as_slice(),
+            br#"{"features":["bounded_run_v1","spawn_identity_v1"]}"#,
+        ] {
+            assert_eq!(
+                super::select_features(payload, &supported).unwrap(),
+                super::SelectedFeatures {
+                    spawn_identity: true
+                }
+            );
+        }
+        assert!(super::select_features(br#"{"features":["tracked_v1"]}"#, &supported).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn failed_identity_delivery_kills_and_reaps_the_child() {
+        use crate::frame::{write_frame, TAG_CAPABILITIES, TAG_HELLO, TAG_SPAWN, TAG_SPAWNED};
+        use std::io::{self, Write};
+
+        struct FailIdentity {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            flushes: usize,
+        }
+
+        impl Write for FailIdentity {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.flushes == 2 {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "identity delivery failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let mut input = Vec::new();
+        write_frame(
+            &mut input,
+            TAG_HELLO,
+            br#"{"features":["spawn_identity_v1"]}"#,
+        )
+        .unwrap();
+        write_frame(
+            &mut input,
+            TAG_SPAWN,
+            br#"{"argv":["sleep","30"],"kill_grace_ms":0}"#,
+        )
+        .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = FailIdentity {
+            bytes: Arc::clone(&bytes),
+            flushes: 0,
+        };
+        assert!(super::run(Cursor::new(input), writer).is_err());
+        let mut frames = Cursor::new(bytes.lock().unwrap().clone());
+        assert_eq!(
+            read_frame(&mut frames).unwrap().unwrap().tag,
+            TAG_CAPABILITIES
+        );
+        let identity = read_frame(&mut frames).unwrap().unwrap();
+        assert_eq!(identity.tag, TAG_SPAWNED);
+        let identity: serde_json::Value = serde_json::from_slice(&identity.payload).unwrap();
+        let pid = rustix::process::Pid::from_raw(identity["pid"].as_i64().unwrap() as i32).unwrap();
+        assert_eq!(rustix::process::test_kill_process(pid), Err(Errno::SRCH));
+        assert_eq!(
+            rustix::process::test_kill_process_group(pid),
+            Err(Errno::SRCH)
+        );
+    }
 
     // Decodes concatenated frames back into their joined payload bytes.
     fn joined_payloads(bytes: &[u8]) -> Vec<u8> {
