@@ -12,8 +12,10 @@ use crate::privdrop::{self, DropPlan};
 use crate::protocol::{
     Capabilities, CgroupMode, EnvMode, ErrorReport, ExitReport, HelloRequest, SpawnRequest,
 };
+use crate::spawn_error::{self, ChildReporter, ReportReader, SpawnFailure, Stage};
 
 use rustix::process::{self, Pid, Signal};
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
@@ -121,13 +123,14 @@ where
         return Ok(());
     }
 
-    let (mut child, pty_master, cgroup) = match spawn_child(&request) {
-        Ok(c) => c,
-        Err(e) => {
-            write_error(&out, &format!("spawn failed: {e}"));
-            return Ok(());
-        }
-    };
+    let (mut child, pty_master, cgroup) =
+        match spawn_child(&request, selected.structured_spawn_errors) {
+            Ok(c) => c,
+            Err(e) => {
+                write_spawn_error(&out, &e, selected.structured_spawn_errors);
+                return Ok(());
+            }
+        };
 
     let pgid = Pid::from_child(&child);
     let kill_grace = Duration::from_millis(request.kill_grace_ms);
@@ -283,7 +286,7 @@ fn supported_features_with_probe<F>(
 where
     F: FnOnce() -> io::Result<()>,
 {
-    let mut features = vec!["bounded_run_v1"];
+    let mut features = vec!["bounded_run_v1", "structured_spawn_errors_v1"];
     // Probe the running shim when HELLO is handled, including an empty HELLO,
     // rather than assuming that a supported OS makes its process metadata
     // readable. This catches unavailable procfs or denied libproc access
@@ -300,6 +303,7 @@ where
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SelectedFeatures {
     spawn_identity: bool,
+    structured_spawn_errors: bool,
 }
 
 fn select_features(payload: &[u8], supported: &[&str]) -> Result<SelectedFeatures, String> {
@@ -319,6 +323,10 @@ fn select_features(payload: &[u8], supported: &[&str]) -> Result<SelectedFeature
             .features
             .iter()
             .any(|feature| feature == "spawn_identity_v1"),
+        structured_spawn_errors: request
+            .features
+            .iter()
+            .any(|feature| feature == "structured_spawn_errors_v1"),
     })
 }
 
@@ -359,17 +367,28 @@ fn drain_inbound_until_closed(rx: &Receiver<Event>) {
 /// writes STDIN frames to it. In pipe mode the second element is `None` and the
 /// child's stdio is the usual set of pipes on the `Child`. The third element is
 /// `None` on the default path, on fallback, and on non-Linux.
-fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>, Option<Cgroup>)> {
-    let (program, args) = request
-        .argv
-        .split_first()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "argv must not be empty"))?;
+fn spawn_child(
+    request: &SpawnRequest,
+    structured: bool,
+) -> Result<(Child, Option<OwnedFd>, Option<Cgroup>), SpawnFailure> {
+    let (program, args) = request.argv.split_first().ok_or_else(|| {
+        SpawnFailure::new(
+            Stage::Spawn,
+            io::Error::new(io::ErrorKind::InvalidInput, "argv must not be empty"),
+            None,
+        )
+    })?;
 
     let mut cmd = Command::new(program);
     cmd.args(args);
 
-    if let Some(cd) = &request.cd {
-        cmd.current_dir(cd);
+    // std performs current_dir before pre_exec, hiding which syscall failed.
+    // With structured reporting, perform the same chdir in our child hook and
+    // report its actual errno. Legacy spawning retains std's original path.
+    if !structured {
+        if let Some(cd) = &request.cd {
+            cmd.current_dir(cd);
+        }
     }
     if request.env_mode == EnvMode::Replace {
         cmd.env_clear();
@@ -383,7 +402,8 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>, Op
     // getgrouplist/getgroups are not async-signal-safe and must never run
     // inside pre_exec. A resolution failure fails closed: we never spawn, so
     // the child cannot run as the wrong (current) user.
-    let plan = privdrop::resolve(request.user.as_ref(), request.group.as_ref())?;
+    let plan = privdrop::resolve(request.user.as_ref(), request.group.as_ref())
+        .map_err(|error| SpawnFailure::new(Stage::Privdrop, error, None))?;
 
     // Prepare the cgroup in the PARENT, before fork: detect cgroup v2, create a
     // delegated child cgroup, and open its cgroup.procs fd. Best-effort mode
@@ -397,53 +417,73 @@ fn spawn_child(request: &SpawnRequest) -> io::Result<(Child, Option<OwnedFd>, Op
         CgroupMode::Required(_) => Some(cgroup::prepare_required()?),
     };
     let placement = cgroup.as_ref().map(|cg| cg.placement());
-
-    if request.pty {
-        spawn_child_pty(cmd, request, plan, placement).map(|(c, m)| (c, m, cgroup))
+    let cgroup_path = cgroup.as_ref().map(|cg| cg.placement_path());
+    let master = if request.pty {
+        Some(
+            prepare_child_pty(&mut cmd)
+                .map_err(|error| SpawnFailure::new(Stage::Pty, error, None))?,
+        )
     } else {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        // Safety: the closure calls setsid() (async-signal-safe), then joins the
-        // cgroup by writing its own pid to the parent-opened fd (a single
-        // allocation-free write, see Placement::join_in_child), then, when a
-        // drop was requested, the numeric setgroups/setgid/setuid syscalls via
-        // DropPlan::apply. All names/fds were resolved/opened in the parent; the
-        // closure allocates nothing beyond reading the moved `plan`/`placement`.
-        // It runs in the forked child between fork and exec, per `pre_exec`'s
-        // contract. Joining the cgroup right after setsid, before any user code
-        // runs, means every descendant the child forks inherits the cgroup.
-        unsafe {
-            cmd.pre_exec(move || {
-                process::setsid()
-                    .map(|_| ())
-                    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
-                if let Some(placement) = &placement {
-                    placement.join_in_child()?;
-                }
-                if let Some(plan) = &plan {
-                    plan.apply()?;
-                }
-                Ok(())
-            });
-        }
-
-        cmd.spawn().map(|child| (child, None, cgroup))
-    }
+        None
+    };
+    let (reader, reporter) = if structured {
+        let (reader, reporter) =
+            spawn_error::channel().map_err(|error| SpawnFailure::new(Stage::Spawn, error, None))?;
+        (Some(reader), Some(reporter))
+    } else {
+        (None, None)
+    };
+    // std defers reporting invalid current_dir bytes until spawn, after our
+    // parent-side setup. Convert here to preserve that failure precedence
+    // when account resolution, required cgroup preparation or pty setup fails.
+    let cwd = if structured {
+        request
+            .cd
+            .as_ref()
+            .map(|cd| {
+                CString::new(cd.as_bytes()).map_err(|_| {
+                    SpawnFailure::new(
+                        Stage::Cwd,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "nul byte found in provided data",
+                        ),
+                        Some(cd.clone()),
+                    )
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let setup = ChildSetup {
+        cwd,
+        reporter,
+        plan,
+        placement,
+        pty: request.pty,
+        winsize: window_size(request),
+    };
+    install_child_setup(&mut cmd, setup);
+    let child = finish_spawn(
+        cmd,
+        reader,
+        program,
+        request.cd.as_deref(),
+        cgroup_path.as_deref(),
+    )?;
+    Ok((child, master, cgroup))
 }
 
-/// Spawns the child attached to a freshly allocated pty. The master fd stays
+/// Configures a freshly allocated pty before spawning. The master fd stays
 /// with the shim; the child's stdin, stdout, and stderr all point at the
 /// slave, and after `setsid` the child claims the slave as its controlling
 /// terminal (`TIOCSCTTY`). Because a pty carries one bidirectional stream,
 /// the child's stderr is merged into the same terminal as its stdout.
-fn spawn_child_pty(
-    mut cmd: Command,
-    request: &SpawnRequest,
-    plan: Option<DropPlan>,
-    placement: Option<cgroup::Placement>,
-) -> io::Result<(Child, Option<OwnedFd>)> {
+fn prepare_child_pty(cmd: &mut Command) -> io::Result<OwnedFd> {
     use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
 
     let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(errno)?;
@@ -468,46 +508,87 @@ fn spawn_child_pty(
         .stdout(Stdio::from(slave_out))
         .stderr(Stdio::from(slave_err));
 
-    let winsize = window_size(request);
+    Ok(master)
+}
 
-    // Safety: the closure runs between fork and exec. It calls only
-    // async-signal-safe operations (setsid, ioctl, the single allocation-free
-    // cgroup.procs write in Placement::join_in_child, and the numeric
-    // setgroups/setgid/setuid in DropPlan::apply) and touches no parent memory
-    // beyond the copied `winsize` and moved `plan`/`placement` values. fd 0 is
-    // the child's slave side after std has wired up stdio, so TIOCSCTTY on it
-    // makes the pty the controlling terminal. The cgroup join runs before the
-    // credential drop, since after setuid the child may lose write access to
-    // cgroup.procs (delegation is tied to the shim's uid). The credential drop
-    // runs last, after the terminal is claimed, so setting the controlling
-    // terminal still has the privilege it needs; after setuid that privilege
-    // may be gone.
-    unsafe {
-        cmd.pre_exec(move || {
-            process::setsid().map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+struct ChildSetup {
+    cwd: Option<CString>,
+    reporter: Option<ChildReporter>,
+    plan: Option<DropPlan>,
+    placement: Option<cgroup::Placement>,
+    pty: bool,
+    winsize: Option<rustix::termios::Winsize>,
+}
 
-            let stdin = std::os::fd::BorrowedFd::borrow_raw(0);
-            process::ioctl_tiocsctty(stdin)
-                .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
-
-            if let Some(ws) = winsize {
-                rustix::termios::tcsetwinsize(stdin, ws)
-                    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
-            }
-
-            if let Some(placement) = &placement {
-                placement.join_in_child()?;
-            }
-
-            if let Some(plan) = &plan {
-                plan.apply()?;
-            }
-            Ok(())
-        });
+impl ChildSetup {
+    fn check(&self, stage: Stage, result: io::Result<()>) -> io::Result<()> {
+        match &self.reporter {
+            Some(reporter) => reporter.check(stage, result),
+            None => result,
+        }
     }
 
-    let child = cmd.spawn()?;
-    Ok((child, Some(master)))
+    fn apply(&self) -> io::Result<()> {
+        if let Some(cwd) = &self.cwd {
+            // SAFETY: cwd was converted to a NUL-terminated CString in the
+            // parent. chdir is async-signal-safe and this closure runs before exec.
+            let result = if unsafe { libc::chdir(cwd.as_ptr()) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            self.check(Stage::Cwd, result)?;
+        }
+        self.check(Stage::Spawn, process::setsid().map(|_| ()).map_err(errno))?;
+        if self.pty {
+            // SAFETY: std has already connected fd 0 to our parent-opened slave.
+            let stdin = unsafe { std::os::fd::BorrowedFd::borrow_raw(0) };
+            self.check(Stage::Pty, process::ioctl_tiocsctty(stdin).map_err(errno))?;
+            if let Some(winsize) = self.winsize {
+                self.check(
+                    Stage::Pty,
+                    rustix::termios::tcsetwinsize(stdin, winsize).map_err(errno),
+                )?;
+            }
+        }
+        if let Some(placement) = &self.placement {
+            self.check(Stage::Cgroup, placement.join_in_child())?;
+        }
+        if let Some(plan) = &self.plan {
+            self.check(Stage::Privdrop, plan.apply())?;
+        }
+        if let Some(reporter) = &self.reporter {
+            reporter.ready_for_exec()?;
+        }
+        Ok(())
+    }
+}
+
+fn install_child_setup(cmd: &mut Command, setup: ChildSetup) {
+    // SAFETY: everything that allocates or resolves names was prepared in the
+    // parent. apply uses only chdir, setsid, terminal ioctls, numeric credential
+    // syscalls and fixed stack-buffer writes. It does not format, allocate or
+    // lock. Cgroup placement precedes privilege drop; chdir precedes both.
+    unsafe {
+        cmd.pre_exec(move || setup.apply());
+    }
+}
+
+fn finish_spawn(
+    mut cmd: Command,
+    reader: Option<ReportReader>,
+    argv0: &str,
+    cwd: Option<&str>,
+    cgroup_path: Option<&str>,
+) -> Result<Child, SpawnFailure> {
+    let result = cmd.spawn();
+    // Command owns the closure and its report writer in the parent. Drop it
+    // before reading, or a failure before pre_exec would wait for EOF forever.
+    drop(cmd);
+    result.map_err(|error| match reader {
+        Some(reader) => reader.failure(error, argv0, cwd, cgroup_path),
+        None => SpawnFailure::new(Stage::Spawn, error, None),
+    })
 }
 
 /// Builds the initial pty window size from the request, if either dimension
@@ -1063,10 +1144,25 @@ fn probe_says_alive(probe: rustix::io::Result<()>) -> bool {
 }
 
 fn write_error<W: Write>(out: &Arc<Mutex<W>>, reason: &str) {
-    let report = ErrorReport { reason };
+    let report = ErrorReport {
+        reason,
+        spawn_error: None,
+    };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();
         let _ = frame::write_frame(&mut *w, TAG_ERROR, &payload);
+    }
+}
+
+fn write_spawn_error<W: Write>(out: &Arc<Mutex<W>>, failure: &SpawnFailure, structured: bool) {
+    let reason = format!("spawn failed: {failure}");
+    let report = ErrorReport {
+        reason: &reason,
+        spawn_error: structured.then(|| failure.report()),
+    };
+    if let Ok(payload) = serde_json::to_vec(&report) {
+        let mut writer = out.lock().unwrap();
+        let _ = frame::write_frame(&mut *writer, TAG_ERROR, &payload);
     }
 }
 
@@ -1080,6 +1176,72 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_cgroup_placement_write_failure_is_reported_before_exec() {
+        use super::{
+            finish_spawn, install_child_setup, prepare_child_pty, write_spawn_error, ChildSetup,
+        };
+        use crate::cgroup::Placement;
+        use crate::frame::TAG_ERROR;
+        use crate::spawn_error::{channel, Stage};
+        use std::fs::File;
+        use std::process::{Command, Stdio};
+
+        for pty in [false, true] {
+            // A read-only fd makes the actual Placement::join_in_child write
+            // fail with EBADF regardless of delegated cgroup availability.
+            // No production configuration or environment fault switch exists.
+            let procs = File::open("/dev/null").unwrap();
+            let placement = Placement::from_test_fd(&procs);
+            let (reader, reporter) = channel().unwrap();
+            let mut cmd = Command::new("/bin/echo");
+            cmd.arg("must-not-execute");
+            let _master = if pty {
+                Some(prepare_child_pty(&mut cmd).unwrap())
+            } else {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                None
+            };
+            install_child_setup(
+                &mut cmd,
+                ChildSetup {
+                    cwd: None,
+                    reporter: Some(reporter),
+                    plan: None,
+                    placement: Some(placement),
+                    pty,
+                    winsize: None,
+                },
+            );
+            // Command returns Err only after its failed child has been reaped.
+            let failure = finish_spawn(
+                cmd,
+                Some(reader),
+                "/bin/echo",
+                None,
+                Some("/test/cgroup.procs"),
+            )
+            .unwrap_err();
+            assert_eq!(failure.stage, Stage::Cgroup);
+            assert_eq!(failure.error.raw_os_error(), Some(libc::EBADF));
+            assert_eq!(failure.path.as_deref(), Some("/test/cgroup.procs"));
+            let out = Arc::new(Mutex::new(Vec::new()));
+            write_spawn_error(&out, &failure, true);
+            let mut frames = Cursor::new(out.lock().unwrap().clone());
+            let frame = read_frame(&mut frames).unwrap().unwrap();
+            assert_eq!(frame.tag, TAG_ERROR);
+            let report: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
+            assert_eq!(report["spawn_error"]["stage"], "cgroup");
+            assert_eq!(report["spawn_error"]["reason"], "ebadf");
+            assert_eq!(report["spawn_error"]["errno"], libc::EBADF);
+            assert_eq!(report["spawn_error"]["path"], "/test/cgroup.procs");
+            assert!(read_frame(&mut frames).unwrap().is_none());
+        }
+    }
 
     #[test]
     fn identity_capability_probe_caches_success_and_failure() {
@@ -1197,7 +1359,8 @@ mod tests {
             assert_eq!(
                 super::select_features(payload, &supported).unwrap(),
                 super::SelectedFeatures {
-                    spawn_identity: true
+                    spawn_identity: true,
+                    structured_spawn_errors: false
                 }
             );
         }

@@ -99,7 +99,9 @@ defmodule Forcola.Stream do
         `:timed_out`
       * `:stderr` - stderr captured before termination (empty when
         `merge_stderr: true` routed it into the line stream)
-      * `:reason` - spawn failure reason, `nil` for a run that started
+      * `:reason` - spawn failure reason, `nil` for a run that started.
+        Native failures are `Forcola.SpawnError` values when
+        `structured_spawn_errors: true`, otherwise legacy strings.
       * `:limit` - `{:line, :stdout | :merged, n}` or `{:total, :stderr, n}`
         when bounded output exceeded its configured limit
       * `:output_truncated` - whether output was deliberately discarded or
@@ -118,7 +120,7 @@ defmodule Forcola.Stream do
 
     @type t :: %__MODULE__{
             status: non_neg_integer() | {:signal, atom() | non_neg_integer()} | nil,
-            reason: String.t() | atom() | tuple() | nil,
+            reason: Forcola.SpawnError.t() | String.t() | atom() | tuple() | nil,
             limit: {:line | :total, atom(), pos_integer()} | nil,
             stderr: binary(),
             timed_out: boolean(),
@@ -127,6 +129,10 @@ defmodule Forcola.Stream do
           }
 
     @impl true
+    def message(%__MODULE__{reason: %Forcola.SpawnError{} = reason}) do
+      "stream spawn failed: #{Exception.message(reason)}"
+    end
+
     def message(%__MODULE__{reason: reason}) when not is_nil(reason) do
       "stream spawn failed: #{inspect(reason)}"
     end
@@ -192,6 +198,14 @@ defmodule Forcola.Stream do
   EOF right away instead of blocking. Use `Forcola.Duplex` for interactive
   stdin.
 
+  `:structured_spawn_errors` (default `false`) negotiates native
+  `Forcola.SpawnError` reasons in `Forcola.Stream.Error.reason`, retaining
+  the original string in the struct's `:message`. It requires
+  `structured_spawn_errors_v1` and counts negotiation toward `:timeout_ms`,
+  which must be an integer in `0..4_294_967_295`. Incompatible shims fail
+  before SPAWN. This option works independently of identity observation
+  and keeps the existing stream output and exception envelopes.
+
   `:spawn_observer` accepts `{local_pid, reference}` and sends
   `{reference, {:spawned, identity}}` before the first output line is yielded.
   The identity is `%{pid: integer, pgid: integer, start_time: map}`; see
@@ -238,12 +252,13 @@ defmodule Forcola.Stream do
   @spec lines([String.t(), ...], keyword()) :: Enumerable.t()
   def lines([_binary | _] = argv, opts) do
     Shim.validate_spawn_identity!(opts)
+    Shim.validate_structured_spawn_errors!(opts)
     Shim.validate_spawn_observer!(opts)
     validate_identity_observer!(opts)
     opts = if opts[:spawn_observer], do: Keyword.put(opts, :spawn_identity, true), else: opts
     Shim.reject_run_options!(opts, __MODULE__, [:idle_timeout_ms])
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
-    validate_identity_timeout!(opts, timeout_ms)
+    validate_negotiated_timeout!(opts, timeout_ms)
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
     idle_timeout_ms = Keyword.get(opts, :idle_timeout_ms)
     window_bytes = resolve_window_bytes(opts)
@@ -272,13 +287,13 @@ defmodule Forcola.Stream do
       do: raise(ArgumentError, "Forcola.Stream :spawn_identity requires :spawn_observer")
   end
 
-  defp validate_identity_timeout!(opts, timeout_ms) do
-    if Shim.identity_requested?(opts) and
+  defp validate_negotiated_timeout!(opts, timeout_ms) do
+    if Shim.negotiated?(opts) and
          not (is_integer(timeout_ms) and timeout_ms >= 0 and timeout_ms <= 4_294_967_295),
        do:
          raise(
            ArgumentError,
-           "timeout_ms must be an integer in 0..4294967295 with spawn identity"
+           "timeout_ms must be an integer in 0..4294967295 with negotiated options"
          )
   end
 
@@ -334,9 +349,9 @@ defmodule Forcola.Stream do
        ) do
     started_at = System.monotonic_time(:millisecond)
 
-    case Shim.open_with_identity(opts, timeout_ms) do
+    case Shim.open_with_features(opts, timeout_ms) do
       {:ok, port} ->
-        timeout_ms = identity_timeout(port, opts, timeout_ms, started_at)
+        timeout_ms = negotiated_timeout(port, opts, timeout_ms, started_at)
 
         spawn_opts =
           opts
@@ -368,6 +383,7 @@ defmodule Forcola.Stream do
         %{
           port: port,
           identity_enabled: Shim.identity_requested?(opts),
+          structured_spawn_errors: Keyword.get(opts, :structured_spawn_errors, false),
           identity: nil,
           spawn_observer: opts[:spawn_observer],
           buffer: "",
@@ -396,8 +412,8 @@ defmodule Forcola.Stream do
     end
   end
 
-  defp identity_timeout(port, opts, timeout_ms, started_at) do
-    if Shim.identity_requested?(opts) do
+  defp negotiated_timeout(port, opts, timeout_ms, started_at) do
+    if Shim.negotiated?(opts) do
       remaining = timeout_ms - (System.monotonic_time(:millisecond) - started_at)
 
       if remaining <= 0 do
@@ -564,7 +580,11 @@ defmodule Forcola.Stream do
         handle_exit(payload, state)
 
       tag == Shim.tag_error() ->
-        error = %Error{reason: Shim.decode_error(payload), stderr: stderr(state)}
+        error = %Error{
+          reason: Shim.decode_error(payload, state.structured_spawn_errors),
+          stderr: stderr(state)
+        }
+
         {[], %{state | exit: {:error, error}}}
 
       true ->

@@ -129,6 +129,12 @@ defmodule Forcola.Shim do
   end
 
   @doc false
+  def validate_structured_spawn_errors!(opts) do
+    unless Keyword.get(opts, :structured_spawn_errors, false) in [true, false],
+      do: raise(ArgumentError, "structured_spawn_errors must be a boolean")
+  end
+
+  @doc false
   def validate_spawn_observer!(opts) do
     case Keyword.get(opts, :spawn_observer) do
       nil -> :ok
@@ -147,13 +153,24 @@ defmodule Forcola.Shim do
   def identity_requested?(opts), do: Keyword.get(opts, :spawn_identity, false)
 
   @doc false
-  def identity_features(opts, features \\ []) do
-    if identity_requested?(opts), do: features ++ ["spawn_identity_v1"], else: features
+  def features(opts, required \\ []) do
+    selected =
+      for {option, feature} <- [
+            spawn_identity: "spawn_identity_v1",
+            structured_spawn_errors: "structured_spawn_errors_v1"
+          ],
+          Keyword.get(opts, option, false),
+          do: feature
+
+    required ++ selected
   end
 
   @doc false
-  def open_with_identity(opts, timeout_ms \\ 5_000) do
-    case identity_features(opts) do
+  def negotiated?(opts), do: features(opts) != []
+
+  @doc false
+  def open_with_features(opts, timeout_ms \\ 5_000) do
+    case features(opts) do
       [] -> open(opts)
       features -> open_negotiated(opts, timeout_ms, features)
     end
@@ -607,10 +624,32 @@ defmodule Forcola.Shim do
     }
   end
 
-  @doc "Decodes an ERROR frame payload into its reason string."
-  @spec decode_error(binary()) :: String.t()
-  def decode_error(payload) do
-    %{"reason" => reason} = :json.decode(payload)
-    reason
+  @doc """
+  Decodes an ERROR frame, retaining the legacy reason string by default.
+
+  When structured errors were negotiated, native spawn details become a
+  `Forcola.SpawnError` containing the original string in `:message`.
+  Plain protocol errors remain strings. Malformed structured details fall
+  back to the valid legacy reason. An unreadable frame or an invalid
+  top-level reason returns `:invalid_error` without guessing a reason.
+  """
+  @spec decode_error(binary(), boolean()) :: String.t() | Forcola.SpawnError.t() | :invalid_error
+  def decode_error(payload, structured? \\ false) do
+    case decode_json(payload) do
+      {:ok, %{"reason" => reason} = report} when is_binary(reason) ->
+        if structured? and Map.has_key?(report, "spawn_error"),
+          do: decode_spawn_error(report["spawn_error"], reason),
+          else: reason
+
+      _ ->
+        :invalid_error
+    end
+  end
+
+  defp decode_spawn_error(report, reason) do
+    case Forcola.SpawnError.from_report(report, reason) do
+      :invalid_error -> reason
+      error -> error
+    end
   end
 end

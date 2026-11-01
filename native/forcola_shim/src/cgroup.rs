@@ -37,6 +37,7 @@
 
 #[cfg(target_os = "linux")]
 mod imp {
+    use crate::spawn_error::{SpawnFailure, Stage};
     use std::fs::{File, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -76,6 +77,10 @@ mod imp {
             Placement {
                 procs_fd: self.procs.as_raw_fd(),
             }
+        }
+
+        pub fn placement_path(&self) -> String {
+            self.dir.join("cgroup.procs").to_string_lossy().into_owned()
         }
 
         /// Writes `1` to `cgroup.kill`, SIGKILLing every process in the subtree
@@ -124,6 +129,13 @@ mod imp {
     }
 
     impl Placement {
+        #[cfg(test)]
+        pub(crate) fn from_test_fd(fd: &impl AsRawFd) -> Self {
+            Self {
+                procs_fd: fd.as_raw_fd(),
+            }
+        }
+
         /// Writes the current pid to the open `cgroup.procs` fd, moving this
         /// process (and therefore every descendant it later forks) into the
         /// cgroup.
@@ -152,6 +164,9 @@ mod imp {
             };
             if n < 0 {
                 return Err(io::Error::last_os_error());
+            }
+            if n as usize != bytes.len() {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
             }
             Ok(())
         }
@@ -216,24 +231,32 @@ mod imp {
 
     /// Required setup preserves the preparation error so the supervisor can
     /// refuse to spawn rather than silently falling back to a process group.
-    pub fn prepare_required() -> io::Result<Cgroup> {
-        try_prepare(true)
-            .map_err(|reason| io::Error::other(format!("cgroup containment unavailable: {reason}")))
+    pub fn prepare_required() -> Result<Cgroup, SpawnFailure> {
+        try_prepare(true).map_err(|failure| {
+            let message = format!("cgroup containment unavailable: {failure}");
+            SpawnFailure::with_message(Stage::Cgroup, failure.error, failure.path, message)
+        })
     }
 
     /// The fallible core of [`prepare`], separated so each failure carries a
     /// reason for the warning.
-    fn try_prepare(required: bool) -> Result<Cgroup, String> {
+    fn try_prepare(required: bool) -> Result<Cgroup, SpawnFailure> {
         if !is_cgroup2() {
-            return Err("no cgroup v2 unified hierarchy".into());
+            return Err(SpawnFailure::new(
+                Stage::Cgroup,
+                io::Error::new(io::ErrorKind::Unsupported, "no cgroup v2 unified hierarchy"),
+                Some(format!("{CGROUP_ROOT}/cgroup.controllers")),
+            ));
         }
 
-        let own = own_cgroup_dir().map_err(|e| format!("cannot read own cgroup: {e}"))?;
+        let own = own_cgroup_dir().map_err(|e| {
+            preparation_error(e, "/proc/self/cgroup".into(), "cannot read own cgroup")
+        })?;
 
         // Delegation / writability check plus the actual child-dir creation are
         // the same operation: if we can mkdir a child here, the subtree is
         // delegated to us. A failure (EACCES/EROFS/EPERM) means no delegation.
-        let dir = create_child_dir(&own).map_err(|e| format!("subtree not delegated: {e}"))?;
+        let dir = create_child_dir(&own)?;
 
         // Open cgroup.procs for writing now, in the parent, so the fd is valid
         // across the fork and the child writes its pid to an already-open fd.
@@ -244,7 +267,7 @@ mod imp {
                 // Roll back the directory we just made so a half-prepared
                 // cgroup is not left behind.
                 let _ = std::fs::remove_dir(&dir);
-                format!("cannot open cgroup.procs: {e}")
+                preparation_error(e, dir.join("cgroup.procs"), "cannot open cgroup.procs")
             })?;
 
         let kill_fd = if required {
@@ -253,7 +276,11 @@ mod imp {
                 Err(e) => {
                     drop(procs);
                     let _ = std::fs::remove_dir(&dir);
-                    return Err(format!("cannot open cgroup.kill: {e}"));
+                    return Err(preparation_error(
+                        e,
+                        dir.join("cgroup.kill"),
+                        "cannot open cgroup.kill",
+                    ));
                 }
             }
         } else {
@@ -265,6 +292,16 @@ mod imp {
             procs: procs.into(),
             kill_fd,
         })
+    }
+
+    fn preparation_error(error: io::Error, path: PathBuf, context: &str) -> SpawnFailure {
+        let message = format!("{context}: {error}");
+        SpawnFailure::with_message(
+            Stage::Cgroup,
+            error,
+            Some(path.to_string_lossy().into_owned()),
+            message,
+        )
     }
 
     /// Detects a cgroup v2 unified hierarchy: the root mount exposes a
@@ -289,11 +326,12 @@ mod imp {
     /// Creates a uniquely named child cgroup directory under `parent`. The name
     /// combines the shim pid and a monotonic counter so concurrent shims (and a
     /// single shim preparing more than once) never collide.
-    fn create_child_dir(parent: &Path) -> io::Result<PathBuf> {
+    fn create_child_dir(parent: &Path) -> Result<PathBuf, SpawnFailure> {
         let pid = std::process::id();
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = parent.join(format!("forcola-{pid}-{seq}"));
-        std::fs::create_dir(&dir)?;
+        std::fs::create_dir(&dir)
+            .map_err(|e| preparation_error(e, dir.clone(), "subtree not delegated"))?;
         Ok(dir)
     }
 
@@ -320,6 +358,19 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn preparation_failure_retains_errno_and_attempted_path() {
+            let failure = create_child_dir(Path::new("/dev/null")).unwrap_err();
+            assert_eq!(failure.error.raw_os_error(), Some(libc::ENOTDIR));
+            assert_eq!(failure.report().reason, "enotdir");
+            assert!(failure
+                .path
+                .as_deref()
+                .unwrap()
+                .starts_with("/dev/null/forcola-"));
+            assert!(failure.to_string().starts_with("subtree not delegated: "));
+        }
 
         #[test]
         fn format_pid_typical() {
@@ -412,7 +463,7 @@ pub fn prepare() -> Option<Cgroup> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn prepare_required() -> std::io::Result<Cgroup> {
+pub fn prepare_required() -> Result<Cgroup, crate::spawn_error::SpawnFailure> {
     imp::prepare_required()
 }
 
@@ -427,6 +478,10 @@ mod stub {
         /// The child-side placement handle. Unreachable: a `Cgroup` value never
         /// exists on non-Linux.
         pub fn placement(&self) -> Placement {
+            match *self {}
+        }
+
+        pub fn placement_path(&self) -> String {
             match *self {}
         }
 
@@ -469,9 +524,13 @@ pub fn prepare() -> Option<Cgroup> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn prepare_required() -> std::io::Result<Cgroup> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "cgroup v2 containment requires Linux",
+pub fn prepare_required() -> Result<Cgroup, crate::spawn_error::SpawnFailure> {
+    Err(crate::spawn_error::SpawnFailure::new(
+        crate::spawn_error::Stage::Cgroup,
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "cgroup v2 containment requires Linux",
+        ),
+        None,
     ))
 }

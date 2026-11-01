@@ -182,6 +182,8 @@ pub struct ExitReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorReport<'a> {
     pub reason: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_error: Option<crate::spawn_error::SpawnErrorReport<'a>>,
 }
 
 #[cfg(test)]

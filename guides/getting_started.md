@@ -536,6 +536,71 @@ are produced. Passing `merge_stderr: false` with `pty: true` raises
 same as in pipe mode. There is no dynamic resize yet; `:pty_rows`/`:pty_cols`
 set the initial size only.
 
+## Distinguish spawn failures
+
+All four modes accept `structured_spawn_errors: true`. It selects
+`structured_spawn_errors_v1` during HELLO before SPAWN. An older shim that does
+not advertise the feature returns `:incompatible_shim` without executing the
+child. This option composes with identity reporting and bounded runs.
+
+```elixir
+case Forcola.run(["provider", "--version"],
+       cd: "/work/session",
+       timeout_ms: 5_000,
+       structured_spawn_errors: true
+     ) do
+  {:error, {:spawn, %Forcola.SpawnError{stage: :cwd, reason: :enoent}}} ->
+    {:error, :cwd_missing}
+
+  {:error, {:spawn, %Forcola.SpawnError{stage: :exec, reason: :enoent}}} ->
+    {:error, :provider_unavailable}
+
+  result ->
+    result
+end
+```
+
+The struct has `stage`, `reason`, `errno`, `path`, and `message` fields. The
+original error string remains available as `message`. `errno` is the native
+integer when available; errors from name lookup or unsupported facilities may
+have no native errno. Known reason codes are atoms. Unknown reason codes remain
+strings, so decoding never creates atoms from wire data.
+
+| Failure | Stage | Typical reason | Path |
+| --- | --- | --- | --- |
+| Missing working directory | `:cwd` | `:enoent` | Requested `cd` |
+| Working directory is a file | `:cwd` | `:enotdir` | Requested `cd` |
+| Missing executable | `:exec` | `:enoent` | Requested `argv[0]` |
+| Executable lacks execute permission | `:exec` | `:eacces` | Requested `argv[0]` |
+| User/group lookup or credential change fails | `:privdrop` | `:not_found` or `:eperm` | `nil` |
+| Cgroup setup or placement fails | `:cgroup` | Native error or an unsupported-facility reason | Failed cgroup path when available |
+
+Other spawn setup failures use a setup stage rather than being guessed to be
+executable errors. Paths describe the operation attempted; `argv[0]` is not a
+resolved PATH search result. An executable with a missing interpreter can also
+fail at `:exec` with `:enoent`. No filesystem precheck is used to infer the stage:
+working-directory and child setup failures are reported from the actual child
+operations before exec. Cgroup best-effort fallback remains unchanged;
+`cgroup: :required` reports unavailable containment as a spawn failure.
+
+Each mode keeps its existing error envelope:
+
+- Run returns `{:error, {:spawn, error}}`. Bounded collection retains its
+  `{:error, {:spawn, {error, partial_result}}}` form.
+- Duplex sends `{:forcola_exit, session, {:spawn_error, error}}` in message mode.
+  Both message and pull delivery retain `error` as `terminal.spawn_error`,
+  available through `await_terminal/2`, including shutdown drains.
+- Daemon terminates with `{:spawn, error}`. During readiness polling,
+  `start_link/1` returns `{:error, {:exited_before_ready, {:spawn, error}}}`.
+- Stream raises `Forcola.Stream.Error` with the struct in its `reason` field.
+
+Without the option, callers continue to receive the existing error string and
+the shim sends the original ERROR payload. Negotiated payloads retain that
+string alongside the structured details. Protocol and handshake errors remain
+separate from typed spawn failures. Malformed structured details fall back to a
+valid legacy reason. Unreadable ERROR frames or invalid top-level reasons
+return `:invalid_error`. No SPAWNED frame is emitted for a failed spawn.
+
 ## Record process identity
 
 Identity reporting is opt-in and requires a shim advertising

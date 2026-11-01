@@ -89,6 +89,16 @@ defmodule Forcola do
       inherited environment before applying `:env`, including when it is empty.
       Supply an absolute executable path when clearing PATH.
     * `:merge_stderr` - route stderr into stdout; default `false`.
+    * `:structured_spawn_errors` - return a `Forcola.SpawnError` for native
+      spawn failures, default `false`. Its `:stage` and `:reason` distinguish
+      working-directory, executable, privilege, and cgroup failures without
+      parsing text; `:message` retains the original reason string.
+      Requires `structured_spawn_errors_v1` negotiation before SPAWN and
+      composes with identity and strict options. Negotiation counts toward
+      `:timeout_ms`, which must be an integer in `0..4_294_967_295`.
+      This option alone keeps legacy output collection and error envelopes.
+      Unsupported shims fail before the child starts. Without the option,
+      native errors remain strings.
     * `:spawn_identity` - request the child's PID, process group ID, and
       native start time, default `false`. The shim reports identity before
       output; `Forcola.Result` retains it in `:pid`, `:pgid`, and
@@ -143,6 +153,8 @@ defmodule Forcola do
 
   New options (`:idle_timeout_ms`, `:max_output_bytes`, `:env_mode`, or the
   interrupt pair) require a versioned capability exchange before SPAWN.
+  `:spawn_identity` and `:structured_spawn_errors` select independent
+  capabilities through the same exchange, without enabling strict collection.
   `cgroup: :required` alone keeps legacy collection and error shapes without
   negotiation; its existing string encoding enforces required containment.
   An older shim rejecting HELLO or a valid incompatible capability reply returns
@@ -245,6 +257,10 @@ defmodule Forcola do
     * `{:error, {:spawn, reason}}` where `reason` is a string - the shim
       reported the spawn failure, for example a missing or
       non-executable command.
+    * `{:error, {:spawn, %Forcola.SpawnError{}}}` - a native spawn failure
+      with `structured_spawn_errors: true`. With strict options, the
+      existing partial-result shape is
+      `{:error, {:spawn, {%Forcola.SpawnError{}, partial_result}}}`.
     * `{:error, {:spawn, {:shim_exited, %Forcola.Result{}}}}` - the shim
       exited without reporting an exit or error, for example because it
       was SIGKILLed. The result's status is `{:signal, :unconfirmed}`. A
