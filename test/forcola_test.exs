@@ -7,6 +7,16 @@ defmodule ForcolaTest do
         Forcola.run(["true"], [])
       end
     end
+
+    test "rejects a :timeout_ms outside 0..4294967295 before opening the shim" do
+      # The bad shim path would surface as {:error, {:spawn, {:invalid_shim_path, _}}}
+      # if validation let the call reach Forcola.Shim.open/1.
+      for timeout <- [:infinity, "5000", 1.5, -1, 4_294_967_296] do
+        assert_raise ArgumentError, ~r/timeout_ms must be an integer/, fn ->
+          Forcola.run(["/bin/true"], timeout_ms: timeout, shim_path: "/nonexistent/shim")
+        end
+      end
+    end
   end
 
   describe "Result" do
@@ -26,6 +36,14 @@ defmodule ForcolaTest do
   describe "Stream.lines/2" do
     test "requires :timeout_ms" do
       assert_raise KeyError, fn -> Forcola.Stream.lines(["true"], []) end
+    end
+
+    test "rejects a :timeout_ms outside 0..4294967295 when the stream is built" do
+      for timeout <- [:infinity, "5000", 1.5, -1, 4_294_967_296] do
+        assert_raise ArgumentError, ~r/timeout_ms must be an integer/, fn ->
+          Forcola.Stream.lines(["/bin/true"], timeout_ms: timeout, shim_path: "/nonexistent/shim")
+        end
+      end
     end
   end
 

@@ -442,13 +442,8 @@ defmodule Forcola.Run do
     Shim.validate_execution_options!(opts, strict?(opts))
     timeout = Keyword.fetch!(opts, :timeout_ms)
 
-    if (strict?(opts) or Shim.negotiated?(opts)) and
-         not (is_integer(timeout) and timeout >= 0 and timeout <= 4_294_967_295),
-       do:
-         raise(
-           ArgumentError,
-           "timeout_ms must be an integer in 0..4294967295 with negotiated options"
-         )
+    unless is_integer(timeout) and timeout >= 0 and timeout <= 4_294_967_295,
+      do: raise(ArgumentError, "timeout_ms must be an integer in 0..4294967295")
   end
 
   defp validate_observer!(nil), do: :ok

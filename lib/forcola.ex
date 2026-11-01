@@ -49,8 +49,10 @@ defmodule Forcola do
 
   ## Options
 
-    * `:timeout_ms` - required. On expiry the child's process group is
-      killed (SIGTERM, then SIGKILL after the kill grace) and
+    * `:timeout_ms` - required, an integer in `0..4_294_967_295`; other
+      values raise `ArgumentError` before the shim is opened. On expiry the
+      child's process group is killed (SIGTERM, then SIGKILL after the kill
+      grace) and
       `{:error, {:timeout, partial_result}}` is returned with output
       captured so far. The group is normally confirmed dead before the call
       returns. If the shim's bounded kill probes cannot confirm that the group
@@ -205,9 +207,9 @@ defmodule Forcola do
   Daemon reject `:idle_timeout_ms`; Stream retains its existing idle-timeout
   support. These existing mode options keep their own validation and semantics.
 
-  With negotiated options, `:timeout_ms` must be an integer in
-  `0..4_294_967_295`. Its deadline starts before opening the shim and includes
-  capability negotiation; only the remaining budget is sent in SPAWN. Idle
+  With negotiated options, the `:timeout_ms` deadline starts before opening
+  the shim and includes capability negotiation; only the remaining budget is
+  sent in SPAWN. Idle
   timing starts after negotiation. A stalled handshake returns
   `{:error, {:spawn, :handshake_timeout}}`; malformed or unexpected replies
   return `{:error, {:spawn, :invalid_handshake}}`. Transport exit before SPAWN
