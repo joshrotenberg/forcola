@@ -377,6 +377,12 @@ impl<S: Source> Tracker<S> {
         if !group && current.exited {
             return false;
         }
+        // Between stages only the leader identity is needed. kill(-pgid, 0)
+        // is not a live-member check: macOS returns EPERM for zombie-only
+        // groups, including a leader that exits just after this identity read.
+        if signal == 0 {
+            return true;
+        }
         if expected.pid == 0 || expected.pid > i32::MAX as u32 {
             self.fail();
             return false;
@@ -386,7 +392,14 @@ impl<S: Source> Tracker<S> {
         } else {
             expected.pid as i32
         };
-        if self.source.signal(target, signal).is_err() {
+        if let Err(error) = self.source.signal(target, signal) {
+            // XNU's killpg1 skips zombies and returns EPERM when it finds no
+            // eligible members. The same transition can race a real signal.
+            // Fall back to freshly verified individual members; a permission
+            // failure for any still-live member remains a coverage failure.
+            if cfg!(target_os = "macos") && group && error.raw_os_error() == Some(libc::EPERM) {
+                return false;
+            }
             self.fail();
         }
         true
@@ -480,7 +493,7 @@ impl<S: Source> Tracker<S> {
             let (sequence, signal, shortened) =
                 self.next_signal(previous, target_now, self.expired(target_now));
             // Even between stages validate the leader before excluding members
-            // from their fallback path. Signal 0 is only an identity-safe probe.
+            // from their fallback path. A zero value requests only that read.
             if self.send_checked(&group, true, signal.unwrap_or(0)) {
                 let sequence = if signal.is_some() {
                     self.after_signal(sequence, target_now)
@@ -596,6 +609,9 @@ mod tests {
         denied: HashSet<u32>,
         fail_children: bool,
         fail_signals: bool,
+        fail_group_signals: bool,
+        exit_on_group_signal: bool,
+        zero_signals: usize,
         signals: Vec<(i32, i32)>,
         reaped: Vec<u32>,
         read_delay: Duration,
@@ -624,6 +640,22 @@ mod tests {
             Ok(children)
         }
         fn signal(&mut self, target: i32, signal: i32) -> io::Result<()> {
+            if signal == 0 {
+                self.zero_signals += 1;
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            if target < 0 && self.fail_group_signals {
+                if self.exit_on_group_signal {
+                    for record in self
+                        .records
+                        .values_mut()
+                        .filter(|record| record.identity.pgid == (-target) as u32)
+                    {
+                        record.exited = true;
+                    }
+                }
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
             if self.fail_signals {
                 return Err(io::Error::from_raw_os_error(libc::EPERM));
             }
@@ -885,6 +917,42 @@ mod tests {
                 .map(|(_, signal)| *signal)
                 .collect();
             assert_eq!(signals, [libc::SIGINT, libc::SIGTERM, libc::SIGKILL]);
+        }
+        assert_eq!(tracker.source.zero_signals, 0);
+        assert!(!tracker.uncertain());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zombie_group_permission_race_uses_fresh_member_evidence() {
+        let mut tracker = tracker();
+        tracker.source.fail_group_signals = true;
+        tracker.source.exit_on_group_signal = true;
+        let now = Instant::now();
+        begin(&mut tracker, now);
+        tracker.advance(now);
+        assert!(!tracker.uncertain());
+        assert!(tracker.source.signals.is_empty());
+        tracker.scan();
+        tracker.advance(now + SAMPLE_INTERVAL);
+        tracker.scan();
+        assert!(tracker.advance(now + SAMPLE_INTERVAL * 2).confirmed);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_permission_error_falls_back_to_live_members_without_hiding_denial() {
+        for denied in [false, true] {
+            let mut tracker = tracker();
+            tracker.source.fail_group_signals = true;
+            tracker.source.fail_signals = denied;
+            let now = Instant::now();
+            begin(&mut tracker, now);
+            tracker.advance(now);
+            assert_eq!(tracker.uncertain(), denied);
+            if !denied {
+                assert_eq!(tracker.source.signals, [(10, libc::SIGINT)]);
+            }
         }
     }
 
