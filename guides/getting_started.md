@@ -576,8 +576,10 @@ waiting, `{:error, :not_requested}` for a live session with reporting disabled,
 or `{:error, :closed}` when unavailable after shutdown. Duplex retains its
 identity alongside terminal evidence after natural exit until `close/1`,
 `forget_terminal/1`, or owner exit releases the record. Daemon queries require
-a live daemon. A query that times out while a named daemon is still polling
-readiness also returns `{:error, :pending}`.
+a live daemon. `Forcola.Daemon.spawned/2` accepts a query timeout in milliseconds,
+defaulting to 5,000. Any server that cannot reply within that timeout also returns
+`{:error, :pending}`, whether or not identity is enabled, including while a named
+daemon is still polling readiness.
 
 Daemon sends identity notifications only to an explicit
 `spawn_observer: {local_pid, reference}`. The observer enables identity reporting
@@ -630,8 +632,8 @@ or make checking identity and sending a signal atomic.
 
 Without either identity option, existing wire behavior is unchanged. A shim
 without the capability rejects the request before the child executes.
-Capability advertisement includes a cached probe of the shim's own native
-identity, so inaccessible process metadata disables the feature before SPAWN.
+The shim probes its own native identity when HELLO is handled, including an
+empty HELLO, so inaccessible process metadata disables the feature before SPAWN.
 The probe does not guarantee later access to a child after a privilege change
 or a change in permissions. If child identity capture then fails, the shim
 kills and reaps the child, which may already have executed.

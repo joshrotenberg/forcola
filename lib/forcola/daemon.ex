@@ -147,16 +147,18 @@ defmodule Forcola.Daemon do
 
   Returns `{:error, :pending}` before an enabled daemon receives the frame,
   `{:error, :not_requested}` when disabled, and `{:error, :closed}` after
-  the daemon exits. The query also returns `{:error, :pending}` if the daemon
-  cannot respond within five seconds, for example while an output callback
-  is blocked. A query timeout does not mean that the daemon has closed.
+  the daemon exits. The query timeout defaults to 5,000 milliseconds.
+  `{:error, :pending}` is also returned for any server that cannot reply within
+  the timeout, whether or not identity is enabled, for example during readiness
+  polling or while an output callback is blocked. A query timeout does not mean
+  that the daemon has closed.
   An explicit `:spawn_observer` can retain its notification after the daemon
   exits. An observed identity is not proof that the process remains alive.
   """
-  @spec spawned(GenServer.server()) ::
+  @spec spawned(GenServer.server(), timeout()) ::
           {:ok, Shim.identity()} | {:error, :pending | :not_requested | :closed}
-  def spawned(daemon) do
-    GenServer.call(daemon, :spawned)
+  def spawned(daemon, timeout \\ 5_000) do
+    GenServer.call(daemon, :spawned, timeout)
   catch
     :exit, {:timeout, _call} -> {:error, :pending}
     :exit, _ -> {:error, :closed}

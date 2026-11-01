@@ -45,8 +45,9 @@
 //!   0x15 HELLO   JSON {protocol: 1, features: ["bounded_run_v1", ...]}
 //!                Confirms strict credit drain, env replacement and INT grace.
 //!                An old shim rejects HELLO rather than ignoring SPAWN keys.
-//!                spawn_identity_v1 is advertised only after a cached native
-//!                self-identity probe succeeds. Access to a child after a
+//!                spawn_identity_v1 is advertised only after a native
+//!                self-identity probe succeeds when HELLO is handled, including
+//!                an empty HELLO. Access to a child after a
 //!                privilege change can still fail; that failure kills and
 //!                reaps the child before ERROR, without sending SPAWNED.
 //!   0x11 STDOUT  payload: bytes from the child's stdout

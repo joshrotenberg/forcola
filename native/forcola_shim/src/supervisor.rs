@@ -284,9 +284,9 @@ where
     F: FnOnce() -> io::Result<()>,
 {
     let mut features = vec!["bounded_run_v1"];
-    // Probe the running shim, rather than assuming that a supported OS makes
-    // its process metadata readable. Cache both success and failure for the
-    // shim lifetime. This catches unavailable procfs or denied libproc access
+    // Probe the running shim when HELLO is handled, including an empty HELLO,
+    // rather than assuming that a supported OS makes its process metadata
+    // readable. This catches unavailable procfs or denied libproc access
     // before SPAWN, but does not guarantee access to a child after a privilege
     // change. The post-spawn read still fails closed and cleans up that child.
     if *identity_available.get_or_init(|| probe().is_ok()) {

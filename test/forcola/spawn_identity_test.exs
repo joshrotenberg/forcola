@@ -254,7 +254,7 @@ defmodule Forcola.SpawnIdentityTest do
     assert_receive {:initializing, daemon}, 5_000
 
     try do
-      assert Daemon.spawned(name) == {:error, :pending}
+      assert Daemon.spawned(name, 100) == {:error, :pending}
       assert Process.alive?(daemon)
       send(daemon, :release_ready)
       assert_receive {:daemon_started, ^daemon}, 5_000
