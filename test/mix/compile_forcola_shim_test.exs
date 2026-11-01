@@ -90,8 +90,16 @@ defmodule Mix.Tasks.Compile.ForcolaShimTest do
       File.rename!(backup, build_priv)
 
       File.mkdir_p!(Path.dirname(source_bin))
-      File.write!(source_bin, saved_bin)
-      File.chmod!(source_bin, 0o755)
+      # Restoring in place can invalidate macOS executable mappings. Follow
+      # the compiler's atomic installation path and keep unchanged inodes.
+      restore = source_bin <> ".test-restore"
+      File.write!(restore, saved_bin)
+
+      try do
+        Forcola.AtomicFile.copy_executable_if_changed(restore, source_bin)
+      after
+        File.rm(restore)
+      end
     end)
 
     # Stand in for a freshly copied dependency priv: a real directory that
