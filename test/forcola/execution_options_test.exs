@@ -104,9 +104,15 @@ defmodule Forcola.ExecutionOptionsTest do
     end
   end
 
-  test "bounded-only negotiation keeps the empty HELLO in every mode", %{tmp_dir: dir} do
+  test "requirement-only negotiation keeps the empty HELLO in every mode", %{tmp_dir: dir} do
     for mode <- @modes,
-        opts <- [[env_mode: :inherit], [interrupt_signal: :int, interrupt_grace_ms: 100]] do
+        opts <- [
+          [env_mode: :inherit],
+          [interrupt_signal: :int, interrupt_grace_ms: 100],
+          [env: [{"NAME", nil}]],
+          [env: [{"NAME", false}]],
+          [env_mode: :replace, env: [{"NAME", nil}]]
+        ] do
       shim = shim(dir, "all")
       assert String.trim(output(mode, ["unused"], opts ++ [shim_path: shim])) == "ok"
       assert File.read!(Path.join(dir, "hello")) == ""
@@ -120,7 +126,9 @@ defmodule Forcola.ExecutionOptionsTest do
           {"no_bounded", [env_mode: :replace]},
           {"no_bounded", [interrupt_signal: :int, interrupt_grace_ms: 100]},
           {"no_unset", [env: [{"NAME", nil}]]},
-          {"no_unset", [env: [{"NAME", false}]]}
+          {"no_unset", [env: [{"NAME", false}]]},
+          {"no_bounded", [env_mode: :replace, env: [{"NAME", nil}]]},
+          {"no_unset", [env: [{"NAME", nil}], structured_spawn_errors: true]}
         ] do
       shim = shim(dir, peer)
       assert_start_error(mode, opts ++ [shim_path: shim], :incompatible_shim)
@@ -147,7 +155,7 @@ defmodule Forcola.ExecutionOptionsTest do
       hello = dir |> Path.join("hello") |> File.read!() |> :json.decode()
 
       assert Enum.sort(hello["features"]) ==
-               ["env_unset_v1", "spawn_identity_v1", "structured_spawn_errors_v1"]
+               ["spawn_identity_v1", "structured_spawn_errors_v1"]
 
       spawn = dir |> Path.join("spawn") |> File.read!() |> :json.decode()
       assert spawn["env"] == %{"NIL" => :null, "FALSE" => :null, "SET" => "value"}

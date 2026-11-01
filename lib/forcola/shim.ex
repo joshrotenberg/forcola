@@ -75,10 +75,11 @@ defmodule Forcola.Shim do
   @doc false
   def negotiate(port, timeout_ms, required_features \\ ["bounded_run_v1"])
       when is_integer(timeout_ms) and timeout_ms >= 0 do
-    selected_features = Enum.reject(required_features, &(&1 == "bounded_run_v1"))
+    selected_features =
+      Enum.reject(required_features, &(&1 in ["bounded_run_v1", "env_unset_v1"]))
 
-    # bounded_run_v1 originally used an empty HELLO. It is a capability
-    # requirement, not a request to enable additional outbound frames.
+    # bounded_run_v1 and env_unset_v1 only require advertised support.
+    # With no outbound extension selected, keep the original empty HELLO.
     payload =
       if selected_features == [],
         do: "",
@@ -241,7 +242,7 @@ defmodule Forcola.Shim do
           do: feature
 
     required = if execution_options?(opts), do: ["bounded_run_v1" | required], else: required
-    selected = if env_unsets?(opts[:env]), do: selected ++ ["env_unset_v1"], else: selected
+    required = if env_unsets?(opts[:env]), do: ["env_unset_v1" | required], else: required
     Enum.uniq(required ++ selected)
   end
 

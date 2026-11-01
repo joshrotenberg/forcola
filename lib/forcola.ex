@@ -156,11 +156,12 @@ defmodule Forcola do
 
   New options (`:idle_timeout_ms`, `:max_output_bytes`, `:env_mode`, or the
   interrupt pair) require a versioned capability exchange before SPAWN.
-  Environment unsets, `:spawn_identity`, and `:structured_spawn_errors`
-  select independent capabilities through the same exchange, without enabling
-  strict collection. Explicit `:env_mode` and interrupt options require
-  `bounded_run_v1` in all four execution modes; bounded-only negotiation sends
-  the original empty HELLO payload.
+  Environment unsets require `env_unset_v1`; `:spawn_identity` and
+  `:structured_spawn_errors` select independent extensions through the same
+  exchange, without enabling strict collection. Explicit `:env_mode` and
+  interrupt options require `bounded_run_v1` in all four execution modes.
+  The two requirement-only capabilities are checked in the response and leave
+  the HELLO payload empty unless an outbound extension is selected.
   `cgroup: :required` alone keeps legacy collection and error shapes without
   negotiation; its existing string encoding enforces required containment.
   An older shim rejecting HELLO or a valid incompatible capability reply returns
