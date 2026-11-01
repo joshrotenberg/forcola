@@ -6,8 +6,6 @@
 use serde::Serialize;
 use std::io;
 
-pub const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessIdentity {
     pub pid: u32,

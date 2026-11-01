@@ -113,7 +113,14 @@ fn identity_precedes_pipe_and_pty_output_and_matches_ps() {
 
         let group = ps(pid, "pgid=");
         assert_eq!(group.trim().parse::<u64>().unwrap(), pid);
-        assert_eq!(ps(pid, "lstart=").trim(), format_start_time(&identity));
+        let ps_start = ps(pid, "lstart=");
+        let native_seconds = start_seconds(&identity["start_time"]);
+        assert!(
+            ps_start_matches(ps_start.trim(), native_seconds),
+            "ps start {:?} differs from native start {}",
+            ps_start.trim(),
+            format_start_time(native_seconds)
+        );
         check_native_start_time(pid, &identity["start_time"]);
 
         let mut output = Vec::new();
@@ -212,8 +219,28 @@ fn ps(pid: u64, field: &str) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn format_start_time(identity: &Value) -> String {
-    let epoch = start_seconds(&identity["start_time"]) as libc::time_t;
+fn ps_start_matches(observed: &str, epoch: u64) -> bool {
+    // Linux ps and /proc/stat can round the boot-time conversion differently.
+    // Keep the independent /proc start-tick comparison below exact.
+    let tolerance = if cfg!(target_os = "linux") { 1 } else { 0 };
+    (epoch.saturating_sub(tolerance)..=epoch.saturating_add(tolerance))
+        .any(|candidate| observed == format_start_time(candidate))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ps_start_comparison_allows_only_one_second_of_rounding() {
+    let epoch = 1_800_000_000;
+    for candidate in [epoch - 1, epoch, epoch + 1] {
+        assert!(ps_start_matches(&format_start_time(candidate), epoch));
+    }
+    for candidate in [epoch - 2, epoch + 2] {
+        assert!(!ps_start_matches(&format_start_time(candidate), epoch));
+    }
+}
+
+fn format_start_time(epoch: u64) -> String {
+    let epoch = epoch as libc::time_t;
     let mut time = std::mem::MaybeUninit::<libc::tm>::uninit();
     let mut formatted = [0u8; 64];
     // SAFETY: both C functions receive valid, correctly sized buffers;
