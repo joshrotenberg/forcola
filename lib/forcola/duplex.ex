@@ -126,10 +126,17 @@ defmodule Forcola.Duplex do
     `:output` is `:complete`, `:truncated`, `:unknown`, or a typed limit tuple
     such as `{:limit, :line, :stdout, 65536}`. Cleanup confirmation and output
     completeness are independent observations.
+
+    `:spawn_error` retains the native failure reason when `:cause` is
+    `:spawn_error`: a `Forcola.SpawnError` when structured errors were
+    requested, otherwise the legacy string. Malformed reports use
+    `:invalid_error`; other terminal causes leave the field `nil`.
+    This also exposes failures in pull mode, which sends no exit message,
+    and when shutdown consumes the failure before normal frame handling.
     """
 
     @enforce_keys [:status, :confirmation, :cause, :scope]
-    defstruct [:status, :confirmation, :cause, :scope, output: :complete]
+    defstruct [:status, :confirmation, :cause, :scope, spawn_error: nil, output: :complete]
 
     @type t :: %__MODULE__{
             status: non_neg_integer() | {:signal, non_neg_integer()} | nil,
@@ -144,6 +151,7 @@ defmodule Forcola.Duplex do
               | :output_limit
               | :spawn_error,
             scope: :process_group | :active_cgroup | :unknown,
+            spawn_error: Forcola.SpawnError.t() | String.t() | :invalid_error | nil,
             output:
               :complete | :truncated | :unknown | {:limit, :line | :total, atom(), pos_integer()}
           }
@@ -167,6 +175,12 @@ defmodule Forcola.Duplex do
 
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
     * `:shim_path` - trusted absolute shim path, as in `Forcola.run/2`.
+    * `:structured_spawn_errors` - negotiate native `Forcola.SpawnError`
+      reasons, default `false`. Failures retain the existing
+      `{:forcola_exit, session, {:spawn_error, reason}}` message envelope.
+      `Terminal.spawn_error` retains the same reason for pull delivery and
+      shutdown. Requires `structured_spawn_errors_v1` support; negotiation
+      has a five-second bound and incompatible shims fail before SPAWN.
     * `:spawn_identity` - request the child's native identity, default
       `false`. Requires `spawn_identity_v1` negotiation before SPAWN, with
       a five-second handshake bound. An incompatible shim returns an error
@@ -307,6 +321,9 @@ defmodule Forcola.Duplex do
   @doc """
   Demand one line from an opt-in pull session.
 
+  Spawn failures are available in `terminal.spawn_error`, including typed
+  `Forcola.SpawnError` values when `structured_spawn_errors: true`.
+
   Returns `{:ok, {:stdout, line}}` or `{:ok, {:stderr, line}}`, then
   `{:done, terminal}` after all output has been consumed. A caller that stops
   consuming should call `shutdown/1`; that result marks discarded output as
@@ -419,7 +436,7 @@ defmodule Forcola.Duplex do
     max_output_bytes = Keyword.get(opts, :max_output_bytes, @default_max_output_bytes)
     max_pending_bytes = Keyword.get(opts, :max_pending_bytes, max_line_bytes + 1)
 
-    case Shim.open_with_identity(opts) do
+    case Shim.open_with_features(opts) do
       {:ok, port} ->
         spawn_opts =
           opts
@@ -445,6 +462,7 @@ defmodule Forcola.Duplex do
            stdin_open: true,
            exit: nil,
            identity_enabled: Shim.identity_requested?(opts),
+           structured_spawn_errors: Keyword.get(opts, :structured_spawn_errors, false),
            identity: nil,
            terminal: nil,
            terminal_recipient: Keyword.get(opts, :terminal_recipient),
@@ -604,6 +622,7 @@ defmodule Forcola.Duplex do
   defp validate_opts!(argv, opts) do
     Shim.reject_spawn_observer!(opts, __MODULE__)
     Shim.validate_spawn_identity!(opts)
+    Shim.validate_structured_spawn_errors!(opts)
     Shim.reject_run_options!(opts, __MODULE__, [:max_output_bytes])
     validate_timeout_opt!(opts)
     validate_pty_opt!(opts)
@@ -751,14 +770,15 @@ defmodule Forcola.Duplex do
   end
 
   defp spawn_failed(state, payload) do
-    reason = Shim.decode_error(payload)
+    reason = Shim.decode_error(payload, state.structured_spawn_errors)
     notify_exit(state, {:spawn_error, reason})
 
     terminal = %Terminal{
       status: nil,
       confirmation: :not_started,
       cause: :spawn_error,
-      scope: :unknown
+      scope: :unknown,
+      spawn_error: reason
     }
 
     %{state | exit: {:spawn_error, reason}, terminal: terminal} |> reply_pull_waiter()
@@ -956,10 +976,17 @@ defmodule Forcola.Duplex do
     receive do
       {^port, {:data, <<tag, payload::binary>>}} ->
         cond do
-          tag == Shim.tag_exit() -> {:exit, payload}
-          tag == Shim.tag_error() -> {:spawn_error, payload}
-          tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
-          true -> do_await_exit(state, deadline)
+          tag == Shim.tag_exit() ->
+            {:exit, payload}
+
+          tag == Shim.tag_error() ->
+            {:spawn_error, Shim.decode_error(payload, state.structured_spawn_errors)}
+
+          tag == Shim.tag_spawned() ->
+            do_await_exit(record_identity(state, payload), deadline)
+
+          true ->
+            do_await_exit(state, deadline)
         end
 
       {^port, {:exit_status, _status}} ->
@@ -983,8 +1010,14 @@ defmodule Forcola.Duplex do
 
   defp shutdown_terminal({:exit, payload}, cause), do: exit_terminal(payload, cause)
 
-  defp shutdown_terminal({:spawn_error, _payload}, _cause) do
-    %Terminal{status: nil, confirmation: :not_started, cause: :spawn_error, scope: :unknown}
+  defp shutdown_terminal({:spawn_error, reason}, _cause) do
+    %Terminal{
+      status: nil,
+      confirmation: :not_started,
+      cause: :spawn_error,
+      scope: :unknown,
+      spawn_error: reason
+    }
   end
 
   defp shutdown_terminal(:timeout, cause) do

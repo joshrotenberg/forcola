@@ -30,6 +30,13 @@ defmodule Forcola.Daemon do
     * `:name` - optional GenServer registration name.
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
     * `:shim_path` - trusted absolute shim path, as in `Forcola.run/2`.
+    * `:structured_spawn_errors` - negotiate native `Forcola.SpawnError`
+      reasons, default `false`. Spawn failures still stop the daemon with
+      `{:spawn, reason}`, or return
+      `{:error, {:exited_before_ready, {:spawn, reason}}}` during readiness
+      polling. The struct retains the original string in `:message`.
+      Requires `structured_spawn_errors_v1` with a five-second negotiation
+      bound; incompatible shims fail before SPAWN.
     * `:spawn_identity` - request the child's native identity for `spawned/1`,
       default `false`. This sends no notification by itself. Requires
       `spawn_identity_v1` negotiation with a five-second handshake bound;
@@ -172,7 +179,7 @@ defmodule Forcola.Daemon do
 
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
 
-    case Shim.open_with_identity(opts) do
+    case Shim.open_with_features(opts) do
       {:ok, port} ->
         argv = Keyword.fetch!(opts, :argv)
         payload = Shim.encode_spawn(argv, Keyword.put(opts, :kill_grace_ms, kill_grace_ms))
@@ -182,6 +189,7 @@ defmodule Forcola.Daemon do
           port: port,
           spawn_observer: opts[:spawn_observer],
           identity_enabled: Shim.identity_requested?(opts),
+          structured_spawn_errors: Keyword.get(opts, :structured_spawn_errors, false),
           identity: nil,
           output: Keyword.get(opts, :output, :logger),
           log_level: Keyword.get(opts, :log_output, :info),
@@ -258,6 +266,7 @@ defmodule Forcola.Daemon do
 
   defp validate_opts!(opts) do
     Shim.validate_spawn_identity!(opts)
+    Shim.validate_structured_spawn_errors!(opts)
     Shim.validate_spawn_observer!(opts)
     Shim.reject_run_options!(opts, __MODULE__)
 
@@ -373,12 +382,23 @@ defmodule Forcola.Daemon do
 
   defp handle_frame(state, tag, payload) do
     cond do
-      tag == Shim.tag_stdout() -> emit(state, :stdout, payload)
-      tag == Shim.tag_stderr() -> emit(state, :stderr, payload)
-      tag == Shim.tag_spawned() -> record_identity(state, payload)
-      tag == Shim.tag_exit() -> handle_exit(state, payload)
-      tag == Shim.tag_error() -> %{state | exit: {:spawn_error, Shim.decode_error(payload)}}
-      true -> state
+      tag == Shim.tag_stdout() ->
+        emit(state, :stdout, payload)
+
+      tag == Shim.tag_stderr() ->
+        emit(state, :stderr, payload)
+
+      tag == Shim.tag_spawned() ->
+        record_identity(state, payload)
+
+      tag == Shim.tag_exit() ->
+        handle_exit(state, payload)
+
+      tag == Shim.tag_error() ->
+        %{state | exit: {:spawn_error, Shim.decode_error(payload, state.structured_spawn_errors)}}
+
+      true ->
+        state
     end
   end
 

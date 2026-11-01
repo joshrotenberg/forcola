@@ -21,7 +21,7 @@ defmodule Forcola.Run do
     strict = strict?(opts)
 
     deadline =
-      if strict or Shim.identity_requested?(opts), do: now() + Keyword.fetch!(opts, :timeout_ms)
+      if strict or Shim.negotiated?(opts), do: now() + Keyword.fetch!(opts, :timeout_ms)
 
     case Shim.open(opts) do
       {:ok, port} ->
@@ -47,7 +47,7 @@ defmodule Forcola.Run do
   defp execute_checked(port, argv, opts, false, nil), do: execute(port, argv, opts, false, nil)
 
   defp execute_checked(port, argv, opts, strict, deadline) do
-    features = Shim.identity_features(opts, if(strict, do: ["bounded_run_v1"], else: []))
+    features = Shim.features(opts, if(strict, do: ["bounded_run_v1"], else: []))
 
     with :ok <- Shim.negotiate(port, max(deadline - now(), 0), features),
          true <- now() < deadline do
@@ -111,6 +111,7 @@ defmodule Forcola.Run do
       reason: nil,
       truncated: false,
       identity_enabled: Shim.identity_requested?(opts),
+      structured_spawn_errors: Keyword.get(opts, :structured_spawn_errors, false),
       identity: nil
     }
 
@@ -320,11 +321,7 @@ defmodule Forcola.Run do
   end
 
   defp spawn_error(payload, acc) do
-    reason =
-      case Shim.decode_json(payload) do
-        {:ok, %{"reason" => reason}} when is_binary(reason) -> reason
-        _ -> :invalid_error
-      end
+    reason = Shim.decode_error(payload, acc.structured_spawn_errors)
 
     if acc.partial_errors or acc.reason != nil do
       res = result(acc, {:signal, :unconfirmed}, evidence(acc, {:spawn, reason}))
@@ -382,6 +379,7 @@ defmodule Forcola.Run do
   defp validate!(opts) do
     Shim.reject_spawn_observer!(opts, "Forcola.run/2")
     Shim.validate_spawn_identity!(opts)
+    Shim.validate_structured_spawn_errors!(opts)
     validate_observer!(opts[:output_observer])
 
     for key <- [:idle_timeout_ms, :max_output_bytes] do
@@ -392,7 +390,7 @@ defmodule Forcola.Run do
     validate_interrupt!(opts)
     timeout = Keyword.fetch!(opts, :timeout_ms)
 
-    if (strict?(opts) or Shim.identity_requested?(opts)) and
+    if (strict?(opts) or Shim.negotiated?(opts)) and
          not (is_integer(timeout) and timeout >= 0 and timeout <= 4_294_967_295),
        do:
          raise(

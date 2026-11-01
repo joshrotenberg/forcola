@@ -40,6 +40,8 @@
 //!                Empty payload queries capabilities without selecting new
 //!                frames. JSON {features: ["spawn_identity_v1"]} selects
 //!                features explicitly; unsupported selections fail closed.
+//!                structured_spawn_errors_v1 independently selects typed
+//!                spawn-error details; both extensions can be selected together.
 //!
 //! shim -> BEAM:
 //!   0x15 HELLO   JSON {protocol: 1, features: ["bounded_run_v1", ...]}
@@ -54,7 +56,16 @@
 //!   0x12 STDERR  payload: bytes from the child's stderr
 //!   0x13 EXIT    payload: JSON {status | signal, timed_out, confirmed,
 //!                               contained, output_truncated}
-//!   0x14 ERROR   payload: JSON {reason} (spawn failure etc.)
+//!   0x14 ERROR   payload: JSON {reason} (spawn failure etc.). With
+//!                structured_spawn_errors_v1 selected, spawn failures also
+//!                carry spawn_error: {stage, reason, errno, path}. Stages are
+//!                cwd, exec, privdrop, cgroup, spawn, or pty. Nested reason is
+//!                a lowercase POSIX errno name or static I/O error-kind name;
+//!                errno is the native integer or null, path a string or null.
+//!                Top-level reason retains the original human-readable text.
+//!                exec path is requested argv[0], not a resolved PATH candidate.
+//!                Child-side attribution comes from failed syscalls, without
+//!                path preflight. Generic pre-hook failures use stage spawn.
 //!   0x16 SPAWNED JSON {pid, pgid, start_time}, before any output and only
 //!                with spawn_identity_v1 selected. start_time is tagged:
 //!                Linux {kind: "linux", boot_id: string, ticks: integer}
@@ -71,6 +82,7 @@ mod frame;
 mod identity;
 mod privdrop;
 mod protocol;
+mod spawn_error;
 mod supervisor;
 
 use std::io;
