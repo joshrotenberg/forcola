@@ -224,11 +224,14 @@ are not atomic.
 
 An optional `track_observer: {pid, reference}` enables tracking and receives
 `{reference, {:tracked, identity}}` as groups appear, starting with the root,
-and `{reference, {:tracking_exit, %{scope: scope, confirmation: confirmation}}}`
-when the Elixir process survives to report completion. Native cleanup continues
+and `{reference, {:tracking_exit, evidence}}`, where evidence includes `scope`,
+`confirmation`, `contained` and `tracked_groups_truncated`, when the Elixir
+process survives to report completion. Native cleanup continues
 on brutal owner or BEAM death, but no final observer event is guaranteed then.
-Run results and Duplex terminals retain `tracked_groups`;
-Duplex and Daemon also expose `tracked/1` for polling. Tracking negotiates the
+Run results, Duplex terminals and Stream errors retain `tracked_groups` and
+`tracked_groups_truncated`. Their cleanup evidence also exposes `contained`
+(`true`, `false` or `:unknown`) independently of the tree scope. Duplex and Daemon
+also expose `tracked/1` for polling. Tracking negotiates the
 `track_descendants_v1` capability before SPAWN and leaves defaults unchanged.
 The [tracking guide](https://hexdocs.pm/forcola/getting_started.html#track-descendant-groups)
 describes platform limits and evidence.

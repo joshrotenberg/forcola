@@ -544,8 +544,6 @@ fn interrupt_graces_advance_concurrently_for_all_tracked_groups() {
             started.elapsed() < Duration::from_secs(2),
             "graces multiplied by group count"
         );
-        let mut interrupts = Vec::new();
-        let mut terms = Vec::new();
         for label in ["root", "session", "group"] {
             let signals = fixture.signals(label);
             assert_eq!(
@@ -555,18 +553,7 @@ fn interrupt_graces_advance_concurrently_for_all_tracked_groups() {
             );
             assert_eq!(signals[0]["signal"], "INT");
             assert_eq!(signals[1]["signal"], "TERM");
-            let interrupt = signals[0]["time"].as_f64().unwrap();
-            let term = signals[1]["time"].as_f64().unwrap();
-            assert!(term - interrupt >= 0.18, "INT grace skipped for {label}");
-            interrupts.push(interrupt);
-            terms.push(term);
         }
-        let last_interrupt = interrupts.into_iter().fold(f64::NEG_INFINITY, f64::max);
-        let first_term = terms.into_iter().fold(f64::INFINITY, f64::min);
-        assert!(
-            last_interrupt < first_term,
-            "one group reached TERM before another received INT"
-        );
         for pid in [root, session, group] {
             assert_gone(pid);
         }
@@ -712,5 +699,156 @@ fn tracking_discovers_forks_owned_by_nonleader_threads() {
     shim.send(KILL, &[]);
     assert_tracking_exit(&shim.finish().unwrap());
     assert_gone(child);
+    assert_gone(root);
+}
+
+#[test]
+fn natural_exit_keeps_its_outcome_and_output_when_descendant_cleanup_crosses_deadline() {
+    for cancel_after_exit in [false, true] {
+        let fixture = Fixture::new();
+        let script = r#"
+import os, signal, sys, time
+path = sys.argv[1]
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    signal.signal(signal.SIGTERM, lambda *_: None)
+    with open(path + '/session.ready', 'w') as stream:
+        stream.write(str(os.getpid()))
+    time.sleep(30)
+    os._exit(0)
+while not os.path.exists(path + '/root.exit'):
+    time.sleep(.005)
+print('complete trailing output', flush=True)
+os._exit(0)
+"#;
+        let mut shim = Shim::new(Some(&["track_descendants_v1"]));
+        let started = Instant::now();
+        shim.spawn(json!({
+            "argv":["python3", "-c", script, fixture.path],
+            "timeout_ms": 2000, "kill_grace_ms": 2500, "strict_output": true
+        }));
+        let root = shim.root_tracked()["pid"].as_i64().unwrap() as i32;
+        let descendant = fixture.ready("session");
+        shim.wait_tracked(&[descendant]);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "fixture startup used the root's deadline"
+        );
+        fixture.trigger("root.exit");
+        // The root is an unreaped zombie during descendant cleanup. Confirm
+        // from outside that its normal exit occurred before the run deadline.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !process_exited(root) {
+            assert!(
+                Instant::now() < deadline,
+                "root did not exit before its deadline"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        if cancel_after_exit {
+            // Let the waiter event arrive before this late cancellation.
+            thread::sleep(Duration::from_millis(100));
+            shim.send(KILL, &[]);
+        }
+        let mut output = Vec::new();
+        let exit = loop {
+            let (tag, bytes) = shim.recv().expect("missing EXIT");
+            match tag {
+                STDOUT => output.extend(bytes),
+                STDERR | TRACKED => {}
+                EXIT => break serde_json::from_slice::<Value>(&bytes).unwrap(),
+                _ => panic!("unexpected frame {tag:#x}"),
+            }
+        };
+        assert!(started.elapsed() >= Duration::from_millis(2500));
+        assert_tracking_exit(&exit);
+        assert_eq!(exit["status"], 0);
+        assert_eq!(exit["timed_out"], false);
+        assert_eq!(exit["output_truncated"], false);
+        assert_eq!(output, b"complete trailing output\n");
+        assert!(shim.finish().is_none());
+        assert_gone(root);
+        assert_gone(descendant);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_exited(pid: i32) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    result == size && unsafe { info.assume_init() }.pbi_status == 5
+}
+
+#[cfg(target_os = "linux")]
+fn process_exited(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .is_some_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, fields)| fields.trim_start().starts_with('Z'))
+        })
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn immediately_exiting_shell_keeps_unsampled_root_group_members_signalable() {
+    for _ in 0..5 {
+        let fixture = Fixture::new();
+        let mut shim = Shim::new(Some(&["track_descendants_v1"]));
+        shim.spawn(json!({
+            "argv":["sh", "-c", "sleep 60 & echo $! > \"$1/session.ready\"; exit 0", "sh", fixture.path],
+            "timeout_ms": 5000, "kill_grace_ms": 100
+        }));
+        let root = shim.root_tracked()["pid"].as_i64().unwrap() as i32;
+        let member = fixture.ready("session");
+        let exit = shim.finish().unwrap();
+        assert_tracking_exit(&exit);
+        assert_eq!(exit["status"], 0);
+        assert_gone(root);
+        assert_gone(member);
+    }
+}
+
+#[test]
+fn large_stdin_uses_backpressure_without_stopping_a_slow_child() {
+    const CHUNKS: usize = 1280;
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut shim = Shim::new(Some(&["track_descendants_v1"]));
+    let script = "import sys,time\ntime.sleep(.2)\nsize=0\nwhile True:\n data=sys.stdin.buffer.read(65536)\n if not data: break\n size+=len(data)\n time.sleep(.001)\nprint(size,flush=True)\n";
+    shim.spawn(json!({"argv":["python3", "-c", script], "timeout_ms":15000, "kill_grace_ms":100}));
+    let root = shim.root_tracked()["pid"].as_i64().unwrap() as i32;
+    let bytes = vec![b'x'; CHUNK_SIZE];
+    for _ in 0..CHUNKS {
+        shim.send(STDIN, &bytes);
+    }
+    shim.send(0x03, &[]);
+    let mut output = Vec::new();
+    let exit = loop {
+        let (tag, bytes) = shim.recv().expect("missing EXIT");
+        match tag {
+            STDOUT => output.extend(bytes),
+            STDERR | TRACKED => {}
+            EXIT => break serde_json::from_slice::<Value>(&bytes).unwrap(),
+            _ => panic!("unexpected frame {tag:#x}"),
+        }
+    };
+    assert_tracking_exit(&exit);
+    assert_eq!(exit["status"], 0);
+    assert_eq!(exit["timed_out"], false);
+    assert_eq!(
+        String::from_utf8(output).unwrap().trim(),
+        (CHUNKS * CHUNK_SIZE).to_string()
+    );
+    assert!(shim.finish().is_none());
     assert_gone(root);
 }

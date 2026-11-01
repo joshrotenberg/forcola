@@ -2,6 +2,7 @@
 """TRACKED compatibility and evidence fixture. Never starts a child."""
 import json
 import os
+import select
 import struct
 import sys
 
@@ -52,11 +53,35 @@ if "track_descendants_v1" in selected and MODE != "missing_root":
         frame(0x17, b"{broken")
     if MODE == "not_leader":
         frame(0x17, {**CHILD, "pgid": 789})
-    if MODE == "overflow":
+    if MODE in ("overflow", "overflow_wait"):
         for pid in range(1000, 5097):
             frame(0x17, {**CHILD, "pid": pid, "pgid": pid})
+if MODE == "overflow_wait":
+    frame(0x11, b"history-full\n")
+    with open(os.path.join(DIRECTORY, "waiting"), "w") as out:
+        out.write("ready")
+    while not os.path.exists(os.path.join(DIRECTORY, "release")):
+        if select.select([sys.stdin.buffer], [], [], 0.01)[0]:
+            request = read_frame()
+            if request is None or request[0] == 4:
+                with open(os.path.join(DIRECTORY, "premature_kill"), "w") as out:
+                    out.write("stopped")
+                break
+    with open(os.path.join(DIRECTORY, "continued"), "w") as out:
+        out.write("after-release")
+    frame(0x11, b"after-release\n")
 frame(0x11, b"ok\n")
 report = {"status": 0, "confirmed": True, "timed_out": False, "contained": False, "output_truncated": False}
+if MODE.startswith("contained_"):
+    report["status"] = 7
+    if MODE == "contained_true":
+        report["contained"] = True
+    elif MODE == "contained_missing":
+        del report["contained"]
+    elif MODE == "contained_invalid":
+        report["contained"] = "invalid"
+if MODE == "native_overflow":
+    report["tracked_groups_truncated"] = True
 if "track_descendants_v1" in selected:
     if MODE == "unknown_scope":
         report["scope"] = "invented_scope"

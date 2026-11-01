@@ -10,6 +10,7 @@ defmodule Forcola.Tracking do
             groups: [],
             seen: MapSet.new(),
             valid: true,
+            truncated: false,
             finished: false
 
   def validate_opts!(opts) do
@@ -51,7 +52,7 @@ defmodule Forcola.Tracking do
         {tracking, nil}
 
       MapSet.size(tracking.seen) >= @limit ->
-        {%{tracking | valid: false}, nil}
+        {%{tracking | valid: false, truncated: true}, nil}
 
       true ->
         {%{
@@ -67,7 +68,12 @@ defmodule Forcola.Tracking do
 
   def report(%{enabled: false}, payload) do
     report = Shim.decode_exit_report(payload)
-    Map.put(report, :scope, if(report.contained, do: :active_cgroup, else: :process_group))
+
+    Map.put(
+      report,
+      :scope,
+      if(report.contained == true, do: :active_cgroup, else: :process_group)
+    )
   end
 
   def report(tracking, payload) do
@@ -82,21 +88,29 @@ defmodule Forcola.Tracking do
     scope = scope(report["scope"])
 
     valid_flags =
-      Enum.all?(["timed_out", "contained", "output_truncated"], fn key ->
-        not Map.has_key?(report, key) or is_boolean(report[key])
-      end)
+      Enum.all?(
+        ["timed_out", "contained", "output_truncated", "tracked_groups_truncated"],
+        fn key ->
+          not Map.has_key?(report, key) or is_boolean(report[key])
+        end
+      )
 
     %{
       status: status,
       confirmed:
         report["confirmed"] == true and status != nil and valid_flags and
-          scope != :unknown and tracking.valid and tracking.groups != [],
+          scope != :unknown and tracking.valid and tracking.groups != [] and
+          report["tracked_groups_truncated"] != true,
       scope: scope,
       timed_out: report["timed_out"] == true,
-      contained: report["contained"] == true,
+      contained: contained(report["contained"]),
+      tracked_groups_truncated: tracking.truncated or report["tracked_groups_truncated"] == true,
       output_truncated: report["output_truncated"] == true
     }
   end
+
+  def contained(value) when is_boolean(value), do: value
+  def contained(_value), do: :unknown
 
   defp scope("tree_contained"), do: :tree_contained
   defp scope("tree_sampled"), do: :tree_sampled
@@ -118,11 +132,26 @@ defmodule Forcola.Tracking do
   def confirmation(%{confirmed: true}), do: :confirmed
   def confirmation(_report), do: :unconfirmed
 
-  def finish(%{enabled: false} = tracking, _scope, _confirmation), do: tracking
-  def finish(%{finished: true} = tracking, _scope, _confirmation), do: tracking
+  def finish(tracking, scope, confirmation, contained \\ :unknown, truncated \\ false)
 
-  def finish(tracking, scope, confirmation) do
-    notify(tracking, {:tracking_exit, %{scope: scope, confirmation: confirmation}})
+  def finish(%{enabled: false} = tracking, _scope, _confirmation, _contained, _truncated),
+    do: tracking
+
+  def finish(%{finished: true} = tracking, _scope, _confirmation, _contained, _truncated),
+    do: tracking
+
+  def finish(tracking, scope, confirmation, contained, truncated) do
+    notify(
+      tracking,
+      {:tracking_exit,
+       %{
+         scope: scope,
+         confirmation: confirmation,
+         contained: contained,
+         tracked_groups_truncated: tracking.truncated or truncated
+       }}
+    )
+
     %{tracking | finished: true}
   end
 

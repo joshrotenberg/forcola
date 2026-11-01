@@ -66,7 +66,7 @@ defmodule Forcola.Daemon do
       and unknown scope prevent positive tracking confirmation.
     * `:track_observer` - optional `{local_pid, reference}` receiving
       `{reference, {:tracked, identity}}` and one terminal
-      `{reference, {:tracking_exit, %{scope: scope, confirmation: confirmation}}}`
+      `{reference, {:tracking_exit, evidence}}`
       on startup failure, exit, readiness failure, or shutdown when the daemon
       survives to report it. A non-nil observer enables tracking even with
       `track_descendants: false`. Only this explicit observer is notified;
@@ -510,8 +510,11 @@ defmodule Forcola.Daemon do
     state
   end
 
-  defp finish_tracking(state, scope, confirmation),
-    do: %{state | tracking: Tracking.finish(state.tracking, scope, confirmation)}
+  defp finish_tracking(state, scope, confirmation, contained \\ :unknown, truncated \\ false),
+    do: %{
+      state
+      | tracking: Tracking.finish(state.tracking, scope, confirmation, contained, truncated)
+    }
 
   defp record_identity(%{identity_enabled: true, identity: nil} = state, payload) do
     case Shim.decode_identity(payload) do
@@ -533,12 +536,17 @@ defmodule Forcola.Daemon do
   defp handle_exit(state, payload) do
     report = Tracking.report(state.tracking, payload)
 
-    if report.contained do
+    if report.contained == true do
       Logger.debug("forcola: daemon ran under Linux cgroup v2 containment")
     end
 
     state
-    |> finish_tracking(report.scope, Tracking.confirmation(report))
+    |> finish_tracking(
+      report.scope,
+      Tracking.confirmation(report),
+      report.contained,
+      report.tracked_groups_truncated
+    )
     |> Map.put(:exit, {:exit, {Tracking.status(report), report.timed_out}})
   end
 
@@ -617,7 +625,14 @@ defmodule Forcola.Daemon do
   end
 
   defp finish_cleanup_tracking(state, {:exit, report}),
-    do: finish_tracking(state, report.scope, Tracking.confirmation(report))
+    do:
+      finish_tracking(
+        state,
+        report.scope,
+        Tracking.confirmation(report),
+        report.contained,
+        report.tracked_groups_truncated
+      )
 
   defp finish_cleanup_tracking(state, confirmation),
     do: finish_tracking(state, :unknown, confirmation)

@@ -147,10 +147,12 @@ It is Linux-only and always degrades gracefully, never erroring. On macOS, on
 non-cgroup-v2 systems, and when the subtree is not delegated, `cgroup: true`
 falls back to the ordinary process-group kill and logs a warning; ordinary
 in-group grandchildren still die exactly as before. The EXIT report carries a
-`contained` flag reporting which mechanism was used. `Forcola.Duplex.Terminal`
-exposes this as `scope: :active_cgroup` or `:process_group` when tracking is
-disabled. Tracking reports `:tree_contained` or `:tree_sampled` instead;
-the native `contained` flag independently records cgroup placement. Scope
+`contained` flag reporting cgroup placement. `Result.evidence.contained`,
+`Duplex.Terminal.contained`, `Stream.Error.contained` and the tracking observer's
+terminal evidence expose `true`, `false` or `:unknown` when no valid placement
+report is available. Scope is `:active_cgroup` or `:process_group` when tracking
+is disabled, and `:tree_contained` or `:tree_sampled` when enabled. `contained`
+remains independent of that tree scope. Scope
 describes the mechanism, not proof that externally owned work was contained. A
 `Logger.debug` line is also emitted when containment was active. That line
 comes from `Forcola.run/2` and `Forcola.Daemon`; `Forcola.Stream` and
@@ -215,6 +217,13 @@ confirm anything about a descendant reparented before it was first sampled.
 
 Tracking emits a root-first TRACKED identity for each observed group and
 retains process identities separately so a later group change can be detected.
+The root is observed with `waitid(..., WNOWAIT)` and reaped after cleanup, keeping
+its original group identity valid for signals to unsampled same-group members.
+On macOS, `proc_listpids` inventories that pinned group after the root exits.
+Dead groups are pruned from the native live set. Retained Elixir history can be
+truncated without stopping the command; truncation makes cleanup unconfirmed.
+Persistent inventory failures or live capacity exhaustion still stop a tracked
+command, as detailed in the tracking guide.
 Before each signal, the current leader must match its recorded start time and
 group. If it does not, the numeric group is never signalled; independently
 verified retained members are signalled individually. Identity verification

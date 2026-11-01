@@ -13,6 +13,9 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 pub const MAX_GROUPS: usize = 4096;
 pub const MAX_PROCESSES: usize = 65_536;
 const CONFIRM_GRACE: Duration = Duration::from_millis(500);
+// One failed inventory can be a transient procfs/libproc race. Three
+// consecutive incomplete scans mean discovery can no longer be trusted.
+const MAX_INCOMPLETE_SCANS: u8 = 3;
 
 pub fn scope() -> &'static str {
     if cfg!(target_os = "linux") {
@@ -36,6 +39,7 @@ pub fn prepare() -> io::Result<ProcessIdentity> {
 trait Source {
     fn read(&mut self, pid: u32) -> io::Result<Option<ProcessRecord>>;
     fn children(&mut self, pid: u32) -> io::Result<Vec<u32>>;
+    fn group_members(&mut self, pgid: u32) -> io::Result<Vec<u32>>;
     fn signal(&mut self, target: i32, signal: i32) -> io::Result<()>;
     fn reap(&mut self, pid: u32) -> io::Result<()>;
     fn now(&self, reference: Instant) -> Instant {
@@ -60,6 +64,21 @@ impl Source for Native {
 
     fn children(&mut self, pid: u32) -> io::Result<Vec<u32>> {
         platform::children(pid)
+    }
+
+    fn group_members(&mut self, pgid: u32) -> io::Result<Vec<u32>> {
+        #[cfg(target_os = "macos")]
+        {
+            platform::group_members(pgid)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pgid;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "group inventory unavailable",
+            ))
+        }
     }
 
     fn signal(&mut self, target: i32, signal: i32) -> io::Result<()> {
@@ -139,6 +158,8 @@ pub struct Tracker<S = Native> {
     pending: Vec<ProcessIdentity>,
     cleanup: Option<Cleanup>,
     uncertain: bool,
+    incomplete_scans: u8,
+    root_group_unresolved: bool,
     group_limit: usize,
     process_limit: usize,
     adopt_orphans: bool,
@@ -182,6 +203,8 @@ impl<S: Source> Tracker<S> {
             pending: Vec::new(),
             cleanup: None,
             uncertain: false,
+            incomplete_scans: 0,
+            root_group_unresolved: false,
             group_limit: MAX_GROUPS,
             process_limit: MAX_PROCESSES,
             adopt_orphans: cfg!(target_os = "linux"),
@@ -225,7 +248,7 @@ impl<S: Source> Tracker<S> {
                 self.send_checked(&member, false, libc::SIGKILL);
             }
         }
-        !self.uncertain
+        !self.uncertain && self.incomplete_scans == 0
     }
 
     pub fn begin_cleanup(&mut self, now: Instant, interrupt: Option<Duration>, term: Duration) {
@@ -239,9 +262,80 @@ impl<S: Source> Tracker<S> {
         }
     }
 
-    /// Refresh retained anchors, then traverse every verified child edge. A
-    /// failed read never silently turns an unknown subtree into an empty one.
+    fn scan_error(&mut self, error: &io::Error, incomplete: &mut bool) {
+        *incomplete = true;
+        // Invalid metadata/inventory bounds are safety failures, not transient
+        // OS reads. Signal and reap errors also remain immediately sticky.
+        if matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::Unsupported
+        ) {
+            self.fail();
+        }
+    }
+
+    fn scan_root_group(&mut self, incomplete: &mut bool) {
+        self.root_group_unresolved = false;
+        if self.adopt_orphans {
+            return;
+        }
+        let Some(root) = self.processes.get(&self.root_pid) else {
+            return;
+        };
+        if !root.exited || root.identity.pid != root.identity.pgid {
+            return;
+        }
+        let expected = root.identity.clone();
+        self.root_group_unresolved = true;
+        // WNOWAIT pins this zombie's group while cleanup runs. Enumerating it
+        // reaches same-group members that reparented before the first ancestry
+        // sample and avoids waiting a full grace for a root-only command.
+        let members = match self.source.group_members(expected.pgid) {
+            Ok(members) => members,
+            Err(error) => {
+                self.scan_error(&error, incomplete);
+                return;
+            }
+        };
+        match self.source.read(expected.pid) {
+            Ok(Some(root)) if root.identity == expected => {}
+            Ok(_) => {
+                // An unreaped root cannot disappear or be reused. Losing this
+                // invariant means the group inventory cannot be authorized.
+                self.fail();
+                return;
+            }
+            Err(error) => {
+                self.scan_error(&error, incomplete);
+                return;
+            }
+        }
+        let mut unresolved = false;
+        for pid in members {
+            let member = match self.source.read(pid) {
+                Ok(Some(member)) if member.identity.pgid == expected.pgid => member,
+                Ok(_) => continue,
+                Err(error) => {
+                    self.scan_error(&error, incomplete);
+                    unresolved = true;
+                    continue;
+                }
+            };
+            if !self.processes.contains_key(&pid) && self.processes.len() >= self.process_limit {
+                self.fail();
+                unresolved = true;
+                break;
+            }
+            self.processes.insert(pid, member);
+        }
+        self.root_group_unresolved = unresolved;
+    }
+
+    /// Refresh retained anchors, then traverse every verified child edge.
+    /// Incomplete scans retain anchors and retry. Persistent discovery failure
+    /// stops the child; a single transient read does not start cleanup.
     pub fn scan(&mut self) {
+        let mut incomplete = false;
         let mut queue: VecDeque<_> = self
             .processes
             .values()
@@ -275,8 +369,8 @@ impl<S: Source> Tracker<S> {
                     }
                     continue;
                 }
-                Err(_) => {
-                    self.fail();
+                Err(error) => {
+                    self.scan_error(&error, &mut incomplete);
                     continue;
                 }
             };
@@ -287,8 +381,8 @@ impl<S: Source> Tracker<S> {
             let children = match self.source.children(expected.pid) {
                 Ok(children) => children,
                 Err(error) if disappeared(&error) => continue,
-                Err(_) => {
-                    self.fail();
+                Err(error) => {
+                    self.scan_error(&error, &mut incomplete);
                     continue;
                 }
             };
@@ -296,8 +390,8 @@ impl<S: Source> Tracker<S> {
             match self.source.read(expected.pid) {
                 Ok(Some(parent)) if parent.identity.same_process(&expected) => {}
                 Ok(_) => continue,
-                Err(_) => {
-                    self.fail();
+                Err(error) => {
+                    self.scan_error(&error, &mut incomplete);
                     continue;
                 }
             }
@@ -308,8 +402,8 @@ impl<S: Source> Tracker<S> {
                 let child = match self.source.read(pid) {
                     Ok(Some(child)) if child.ppid == expected.pid => child,
                     Ok(_) => continue,
-                    Err(_) => {
-                        self.fail();
+                    Err(error) => {
+                        self.scan_error(&error, &mut incomplete);
                         continue;
                     }
                 };
@@ -326,18 +420,11 @@ impl<S: Source> Tracker<S> {
             }
         }
 
+        self.scan_root_group(&mut incomplete);
         let records: Vec<_> = self.processes.values().cloned().collect();
-        for record in records {
+        for record in &records {
             let id = &record.identity;
-            if id.pid == id.pgid && !self.groups.contains_key(id) {
-                if self.groups.len() >= self.group_limit {
-                    self.fail();
-                } else {
-                    self.groups.insert(id.clone(), None);
-                    self.pending.push(id.clone());
-                }
-            }
-            // Root is exclusively owned by Child::wait in the waiter thread.
+            // The root waiter retains its zombie until tracking is complete.
             // Adopted zombies need no further signals and are reaped promptly.
             if self.adopt_orphans
                 && id.pid != self.root_pid
@@ -351,11 +438,46 @@ impl<S: Source> Tracker<S> {
                 }
             }
         }
+        // Bound currently retained groups, not every group ever observed. A
+        // zombie leader still pins its PGID and must remain signalable (most
+        // importantly the unreaped root). A reused leader proves the old group
+        // no longer exists, even if the replacement has the same numeric PGID.
+        let retained_pgids: HashSet<_> = self.processes.values().map(|p| p.identity.pgid).collect();
+        self.groups.retain(|id, _| {
+            if let Some(leader) = self.processes.get(&id.pid) {
+                if !leader.identity.same_process(id) {
+                    return false;
+                }
+                if leader.identity == *id {
+                    return true;
+                }
+            }
+            retained_pgids.contains(&id.pgid)
+        });
+        for record in self.processes.values() {
+            let id = &record.identity;
+            if id.pid == id.pgid && !self.groups.contains_key(id) {
+                if self.groups.len() >= self.group_limit {
+                    self.uncertain = true;
+                } else {
+                    self.groups.insert(id.clone(), None);
+                    self.pending.push(id.clone());
+                }
+            }
+        }
         self.members.retain(|id, _| {
             self.processes
                 .get(&id.pid)
                 .is_some_and(|p| !p.exited && p.identity == *id)
         });
+        self.incomplete_scans = if incomplete {
+            self.incomplete_scans.saturating_add(1)
+        } else {
+            0
+        };
+        if self.incomplete_scans >= MAX_INCOMPLETE_SCANS {
+            self.fail();
+        }
     }
 
     /// Check identity immediately before signalling. There is no portable
@@ -486,7 +608,8 @@ impl<S: Source> Tracker<S> {
             .map(|(id, seq)| (id.clone(), *seq))
             .collect();
         for (group, previous) in groups {
-            if !live.iter().any(|id| id.pgid == group.pgid) {
+            let unresolved_root = self.root_group_unresolved && group.pid == self.root_pid;
+            if !unresolved_root && !live.iter().any(|id| id.pgid == group.pgid) {
                 continue;
             }
             let target_now = self.source.now(now);
@@ -526,12 +649,12 @@ impl<S: Source> Tracker<S> {
             }
         }
         let cleanup = self.cleanup.as_mut().unwrap();
-        cleanup.empty_scans = if live.is_empty() {
+        cleanup.empty_scans = if live.is_empty() && self.incomplete_scans == 0 {
             cleanup.empty_scans.saturating_add(1)
         } else {
             0
         };
-        if force && !live.is_empty() {
+        if force && (!live.is_empty() || self.incomplete_scans > 0) {
             self.uncertain = true;
         }
         let done = cleanup.empty_scans >= 2 || force;
@@ -574,7 +697,10 @@ mod platform {
         };
         for (index, task) in tasks.enumerate() {
             if index >= MAX_PROCESSES {
-                return Err(io::Error::other("tracking thread inventory overflow"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tracking thread inventory overflow",
+                ));
             }
             let path = task?.path();
             let bytes = match fs::read(path.join("children")) {
@@ -583,14 +709,17 @@ mod platform {
                 Err(error) => return Err(error),
             };
             let text = std::str::from_utf8(&bytes)
-                .map_err(|_| io::Error::other("invalid children list"))?;
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid children list"))?;
             for child in text.split_whitespace() {
                 let child = child
                     .parse()
-                    .map_err(|_| io::Error::other("invalid child pid"))?;
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid child pid"))?;
                 children.insert(child);
                 if children.len() > MAX_PROCESSES {
-                    return Err(io::Error::other("tracking process inventory overflow"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "tracking process inventory overflow",
+                    ));
                 }
             }
         }
@@ -608,6 +737,7 @@ mod tests {
         records: HashMap<u32, ProcessRecord>,
         denied: HashSet<u32>,
         fail_children: bool,
+        fail_group_inventory: bool,
         fail_signals: bool,
         fail_group_signals: bool,
         exit_on_group_signal: bool,
@@ -638,6 +768,17 @@ mod tests {
                 .collect();
             children.sort_unstable();
             Ok(children)
+        }
+        fn group_members(&mut self, pgid: u32) -> io::Result<Vec<u32>> {
+            if self.fail_children || self.fail_group_inventory {
+                return Err(io::Error::other("inventory unavailable"));
+            }
+            Ok(self
+                .records
+                .values()
+                .filter(|p| p.identity.pgid == pgid)
+                .map(|p| p.identity.pid)
+                .collect())
         }
         fn signal(&mut self, target: i32, signal: i32) -> io::Result<()> {
             if signal == 0 {
@@ -844,11 +985,100 @@ mod tests {
         tracker.source.records.insert(20, record(20, 20, 1));
         tracker.scan();
         assert!(tracker.processes.is_empty());
+        assert!(tracker.groups.is_empty());
+    }
+
+    #[test]
+    fn transient_metadata_and_inventory_errors_retry_without_stopping_a_healthy_child() {
+        for metadata in [false, true] {
+            let mut tracker = tracker();
+            if metadata {
+                tracker.source.denied.insert(10);
+            } else {
+                tracker.source.fail_children = true;
+            }
+            tracker.scan();
+            assert!(!tracker.uncertain());
+            assert!(!tracker.cleaning());
+            assert!(tracker.root_known());
+            assert_eq!(tracker.incomplete_scans, 1);
+            tracker.source.denied.clear();
+            tracker.source.fail_children = false;
+            tracker.source.records.insert(20, record(20, 20, 10));
+            tracker.scan();
+            assert!(!tracker.uncertain());
+            assert!(!tracker.cleaning());
+            assert_eq!(tracker.incomplete_scans, 0);
+            assert!(tracker.processes.contains_key(&20));
+        }
+    }
+
+    #[test]
+    fn incomplete_scan_cannot_confirm_empty_cleanup() {
+        let mut tracker = tracker();
+        tracker.adopt_orphans = true;
+        tracker.source.records.remove(&10);
+        tracker.scan();
+        let now = Instant::now();
+        begin(&mut tracker, now);
+        tracker.advance(now);
+        tracker.source.fail_children = true;
+        tracker.scan();
+        let result = tracker.advance(now + SAMPLE_INTERVAL);
+        assert!(!result.done);
+        assert!(!result.confirmed);
+        assert!(!tracker.uncertain());
+        tracker.source.fail_children = false;
+        tracker.scan();
+        tracker.advance(now + SAMPLE_INTERVAL * 2);
+        tracker.scan();
+        assert!(tracker.advance(now + SAMPLE_INTERVAL * 3).confirmed);
+    }
+
+    #[test]
+    fn dead_group_churn_does_not_exhaust_the_live_group_bound() {
+        let mut tracker = tracker();
+        tracker.group_limit = 2;
+        tracker.take_new_groups();
+        let mut previous = None;
+        for pid in 20..20 + MAX_GROUPS as u32 + 1 {
+            if let Some(previous) = previous {
+                tracker.source.records.remove(&previous);
+            }
+            tracker.source.records.insert(pid, record(pid, pid, 10));
+            tracker.scan();
+            assert!(!tracker.uncertain());
+            assert_eq!(tracker.groups.len(), 2);
+            assert_eq!(tracker.take_new_groups(), [record(pid, pid, 10).identity]);
+            previous = Some(pid);
+        }
+        tracker.source.records.remove(&previous.unwrap());
+        tracker.scan();
         assert_eq!(tracker.groups.len(), 1);
     }
 
     #[test]
-    fn inventory_metadata_and_signal_errors_remain_unconfirmed_after_recovery() {
+    fn group_pruning_preserves_retained_members_and_handles_numeric_pgid_reuse() {
+        let mut tracker = tracker();
+        tracker.group_limit = 2;
+        tracker.source.records.insert(20, record(20, 20, 10));
+        tracker.source.records.insert(21, record(21, 20, 20));
+        tracker.scan();
+        let original = record(20, 20, 10).identity;
+        tracker.source.records.remove(&20);
+        tracker.scan();
+        assert!(tracker.groups.contains_key(&original));
+        tracker.source.records.remove(&21);
+        let replacement = replacement(record(20, 20, 10));
+        tracker.source.records.insert(20, replacement.clone());
+        tracker.scan();
+        assert!(!tracker.groups.contains_key(&original));
+        assert!(tracker.groups.contains_key(&replacement.identity));
+        assert!(!tracker.uncertain());
+    }
+
+    #[test]
+    fn persistent_inventory_metadata_and_signal_errors_remain_unconfirmed_after_recovery() {
         for failure in 0..3 {
             let mut tracker = tracker();
             match failure {
@@ -858,7 +1088,12 @@ mod tests {
                 1 => tracker.source.fail_children = true,
                 _ => tracker.source.fail_signals = true,
             }
-            tracker.scan();
+            for scan in 1..=MAX_INCOMPLETE_SCANS {
+                tracker.scan();
+                if failure < 2 {
+                    assert_eq!(tracker.uncertain(), scan == MAX_INCOMPLETE_SCANS);
+                }
+            }
             let now = Instant::now();
             begin(&mut tracker, now);
             tracker.advance(now);
@@ -896,6 +1131,63 @@ mod tests {
                 assert_eq!(tracker.processes.len(), 1);
             }
         }
+    }
+
+    #[test]
+    fn unreaped_root_group_inventory_finds_unsampled_reparented_members() {
+        let mut tracker = tracker();
+        tracker.source.records.get_mut(&10).unwrap().exited = true;
+        tracker.source.records.insert(20, record(20, 10, 1));
+        tracker.scan();
+        assert!(tracker.groups.contains_key(&record(10, 10, 1).identity));
+        assert!(tracker.processes.contains_key(&20));
+        let now = Instant::now();
+        begin(&mut tracker, now);
+        tracker.advance(now);
+        assert_eq!(tracker.source.signals, [(-10, libc::SIGINT)]);
+        tracker.source.records.remove(&20);
+        tracker.scan();
+        assert!(!tracker.advance(now + SAMPLE_INTERVAL).done);
+        tracker.scan();
+        assert!(tracker.advance(now + SAMPLE_INTERVAL * 2).confirmed);
+        assert!(tracker.source.reaped.is_empty());
+    }
+
+    #[test]
+    fn failed_root_group_inventory_still_escalates_the_pinned_group() {
+        let mut tracker = tracker();
+        tracker.source.records.get_mut(&10).unwrap().exited = true;
+        tracker.source.fail_group_inventory = true;
+        tracker.scan();
+        assert!(!tracker.uncertain());
+        let now = Instant::now();
+        begin(&mut tracker, now);
+        for millis in [0, 100, 300] {
+            tracker.scan();
+            assert!(!tracker.advance(now + Duration::from_millis(millis)).done);
+        }
+        assert_eq!(
+            tracker.source.signals,
+            [
+                (-10, libc::SIGINT),
+                (-10, libc::SIGTERM),
+                (-10, libc::SIGKILL)
+            ]
+        );
+        assert!(tracker.uncertain());
+    }
+
+    #[test]
+    fn root_only_exit_does_not_wait_unused_signal_graces() {
+        let mut tracker = tracker();
+        tracker.source.records.get_mut(&10).unwrap().exited = true;
+        tracker.scan();
+        let now = Instant::now();
+        begin(&mut tracker, now);
+        assert!(!tracker.advance(now).done);
+        tracker.scan();
+        assert!(tracker.advance(now + SAMPLE_INTERVAL).confirmed);
+        assert!(tracker.source.signals.is_empty());
     }
 
     #[test]
@@ -1021,6 +1313,53 @@ mod platform {
     pub fn prepare() -> io::Result<()> {
         children(std::process::id()).map(|_| ())
     }
+    pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
+        const PROC_PGRP_ONLY: u32 = 2;
+        let mut capacity = 64;
+        loop {
+            let mut pids = vec![0_i32; capacity];
+            // Unlike proc_listchildpids, proc_listpids returns bytes. Retry a
+            // full buffer to cover growth, keeping the same inventory bound.
+            let bytes = unsafe {
+                *libc::__error() = 0;
+                libc::proc_listpids(
+                    PROC_PGRP_ONLY,
+                    pgid,
+                    pids.as_mut_ptr().cast(),
+                    (pids.len() * std::mem::size_of::<i32>()) as i32,
+                )
+            };
+            if bytes <= 0 {
+                let error = io::Error::last_os_error();
+                if bytes == 0 && error.raw_os_error() == Some(0) {
+                    return Ok(Vec::new());
+                }
+                return Err(error);
+            }
+            if !(bytes as usize).is_multiple_of(std::mem::size_of::<i32>()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid group inventory size",
+                ));
+            }
+            let count = bytes as usize / std::mem::size_of::<i32>();
+            if count < capacity {
+                pids.truncate(count);
+                return Ok(pids
+                    .into_iter()
+                    .filter(|pid| *pid > 0)
+                    .map(|pid| pid as u32)
+                    .collect());
+            }
+            if capacity > MAX_PROCESSES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tracking process inventory overflow",
+                ));
+            }
+            capacity = (capacity * 2).min(MAX_PROCESSES + 1);
+        }
+    }
     pub fn children(pid: u32) -> io::Result<Vec<u32>> {
         let mut capacity = 64;
         loop {
@@ -1051,7 +1390,10 @@ mod platform {
                     .collect());
             }
             if capacity > MAX_PROCESSES {
-                return Err(io::Error::other("tracking process inventory overflow"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tracking process inventory overflow",
+                ));
             }
             capacity = (capacity * 2).min(MAX_PROCESSES + 1);
         }

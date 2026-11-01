@@ -480,21 +480,128 @@ defmodule Forcola.TrackingTest do
     end
   end
 
-  test "tracking history is bounded even when a peer exceeds the group limit", %{tmp_dir: dir} do
+  test "tracking history truncation keeps every mode running until the child exits", %{
+    tmp_dir: dir
+  } do
     for mode <- @modes do
       ref = make_ref()
-      handle = start(mode, ["unused"], opts(ref, shim_path: fake_shim(dir, "overflow")))
+      handle = start(mode, ["unused"], opts(ref, shim_path: fake_shim(dir, "overflow_wait")))
 
       try do
+        assert eventually(fn -> File.exists?(Path.join(dir, "waiting")) end)
+        assert handle_alive?(handle)
+        refute_receive {^ref, {:tracking_exit, _}}, 100
+        refute File.exists?(Path.join(dir, "premature_kill"))
+        File.write!(Path.join(dir, "release"), "go")
         outcome = finish(handle, :exit)
         assert_receive {^ref, {:tracking_exit, evidence}}, 5_000
-        refute evidence.confirmation == :confirmed
+        assert evidence.confirmation == :unconfirmed
+        assert evidence.tracked_groups_truncated
         assert_history_bound(outcome)
+        assert_truncated_history(outcome)
+        assert File.read!(Path.join(dir, "continued")) == "after-release"
+        refute File.exists?(Path.join(dir, "premature_kill"))
       after
         stop(handle)
       end
     end
   end
+
+  test "native notification truncation reaches each evidence surface", %{tmp_dir: dir} do
+    for mode <- @modes do
+      ref = make_ref()
+      handle = start(mode, ["unused"], opts(ref, shim_path: fake_shim(dir, "native_overflow")))
+
+      try do
+        outcome = finish(handle, :exit)
+        assert_receive {^ref, {:tracking_exit, evidence}}, 5_000
+        assert evidence.tracked_groups_truncated
+        assert evidence.confirmation == :unconfirmed
+        assert_truncated_history(outcome)
+      after
+        stop(handle)
+      end
+    end
+  end
+
+  test "cgroup placement remains visible independently of tree scope", %{tmp_dir: dir} do
+    for mode <- @modes,
+        {peer, contained} <- [
+          {"contained_true", true},
+          {"contained_false", false},
+          {"contained_missing", :unknown},
+          {"contained_invalid", :unknown}
+        ] do
+      ref = make_ref()
+      handle = start(mode, ["unused"], opts(ref, shim_path: fake_shim(dir, peer)))
+
+      try do
+        outcome = finish(handle, :exit)
+        assert_receive {^ref, {:tracking_exit, evidence}}, 5_000
+        assert evidence.contained == contained
+        assert_contained(outcome, contained)
+      after
+        stop(handle)
+      end
+    end
+  end
+
+  test "Run preserves normal exit and trailing output when descendant cleanup passes its deadline",
+       %{tmp_dir: dir} do
+    child = tree(dir, "setsid")
+    fixture = Path.join(child.dir, "exit_output.py")
+
+    File.write!(
+      fixture,
+      @tree
+      |> File.read!()
+      |> String.replace("sys.exit(0)", "os.write(1, b'trailing-output\\n'); sys.exit(0)")
+    )
+
+    child = %{child | argv: [System.find_executable("python3"), fixture, "setsid", child.dir]}
+    ref = make_ref()
+    handle = start(:run, child.argv, opts(ref, timeout_ms: 1_500, kill_grace_ms: 2_000))
+
+    try do
+      root = await_pid(child, "root")
+      descendant = await_pid(child, "descendant")
+      assert_first_tracked(ref, root)
+      assert_tracked(ref, descendant)
+      trigger(handle, :exit, child, root)
+      assert {:ok, %Result{status: 0} = result} = finish(handle, :exit)
+      assert result.stdout =~ "trailing-output\n"
+      assert result.evidence.reason == nil
+      assert result.evidence.output_truncated == false
+      Enum.each([root, descendant], &assert_gone/1)
+    after
+      stop(handle)
+    end
+  end
+
+  defp handle_alive?({:task, _, task}), do: Process.alive?(task.pid)
+  defp handle_alive?({:duplex, _, session}), do: Process.alive?(session.pid)
+  defp handle_alive?({:daemon, daemon}), do: Process.alive?(daemon)
+
+  defp assert_truncated_history({:ok, result}), do: assert(result.tracked_groups_truncated)
+
+  defp assert_truncated_history({:stream_error, error}),
+    do: assert(error.tracked_groups_truncated)
+
+  defp assert_truncated_history(:closed), do: :ok
+
+  defp assert_contained({:ok, %Result{evidence: evidence}}, expected),
+    do: assert(evidence.contained == expected)
+
+  defp assert_contained({:error, {:spawn, {:invalid_exit, result}}}, expected),
+    do: assert(result.evidence.contained == expected)
+
+  defp assert_contained({:ok, %Duplex.Terminal{contained: actual}}, expected),
+    do: assert(actual == expected)
+
+  defp assert_contained({:stream_error, error}, expected),
+    do: assert(error.contained == expected)
+
+  defp assert_contained(:closed, _expected), do: :ok
 
   defp assert_bound_reason({:stream_error, %{idle_timed_out: true}}, "quiet"), do: :ok
   defp assert_bound_reason({:stream_error, %{limit: {:line, :stdout, 512}}}, "flood"), do: :ok
@@ -651,9 +758,15 @@ defmodule Forcola.TrackingTest do
   defp assert_tracking_exit(ref, scope, confirmation, context \\ nil) do
     assert_receive {^ref, {:tracking_exit, evidence}}, 10_000
 
-    assert evidence == %{scope: scope, confirmation: confirmation},
+    assert %{
+             scope: ^scope,
+             confirmation: ^confirmation,
+             contained: contained,
+             tracked_groups_truncated: false
+           } = evidence,
            "unexpected tracking evidence #{inspect(evidence)} for #{inspect(context)}"
 
+    assert is_boolean(contained)
     refute_receive {^ref, {:tracking_exit, _}}, 0
   end
 
@@ -691,10 +804,10 @@ defmodule Forcola.TrackingTest do
 
   defp refute_confirmed(_), do: :ok
 
-  defp assert_history_bound({:ok, %{tracked_groups: groups}}), do: assert(length(groups) <= 4_096)
+  defp assert_history_bound({:ok, %{tracked_groups: groups}}), do: assert(length(groups) == 4_096)
 
   defp assert_history_bound({:stream_error, %{tracked_groups: groups}}),
-    do: assert(length(groups) <= 4_096)
+    do: assert(length(groups) == 4_096)
 
   defp assert_history_bound(_), do: :ok
 
@@ -782,6 +895,10 @@ defmodule Forcola.TrackingTest do
   defp fake_shim(dir, mode) do
     File.rm(Path.join(dir, "hello"))
     File.rm(Path.join(dir, "spawn"))
+
+    for marker <- ["waiting", "release", "premature_kill", "continued"],
+        do: File.rm(Path.join(dir, marker))
+
     path = Path.join(dir, "shim")
 
     File.write!(

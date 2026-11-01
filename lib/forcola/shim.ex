@@ -704,7 +704,8 @@ defmodule Forcola.Shim do
       status: status,
       confirmed: Map.get(decoded, "confirmed", true),
       timed_out: Map.get(decoded, "timed_out", false),
-      contained: Map.get(decoded, "contained", false),
+      contained: Forcola.Tracking.contained(decoded["contained"]),
+      tracked_groups_truncated: false,
       output_truncated: Map.get(decoded, "output_truncated", false)
     }
   end

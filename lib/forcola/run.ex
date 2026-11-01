@@ -262,7 +262,13 @@ defmodule Forcola.Run do
           do: project_status(raw, ev.cleanup == :confirmed, true),
           else: project_status(raw, report["confirmed"], acc.strict)
 
-      Tracking.finish(acc.tracking, ev.scope, ev.cleanup)
+      Tracking.finish(
+        acc.tracking,
+        ev.scope,
+        ev.cleanup,
+        ev.contained,
+        ev.tracked_groups_truncated
+      )
 
       if report["contained"] == true,
         do: Logger.debug("forcola: run completed under Linux cgroup v2 containment")
@@ -308,6 +314,8 @@ defmodule Forcola.Run do
         cleanup:
           if(tracked, do: Tracking.confirmation(tracked), else: confirmation(report["confirmed"])),
         scope: if(tracked, do: tracked.scope, else: scope(report["contained"])),
+        contained: Tracking.contained(report["contained"]),
+        tracked_groups_truncated: if(tracked, do: tracked.tracked_groups_truncated, else: false),
         reason: acc.reason || timeout_reason(report["timed_out"]),
         output_truncated: truncation(acc.truncated, report["output_truncated"])
     }
@@ -327,8 +335,22 @@ defmodule Forcola.Run do
   defp truncation(_, _), do: :unknown
 
   defp malformed(acc, report \\ %{}) do
-    Tracking.finish(acc.tracking, :unknown, :unconfirmed)
-    ev = evidence(acc, :malformed_exit)
+    ev = %{
+      evidence(acc, :malformed_exit)
+      | contained: Tracking.contained(report["contained"]),
+        tracked_groups_truncated:
+          acc.tracking.enabled and
+            (acc.tracking.truncated or report["tracked_groups_truncated"] == true)
+    }
+
+    Tracking.finish(
+      acc.tracking,
+      :unknown,
+      :unconfirmed,
+      ev.contained,
+      ev.tracked_groups_truncated
+    )
+
     # Retain a syntactically valid raw child observation even if other fields
     # are malformed. It cannot make the cleanup evidence positive.
     ev =
@@ -375,6 +397,8 @@ defmodule Forcola.Run do
       output_truncated: if(acc.truncated, do: true, else: :unknown),
       cleanup: :unknown,
       scope: :unknown,
+      contained: :unknown,
+      tracked_groups_truncated: acc.tracking.truncated,
       guard_close: nil
     }
   end
@@ -388,7 +412,8 @@ defmodule Forcola.Run do
       pgid: if(acc.identity, do: acc.identity.pgid),
       start_time: if(acc.identity, do: acc.identity.start_time),
       evidence: evidence,
-      tracked_groups: Tracking.groups(acc.tracking)
+      tracked_groups: Tracking.groups(acc.tracking),
+      tracked_groups_truncated: evidence.tracked_groups_truncated
     }
   end
 

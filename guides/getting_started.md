@@ -734,16 +734,19 @@ terminal = Forcola.Duplex.shutdown(session)
 
 `track_observer: {local_pid, reference}` enables tracking, even if
 `track_descendants: false` was supplied. Notifications are unacknowledged:
-`{reference, {:tracked, identity}}` reports each new group once, starting with
-the root group before output delivery. The identity has the same native
+`{reference, {:tracked, identity}}` reports each retained distinct identity
+once, starting with the root group before output delivery. The identity has the same native
 `pid`, `pgid`, and `start_time` shape as SPAWNED, with `pid == pgid`.
-A process that changes groups may produce another distinct group identity.
+A process that changes groups may produce another distinct group identity. The
+native shim can report an identity again after its group was pruned and later
+reappears; Elixir deduplicates identities within its retained history.
 Receiving a notification does not pause the executable. Persist it and its
 full start time if recovery code needs it later.
 
 When the Elixir process survives to report completion, the observer receives
 one terminal event,
-`{reference, {:tracking_exit, %{scope: scope, confirmation: confirmation}}}`.
+`{reference, {:tracking_exit, evidence}}`. The evidence map contains `scope`,
+`confirmation`, `contained` and `tracked_groups_truncated`.
 Native EOF cleanup still runs after brutal consumer/server or BEAM death, but
 that path cannot promise a final observer event. A Duplex session surviving
 its owner's death can still report to a surviving explicit observer. This
@@ -753,7 +756,12 @@ Successful Stream and Daemon execution can be observed this way without
 changing line or output delivery. Daemon never implicitly messages its
 supervisor. Tracking without an observer still performs cleanup.
 `Forcola.Result.tracked_groups`, `Forcola.Duplex.Terminal.tracked_groups` and
-`Forcola.Stream.Error.tracked_groups` retain first-seen group identities.
+`Forcola.Stream.Error.tracked_groups` retain the first 4,096 distinct group
+identities. `tracked_groups_truncated: true` records later history overflow or
+a native observation queue overflow. Either prevents positive cleanup confirmation
+but does not stop a healthy command. Native tracking continues for the live set.
+The observer receives at most the retained history; persist those observations
+if they are needed after the session is released.
 Duplex also sends `{:forcola_tracked, session, identity}` to its owner.
 `Duplex.tracked/1` retains history after natural exit until release;
 `Daemon.tracked/2` queries a live daemon, with a default 5,000 ms timeout.
@@ -768,9 +776,16 @@ children of every thread, retains verified descendants, and discovers
 orphans adopted by the shim. It reaps adopted zombies while the command runs.
 On macOS it samples children through `proc_listchildpids`, retaining verified
 observations after reparenting. Both use a 50 ms polling interval and scan at
-the start of cleanup; inventory work adds to that interval. A macOS descendant that is reparented before any sample
-can escape; `:tree_sampled` never proves whole-tree containment. Platforms
+the start of cleanup; inventory work adds to that interval. A macOS descendant
+that is reparented before any sample can escape; `:tree_sampled` never proves whole-tree containment. Platforms
 without these mechanisms reject the negotiated feature.
+
+The shim observes root exit without reaping it until tracked cleanup finishes.
+The retained root identity keeps its original group signalable. On macOS,
+`proc_listpids` inventories that pinned group after root exit, including ordinary
+same-group descendants that were never individually sampled. This
+preserves original-group cleanup on macOS; descendants that escape the group
+and are reparented before a sample remain outside the guarantee.
 
 Normal child exit, child SIGKILL, timeout, idle/output bounds, stream halt,
 Duplex close, Daemon shutdown/readiness failure, owner death and BEAM EOF all
@@ -787,14 +802,19 @@ A valid tracking EXIT reports `:tree_contained` on Linux or `:tree_sampled` on
 macOS. Confirmation covers every tracked live group/member, including cleanup
 after the root has already exited. `cgroup: true` remains the stronger Linux
 backstop; `cgroup: :required` still requires placement before exec. Cgroups do
-not remove the need to reap adopted children. Tracking retains at most 4,096
-group identities and 65,536 process records. To keep blocked child stdin from
-stalling discovery, tracking mode adds a writer queue capped at 64 MiB;
-exceeding that queue's bound starts unconfirmed cleanup. This is not an aggregate
-transport memory bound: frames awaiting dispatch in the existing reader queue
-are separate. Inventory overflow, inaccessible metadata,
-failed signals or incomplete cleanup initiate bounded shutdown and prevent
-positive confirmation. Missing/malformed TRACKED or EXIT evidence cannot
+not remove the need to reap adopted children. The native tracker retains at most
+4,096 current groups and 65,536 process records, pruning dead groups and processes
+so repeated short-lived groups do not consume a lifetime quota. A bounded stdin
+channel applies backpressure to the sender while the supervision loop continues
+sampling. A KILL frame behind blocked input waits for that input, as on the
+default path; the native run timer remains independent.
+
+A single transient metadata or child-inventory read error is retried at the next
+scan. Three consecutive incomplete scans start bounded cleanup. Invalid metadata,
+unsupported discovery, live inventory capacity exhaustion, reaping failures and
+signal failures also prevent positive confirmation and trigger cleanup where it
+has not already begun. Transport loss still triggers cleanup. History truncation
+alone does not stop the command. Missing/malformed TRACKED or EXIT evidence cannot
 confirm cleanup on the Elixir side. Observer terminal confirmation is
 `:confirmed` or `:unconfirmed`, with `:not_started` for startup failure,
 `:timeout` for a missing report at the backstop, and `:transport_lost` for a

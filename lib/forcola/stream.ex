@@ -109,6 +109,11 @@ defmodule Forcola.Stream do
         the shim reported an incomplete drain
       * `:tracked_groups` - observed cleanup-group identities, root first,
         including observations consumed during cancellation; defaults to `[]`
+      * `:tracked_groups_truncated` - whether the history bound or native
+        notification queue dropped observations. Execution continues, but
+        incomplete history cannot confirm cleanup.
+      * `:contained` - the native cgroup-placement flag, or `:unknown` if
+        unavailable, independently of the tree cleanup scope
       * `:scope` / `:confirmation` - the reported cleanup mechanism and its
         confirmation. Tracking uses explicit `:tree_contained` or
         `:tree_sampled`; missing or unknown scope is `:unknown` and cannot
@@ -124,6 +129,8 @@ defmodule Forcola.Stream do
       idle_timed_out: false,
       output_truncated: false,
       tracked_groups: [],
+      tracked_groups_truncated: false,
+      contained: :unknown,
       scope: :unknown,
       confirmation: :unknown
     ]
@@ -137,6 +144,8 @@ defmodule Forcola.Stream do
             idle_timed_out: boolean(),
             output_truncated: boolean(),
             tracked_groups: [Forcola.Shim.identity()],
+            tracked_groups_truncated: boolean(),
+            contained: boolean() | :unknown,
             scope: :process_group | :active_cgroup | :tree_contained | :tree_sampled | :unknown,
             confirmation:
               :confirmed | :unconfirmed | :unknown | :not_started | :timeout | :transport_lost
@@ -245,12 +254,12 @@ defmodule Forcola.Stream do
   Optional `:track_observer` accepts `{local_pid, reference}` and enables
   tracking even with `track_descendants: false`. It receives
   `{reference, {:tracked, identity}}` for each newly observed group and one
-  `{reference, {:tracking_exit, %{scope: scope, confirmation: confirmation}}}`
+  `{reference, {:tracking_exit, evidence}}`
   when enumeration can report its completion, cancellation, or failure.
   The observer is the terminal evidence surface for successful or halted
-  streams; exceptions also retain `:tracked_groups`, `:scope`, and
-  `:confirmation`. See `Forcola.run/2` for confirmation values and
-  `Forcola.Result` for identity fields. A consumer paused between pulls delays
+  streams; exceptions also retain `:tracked_groups`, `:scope`, `:contained`,
+  `:tracked_groups_truncated`, and `:confirmation`. See `Forcola.run/2` for
+  confirmation values and `Forcola.Result` for identity fields. A consumer paused between pulls delays
   observer messages until frames are consumed; native tracking and cleanup
   continue. Tracking frames do not reset output idle deadlines or use output
   credit. Brutal consumer or VM death can prevent a final observer message.
@@ -632,20 +641,42 @@ defmodule Forcola.Stream do
     :error, :badarg -> {:shim_exited, state}
   end
 
-  defp finish_tracking(state, scope, confirmation),
-    do: %{state | tracking: Tracking.finish(state.tracking, scope, confirmation)}
+  defp finish_tracking(state, scope, confirmation, contained \\ :unknown, truncated \\ false),
+    do: %{
+      state
+      | tracking: Tracking.finish(state.tracking, scope, confirmation, contained, truncated)
+    }
 
   defp tracking_error(state, fields) do
     struct!(
       Error,
-      [stderr: stderr(state), tracked_groups: Tracking.groups(state.tracking)] ++ fields
+      [
+        stderr: stderr(state),
+        tracked_groups: Tracking.groups(state.tracking),
+        tracked_groups_truncated: state.tracking.truncated
+      ] ++ fields
     )
   end
 
   defp cleanup_evidence({:exit, report}, state) do
     confirmation = Tracking.confirmation(report)
-    evidence = %{status: Tracking.status(report), scope: report.scope, confirmation: confirmation}
-    {evidence, finish_tracking(state, report.scope, confirmation)}
+
+    evidence = %{
+      status: Tracking.status(report),
+      scope: report.scope,
+      confirmation: confirmation,
+      contained: report.contained,
+      tracked_groups_truncated: report.tracked_groups_truncated
+    }
+
+    {evidence,
+     finish_tracking(
+       state,
+       report.scope,
+       confirmation,
+       report.contained,
+       report.tracked_groups_truncated
+     )}
   end
 
   defp cleanup_evidence(result, state) do
@@ -657,7 +688,13 @@ defmodule Forcola.Stream do
         _ -> :unconfirmed
       end
 
-    evidence = %{status: {:signal, :unconfirmed}, scope: :unknown, confirmation: confirmation}
+    evidence = %{
+      status: {:signal, :unconfirmed},
+      scope: :unknown,
+      confirmation: confirmation,
+      contained: :unknown
+    }
+
     {evidence, finish_tracking(state, :unknown, confirmation)}
   end
 
@@ -783,7 +820,16 @@ defmodule Forcola.Stream do
     report = Tracking.report(state.tracking, payload)
     status = Tracking.status(report)
     confirmation = Tracking.confirmation(report)
-    state = finish_tracking(state, report.scope, confirmation)
+
+    state =
+      finish_tracking(
+        state,
+        report.scope,
+        confirmation,
+        report.contained,
+        report.tracked_groups_truncated
+      )
+
     final = if state.buffer == "", do: [], else: [state.buffer]
 
     outcome =
@@ -796,6 +842,8 @@ defmodule Forcola.Stream do
            timed_out: report.timed_out,
            output_truncated: report.output_truncated,
            scope: report.scope,
+           contained: report.contained,
+           tracked_groups_truncated: report.tracked_groups_truncated,
            confirmation: confirmation
          )}
       end

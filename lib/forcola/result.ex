@@ -28,7 +28,10 @@ defmodule Forcola.Result do
   same start-time shape above. Repeated identities are deduplicated; a reused
   PID with a different start time is a distinct entry. The list defaults to
   `[]`, is bounded at 4,096 entries, and survives in partial results. It is
-  not a list of processes known to be alive. Root identity in this history
+  not a list of processes known to be alive. `:tracked_groups_truncated` is
+  true once the history limit or native observation queue drops an entry;
+  execution continues and cleanup
+  cannot be confirmed from the incomplete history. Root identity in this history
   does not populate `:pid`, `:pgid`, or `:start_time` without `:spawn_identity`.
 
   `:evidence` defaults to `nil` for source-compatible struct construction.
@@ -41,6 +44,10 @@ defmodule Forcola.Result do
     * `:reason` - `nil`, `:timeout`, `:idle_timeout`, `:max_output_bytes`, or
       `:observer_overflow`. Early JSON on stdout does not override this reason.
     * `:output_truncated` - `true`, `false`, or `:unknown` when not reported.
+    * `:contained` - `true` or `false` when cgroup placement was reported, or
+      `:unknown` when unavailable. Independent of the tree cleanup scope.
+    * `:tracked_groups_truncated` - whether the 4,096-entry history limit or
+      native observation queue dropped an entry. This makes cleanup unconfirmed without stopping the child.
     * `:cleanup` - `:confirmed`, `:unconfirmed`, or `:unknown`. Only an explicit,
       valid native EXIT confirmation yields `:confirmed`.
     * `:scope` - `:process_group`, `:active_cgroup`, `:tree_contained`,
@@ -67,6 +74,8 @@ defmodule Forcola.Result do
             :exit | :malformed_exit | :backstop | {:transport, term()} | {:spawn, term()},
           reason: nil | :timeout | :idle_timeout | :max_output_bytes | :observer_overflow,
           output_truncated: boolean() | :unknown,
+          contained: boolean() | :unknown,
+          tracked_groups_truncated: boolean(),
           cleanup: :confirmed | :unconfirmed | :unknown,
           scope: :process_group | :active_cgroup | :tree_contained | :tree_sampled | :unknown,
           guard_close: :ok | {:error, :guard_close_timeout}
@@ -81,7 +90,8 @@ defmodule Forcola.Result do
     stdout: "",
     stderr: "",
     evidence: nil,
-    tracked_groups: []
+    tracked_groups: [],
+    tracked_groups_truncated: false
   ]
 
   @type t :: %__MODULE__{
@@ -90,6 +100,7 @@ defmodule Forcola.Result do
           pgid: pos_integer() | nil,
           start_time: Forcola.Shim.start_time() | nil,
           tracked_groups: [Forcola.Shim.identity()],
+          tracked_groups_truncated: boolean(),
           stdout: binary(),
           stderr: binary(),
           evidence: evidence() | nil

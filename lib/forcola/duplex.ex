@@ -126,10 +126,15 @@ defmodule Forcola.Duplex do
     an escaped descendant outside that mechanism was confined.
     `:output` is `:complete`, `:truncated`, `:unknown`, or a typed limit tuple
     such as `{:limit, :line, :stdout, 65536}`. Cleanup confirmation and output
-    completeness are independent observations.
+    completeness are independent observations. `:contained` is the native
+    cgroup-placement flag, or `:unknown` when no valid flag was reported.
+    It remains independent of tree scope when tracking is enabled.
 
     `:tracked_groups` retains the observed cleanup-group identities in order,
     root first, including frames consumed during shutdown. It defaults to `[]`.
+    `:tracked_groups_truncated` becomes true when the history bound or native
+    notification queue drops observations. Execution continues, but the
+    incomplete history cannot confirm cleanup.
     See `Forcola.Result` for the identity shape and Linux/macOS scope meanings.
     A macOS descendant reparented before its first sample is outside the
     sampled guarantee. Missing or malformed tracking history, overflow, and
@@ -152,7 +157,9 @@ defmodule Forcola.Duplex do
       :scope,
       spawn_error: nil,
       output: :complete,
-      tracked_groups: []
+      tracked_groups: [],
+      tracked_groups_truncated: false,
+      contained: :unknown
     ]
 
     @type t :: %__MODULE__{
@@ -169,6 +176,8 @@ defmodule Forcola.Duplex do
               | :spawn_error,
             scope: :process_group | :active_cgroup | :tree_contained | :tree_sampled | :unknown,
             tracked_groups: [Shim.identity()],
+            tracked_groups_truncated: boolean(),
+            contained: boolean() | :unknown,
             spawn_error: Forcola.SpawnError.t() | String.t() | :invalid_error | nil,
             output:
               :complete | :truncated | :unknown | {:limit, :line | :total, atom(), pos_integer()}
@@ -222,7 +231,7 @@ defmodule Forcola.Duplex do
       reparented before its first sample. Incomplete tracking is unconfirmed.
     * `:track_observer` - optional `{local_pid, reference}` receiving
       `{reference, {:tracked, identity}}` and one terminal
-      `{reference, {:tracking_exit, %{scope: scope, confirmation: confirmation}}}`
+      `{reference, {:tracking_exit, evidence}}`
       when the session can report its end. A non-nil observer enables tracking
       even with `track_descendants: false`; it supplements the owner's
       `:forcola_tracked` messages. See `Forcola.run/2` for confirmation values.
@@ -282,8 +291,8 @@ defmodule Forcola.Duplex do
     table = :ets.new(:forcola_duplex_terminal, [:set, :public])
     identity_status = if Shim.identity_requested?(opts), do: :pending, else: :not_requested
     :ets.insert(table, {:spawn_identity, identity_status})
-    tracking_status = if opts[:track_descendants], do: [], else: :not_requested
-    :ets.insert(table, {:tracked_groups, tracking_status})
+    tracking_status = if opts[:track_descendants], do: 0, else: :not_requested
+    :ets.insert(table, [{:tracked_groups, tracking_status}, {:tracked_groups_truncated, false}])
 
     case GenServer.start(__MODULE__, {self(), ref, table, argv, opts}) do
       {:ok, pid} ->
@@ -352,7 +361,7 @@ defmodule Forcola.Duplex do
   @spec tracked(session()) :: {:ok, [Shim.identity()]} | {:error, :not_requested | :closed}
   def tracked(%__MODULE__{pid: pid, terminal_table: table}) do
     case :ets.lookup(table, :tracked_groups) do
-      [{:tracked_groups, groups}] when is_list(groups) -> {:ok, groups}
+      [{:tracked_groups, count}] when is_integer(count) -> {:ok, stored_groups(table, count)}
       _ -> if Process.alive?(pid), do: {:error, :not_requested}, else: {:error, :closed}
     end
   catch
@@ -820,16 +829,28 @@ defmodule Forcola.Duplex do
     {tracking, identity} = Tracking.record(state.tracking, payload)
 
     if identity do
-      store_tracked(state.session.terminal_table, Tracking.groups(tracking))
+      store_tracked(state.session.terminal_table, MapSet.size(tracking.seen), identity)
       Tracking.notify_record(tracking, identity)
       send(state.owner, {:forcola_tracked, state.session, identity})
+    end
+
+    if tracking.truncated and not state.tracking.truncated do
+      store_tracking_truncated(state.session.terminal_table)
     end
 
     %{state | tracking: tracking}
   end
 
-  defp store_tracked(table, groups) do
-    :ets.insert(table, {:tracked_groups, groups})
+  defp store_tracking_truncated(table) do
+    :ets.insert(table, {:tracked_groups_truncated, true})
+  catch
+    :error, :badarg -> :ok
+  end
+
+  defp store_tracked(table, count, identity) do
+    # Publish the count after the entry so polling never sees a missing index.
+    :ets.insert(table, {{:tracked_group, count}, identity})
+    :ets.insert(table, {:tracked_groups, count})
   catch
     :error, :badarg -> :ok
   end
@@ -1067,10 +1088,24 @@ defmodule Forcola.Duplex do
   end
 
   defp with_groups(terminal, tracking),
-    do: %{terminal | tracked_groups: Tracking.groups(tracking)}
+    do: %{
+      terminal
+      | tracked_groups: Tracking.groups(tracking),
+        tracked_groups_truncated: terminal.tracked_groups_truncated or tracking.truncated
+    }
 
   defp finish_tracking(state, terminal) do
-    %{state | tracking: Tracking.finish(state.tracking, terminal.scope, terminal.confirmation)}
+    %{
+      state
+      | tracking:
+          Tracking.finish(
+            state.tracking,
+            terminal.scope,
+            terminal.confirmation,
+            terminal.contained,
+            terminal.tracked_groups_truncated
+          )
+    }
   end
 
   defp await_exit(state, timeout_ms) do
@@ -1117,8 +1152,10 @@ defmodule Forcola.Duplex do
       confirmation: if(report.confirmed, do: :confirmed, else: :unconfirmed),
       cause: if(report.timed_out, do: :timeout, else: cause),
       scope: report.scope,
+      contained: report.contained,
       output: if(report.output_truncated, do: :truncated, else: :complete),
-      tracked_groups: Tracking.groups(tracking)
+      tracked_groups: Tracking.groups(tracking),
+      tracked_groups_truncated: report.tracked_groups_truncated
     }
   end
 
@@ -1195,7 +1232,8 @@ defmodule Forcola.Duplex do
             cause: :session_lost,
             scope: :unknown,
             output: :unknown,
-            tracked_groups: stored_groups(table)
+            tracked_groups: stored_groups(table),
+            tracked_groups_truncated: :ets.lookup_element(table, :tracked_groups_truncated, 2)
           }
 
           :ets.insert_new(table, {:terminal, terminal})
@@ -1209,9 +1247,15 @@ defmodule Forcola.Duplex do
 
   defp stored_groups(table) do
     case :ets.lookup(table, :tracked_groups) do
-      [{:tracked_groups, groups}] when is_list(groups) -> groups
+      [{:tracked_groups, count}] when is_integer(count) -> stored_groups(table, count)
       _ -> []
     end
+  end
+
+  defp stored_groups(_table, 0), do: []
+
+  defp stored_groups(table, count) do
+    Enum.map(1..count, fn index -> :ets.lookup_element(table, {:tracked_group, index}, 2) end)
   end
 
   defp warn_unconfirmed_cleanup(:unconfirmed) do

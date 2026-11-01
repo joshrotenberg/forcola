@@ -131,7 +131,7 @@ defmodule Forcola do
       remains a stronger backstop where available.
     * `:track_observer` - optional `{local_pid, reference}` receiving
       `{reference, {:tracked, identity}}` for each new group, then
-      `{reference, {:tracking_exit, %{scope: scope, confirmation: confirmation}}}`.
+      `{reference, {:tracking_exit, evidence}}`.
       A non-nil observer enables tracking even with `track_descendants: false`.
       All modes support this observer. It receives no stdout/stderr and does
       not enable `:spawn_identity`. Group identities are observations rather
@@ -139,6 +139,9 @@ defmodule Forcola do
       completed or failed execution path, including pre-SPAWN failure, when
       the BEAM process survives to report it. Confirmation is `:confirmed`,
       `:unconfirmed`, `:not_started`, `:timeout`, or `:transport_lost`.
+      Evidence contains `:scope`, `:confirmation`, `:contained` (boolean or
+      `:unknown`), and `:tracked_groups_truncated` (boolean). History overflow
+      leaves execution running and prevents positive cleanup confirmation.
       Missing or unknown tracking scope never confirms cleanup. Notifications
       are unacknowledged; a dead observer does not affect execution.
     * `:output_observer` - optional `{local_pid, reference}` receiving

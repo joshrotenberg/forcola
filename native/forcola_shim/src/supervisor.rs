@@ -22,7 +22,8 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ enum Event {
     StdinClosed,
     StdinError(io::Error),
     ChildExited(ChildOutcome),
+    ChildWaitFailed,
     TimedOut,
     TrackingWriteFailed,
 }
@@ -265,12 +267,22 @@ where
         }
     }
 
-    spawn_stdin_reader(stdin, tx.clone());
-    // The waiter thread takes ownership of `child` entirely: it is the
-    // single, sole caller of `Child::wait`, so there is never a double
-    // reap race. The supervising loop only ever learns the child's exit
-    // through `Event::ChildExited`.
-    spawn_waiter(child, tx.clone());
+    let (tracked_input, input_sender) = if tracker.is_some() {
+        let (input, sender) = TrackedInput::new(child_stdin.take());
+        (Some(input), Some(sender))
+    } else {
+        (None, None)
+    };
+    spawn_stdin_reader(stdin, tx.clone(), input_sender);
+    // Tracked runs keep the exited root unreaped until cleanup finishes. Its
+    // identity still authorizes group signals to unsampled same-group members.
+    let tracked_child = if tracker.is_some() {
+        spawn_tracked_waiter(child.id(), tx.clone());
+        Some(child)
+    } else {
+        spawn_waiter(child, tx.clone());
+        None
+    };
 
     if let Some(timeout_ms) = request.timeout_ms {
         spawn_timeout_timer(timeout_ms, tx.clone());
@@ -291,6 +303,8 @@ where
         request.interrupt_grace_ms.map(Duration::from_millis),
         tracker,
         tx,
+        tracked_child,
+        tracked_input,
     );
 
     // Backpressure linger: the child is reaped and the EXIT frame is written,
@@ -378,9 +392,8 @@ fn select_features(payload: &[u8], supported: &[&str]) -> Result<SelectedFeature
     })
 }
 
-/// Startup reporting failed before the waiter took ownership. Stop the owned
-/// group immediately, including a cgroup backstop when present, then reap the
-/// child and remove its cgroup. No early error may leave a live child behind.
+/// Startup reporting failed before supervision began. Honor the configured
+/// tracking sequence while keeping the owned root unreaped through cleanup.
 fn abort_startup(
     mut child: Child,
     cgroup: Option<&Cgroup>,
@@ -402,10 +415,10 @@ fn abort_startup(
     tracker.begin_cleanup(Instant::now(), interrupt_grace, grace);
     loop {
         // No waiter thread exists on this path.
-        let reaped = matches!(child.try_wait(), Ok(Some(_)));
+        let exited = peek_child_exit(child.id(), true).is_ok_and(|outcome| outcome.is_some());
         tracker.scan();
         if tracker.advance(Instant::now()).done {
-            if !reaped {
+            if !exited {
                 // A later metadata failure must not block Child::wait forever.
                 // This exact still-owned child cannot have had its PID reused.
                 let _ = process::kill_process(Pid::from_child(&child), Signal::KILL);
@@ -421,6 +434,8 @@ fn abort_startup(
     }
 }
 
+/// Stop the owned group immediately, including a cgroup backstop when present,
+/// then reap the child and remove its cgroup after a startup failure.
 fn abort_spawn(mut child: Child, cgroup: Option<&Cgroup>, grace: Duration) {
     let _ = process::kill_process_group(Pid::from_child(&child), Signal::KILL);
     if let Some(cgroup) = cgroup {
@@ -786,10 +801,27 @@ fn pump_gated<P: Read, W: Write>(
 
 /// Reads protocol frames off the shim's stdin and forwards them as
 /// `Event`s. Clean EOF is reported as `Event::StdinClosed`.
-fn spawn_stdin_reader<R: Read + Send + 'static>(mut stdin: R, tx: Sender<Event>) {
+fn spawn_stdin_reader<R: Read + Send + 'static>(
+    mut stdin: R,
+    tx: Sender<Event>,
+    mut tracked_input: Option<TrackedInputSender>,
+) {
     thread::spawn(move || loop {
         match frame::read_frame(&mut stdin) {
             Ok(Some(f)) => {
+                if let Some(input) = tracked_input.as_mut() {
+                    match f.tag {
+                        TAG_STDIN => {
+                            input.send(f.payload);
+                            continue;
+                        }
+                        TAG_EOF => {
+                            input.sender = None;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 if tx.send(Event::Stdin(f)).is_err() {
                     return;
                 }
@@ -825,6 +857,45 @@ fn spawn_waiter(mut child: Child, tx: Sender<Event>) {
     });
 }
 
+/// Observe a direct child's exit without reaping it. WNOWAIT leaves the root's
+/// start time and process-group identifier valid until tracking cleanup ends.
+fn peek_child_exit(pid: u32, nonblocking: bool) -> io::Result<Option<ChildOutcome>> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let options = libc::WEXITED | libc::WNOWAIT | if nonblocking { libc::WNOHANG } else { 0 };
+        // SAFETY: this is our direct child and info points to a full siginfo_t.
+        let result = unsafe { libc::waitid(libc::P_PID, pid, info.as_mut_ptr(), options) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: waitid initialized the zeroed buffer; si_pid is zero when a
+        // nonblocking call found no exit. si_status is valid for WEXITED events.
+        let info = unsafe { info.assume_init() };
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
+        let status = unsafe { info.si_status() };
+        return Ok(Some(ChildOutcome {
+            status: (info.si_code == libc::CLD_EXITED).then_some(status),
+            signal: matches!(info.si_code, libc::CLD_KILLED | libc::CLD_DUMPED).then_some(status),
+        }));
+    }
+}
+
+fn spawn_tracked_waiter(pid: u32, tx: Sender<Event>) {
+    thread::spawn(move || {
+        let event = match peek_child_exit(pid, false) {
+            Ok(Some(outcome)) => Event::ChildExited(outcome),
+            _ => Event::ChildWaitFailed,
+        };
+        let _ = tx.send(event);
+    });
+}
+
 /// Sends `Event::TimedOut` after `timeout_ms` elapses.
 fn spawn_timeout_timer(timeout_ms: u64, tx: Sender<Event>) {
     thread::spawn(move || {
@@ -833,67 +904,60 @@ fn spawn_timeout_timer(timeout_ms: u64, tx: Sender<Event>) {
     });
 }
 
-/// The main supervising loop: consumes events until the child has exited,
-/// drains the output pumps, then writes the EXIT frame.
-/// Runs the event loop until the child exits, drains output, and writes the
-/// EXIT frame. Returns whether the BEAM had already vanished (stdin EOF or
-/// error), which the caller uses to decide whether to linger for late credit.
+/// A separate writer keeps blocked child input outside the tracking loop.
+/// The protocol reader blocks on this bounded queue, applying the same upstream
+/// backpressure as the default write path instead of terminating a slow child.
 struct TrackedInput {
-    sender: Option<Sender<Vec<u8>>>,
-    pending: Arc<std::sync::atomic::AtomicUsize>,
+    closed: Arc<AtomicBool>,
+}
+
+struct TrackedInputSender {
+    sender: Option<SyncSender<Vec<u8>>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl TrackedInput {
-    fn new(writer: Option<Box<dyn Write + Send>>) -> Self {
-        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let Some(mut writer) = writer else {
-            return Self {
-                sender: None,
-                pending,
-            };
-        };
-        let (sender, input) = mpsc::channel::<Vec<u8>>();
-        let queued = Arc::clone(&pending);
-        thread::spawn(move || {
-            while let Ok(bytes) = input.recv() {
-                let result = writer.write_all(&bytes);
-                queued.fetch_sub(bytes.len(), std::sync::atomic::Ordering::Relaxed);
-                if result.is_err() {
-                    break;
+    fn new(writer: Option<Box<dyn Write + Send>>) -> (Self, TrackedInputSender) {
+        let closed = Arc::new(AtomicBool::new(false));
+        let sender = writer.map(|mut writer| {
+            // At most one frame waits behind the in-progress write. The frame
+            // reader itself, not the supervision loop, waits for queue space.
+            let (sender, input) = mpsc::sync_channel::<Vec<u8>>(1);
+            let cancelled = Arc::clone(&closed);
+            thread::spawn(move || {
+                while let Ok(bytes) = input.recv() {
+                    if cancelled.load(Ordering::Acquire) || writer.write_all(&bytes).is_err() {
+                        break;
+                    }
                 }
-            }
+            });
+            sender
         });
-        Self {
-            sender: Some(sender),
-            pending,
-        }
+        (
+            Self {
+                closed: Arc::clone(&closed),
+            },
+            TrackedInputSender { sender, closed },
+        )
     }
 
-    fn send(&mut self, bytes: Vec<u8>) -> bool {
-        use std::sync::atomic::Ordering;
-        let Some(sender) = &self.sender else {
-            return true;
-        };
-        // Bound the selected path's additional write queue to one maximum
-        // protocol frame. A blocked child cannot stall ancestry sampling.
-        let len = bytes.len();
-        if len > frame::MAX_FRAME_LEN {
-            return false;
-        }
-        let previous = self.pending.fetch_add(len, Ordering::Relaxed);
-        if previous > frame::MAX_FRAME_LEN - len {
-            self.pending.fetch_sub(len, Ordering::Relaxed);
-            return false;
-        }
-        if sender.send(bytes).is_err() {
-            self.pending.fetch_sub(len, Ordering::Relaxed);
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+impl TrackedInputSender {
+    fn send(&mut self, bytes: Vec<u8>) {
+        if self.closed.load(Ordering::Acquire) {
             self.sender = None;
         }
-        true
-    }
-
-    fn close(&mut self) {
-        self.sender = None;
+        if self
+            .sender
+            .as_ref()
+            .is_some_and(|sender| sender.send(bytes).is_err())
+        {
+            self.sender = None;
+        }
     }
 }
 
@@ -901,7 +965,8 @@ impl TrackedInput {
 fn supervise_tracked<W: Write + Send + 'static>(
     rx: &Receiver<Event>,
     kill_grace: Duration,
-    child_stdin: &mut Option<Box<dyn Write + Send>>,
+    input: TrackedInput,
+    mut child: Child,
     out: &Arc<Mutex<W>>,
     pumps: usize,
     pump_done: &Receiver<()>,
@@ -913,10 +978,11 @@ fn supervise_tracked<W: Write + Send + 'static>(
     mut tracker: Tracker,
     events: Sender<Event>,
 ) -> bool {
-    let mut input = TrackedInput::new(child_stdin.take());
-    // Group history bounds this queue to MAX_GROUPS small identity frames.
-    // A blocked output pipe cannot stall discovery or owner-EOF cleanup.
-    let (control, frames) = mpsc::channel::<Frame>();
+    // Bound pending observations independently of the live group inventory.
+    // If the consumer falls behind, report truncated history without stopping
+    // a healthy child or blocking discovery and cleanup.
+    let (control, frames) = mpsc::sync_channel::<Frame>(tracking::MAX_GROUPS);
+    let mut history_truncated = false;
     let (delivered, delivery) = mpsc::channel();
     let output = Arc::clone(out);
     thread::spawn(move || {
@@ -944,12 +1010,14 @@ fn supervise_tracked<W: Write + Send + 'static>(
             for identity in tracker.take_new_groups() {
                 if !beam_gone {
                     match serde_json::to_vec(&identity) {
-                        Ok(payload) => {
-                            if control.send(Frame::new(TAG_TRACKED, payload)).is_err() {
+                        Ok(payload) => match control.try_send(Frame::new(TAG_TRACKED, payload)) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(_)) => history_truncated = true,
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
                                 tracker.fail();
                                 beam_gone = true;
                             }
-                        }
+                        },
                         Err(_) => tracker.fail(),
                     }
                 }
@@ -979,13 +1047,6 @@ fn supervise_tracked<W: Write + Send + 'static>(
             next_scan = Instant::now() + tracking::SAMPLE_INTERVAL;
         }
         match rx.recv_timeout(next_scan.saturating_duration_since(Instant::now())) {
-            Ok(Event::Stdin(f)) if f.tag == TAG_STDIN => {
-                if !input.send(f.payload) {
-                    tracker.fail();
-                    next_scan = Instant::now();
-                }
-            }
-            Ok(Event::Stdin(f)) if f.tag == TAG_EOF => input.close(),
             Ok(Event::Stdin(f)) if f.tag == TAG_CREDIT => {
                 if let (Some(c), Some(n)) = (credit, crate::credit::parse_grant(&f.payload)) {
                     c.grant(n);
@@ -998,7 +1059,7 @@ fn supervise_tracked<W: Write + Send + 'static>(
                 }
             }
             Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
-                discard_output = true;
+                discard_output |= outcome.is_none();
                 tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
                 next_scan = Instant::now();
             }
@@ -1011,9 +1072,15 @@ fn supervise_tracked<W: Write + Send + 'static>(
                 next_scan = Instant::now();
             }
             Ok(Event::TimedOut) => {
-                timed_out = true;
-                discard_output = true;
-                tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                if outcome.is_none() {
+                    timed_out = true;
+                    discard_output = true;
+                    tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                    next_scan = Instant::now();
+                }
+            }
+            Ok(Event::ChildWaitFailed) => {
+                tracker.fail();
                 next_scan = Instant::now();
             }
             Ok(Event::ChildExited(status)) => {
@@ -1025,8 +1092,13 @@ fn supervise_tracked<W: Write + Send + 'static>(
         }
     };
     input.close();
-    let cgroup_confirmed = cgroup.is_none_or(|cg| finish_cgroup(cg, kill_grace));
     let final_confirmed = tracker.finish_scan();
+    // The waiter used WNOWAIT, so only this path reaps the root. Keeping it
+    // through the final inventory prevents reuse of its group identifier.
+    if outcome.is_some() {
+        let _ = child.wait();
+    }
+    let cgroup_confirmed = cgroup.is_none_or(|cg| finish_cgroup(cg, kill_grace));
     if beam_gone {
         if let Some(c) = credit {
             c.cancel();
@@ -1038,7 +1110,9 @@ fn supervise_tracked<W: Write + Send + 'static>(
     }
     for identity in tracker.take_new_groups() {
         if let Ok(payload) = serde_json::to_vec(&identity) {
-            let _ = control.send(Frame::new(TAG_TRACKED, payload));
+            if control.try_send(Frame::new(TAG_TRACKED, payload)).is_err() {
+                history_truncated = true;
+            }
         }
     }
     let (output_truncated, disappeared) = if strict_output && !discard_output {
@@ -1074,10 +1148,11 @@ fn supervise_tracked<W: Write + Send + 'static>(
         status: outcome.status,
         signal: outcome.signal,
         timed_out,
-        confirmed: confirmed && cgroup_confirmed && final_confirmed,
+        confirmed: confirmed && cgroup_confirmed && final_confirmed && !history_truncated,
         contained: cgroup.is_some(),
         output_truncated,
         scope: Some(tracking::scope()),
+        tracked_groups_truncated: Some(history_truncated),
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let _ = control.send(Frame::new(TAG_EXIT, payload));
@@ -1088,6 +1163,8 @@ fn supervise_tracked<W: Write + Send + 'static>(
     !matches!(delivery.recv(), Ok(Ok(())))
 }
 
+/// Consume events until the child exits, drain output, and write EXIT. Return
+/// whether the BEAM vanished, so the caller can skip lingering for late credit.
 #[allow(clippy::too_many_arguments)]
 fn supervise<W: Write + Send + 'static>(
     rx: &Receiver<Event>,
@@ -1104,12 +1181,15 @@ fn supervise<W: Write + Send + 'static>(
     interrupt_grace: Option<Duration>,
     tracker: Option<Tracker>,
     events: Sender<Event>,
+    tracked_child: Option<Child>,
+    tracked_input: Option<TrackedInput>,
 ) -> bool {
     if let Some(tracker) = tracker {
         return supervise_tracked(
             rx,
             kill_grace,
-            child_stdin,
+            tracked_input.expect("tracking input is initialized before its reader"),
+            tracked_child.expect("tracking retains the root until cleanup finishes"),
             out,
             pumps,
             pump_done,
@@ -1167,7 +1247,7 @@ fn supervise<W: Write + Send + 'static>(
                 // Unknown/unexpected tag mid-session; ignore rather than
                 // tearing down a running child over a protocol wrinkle.
             }
-            Ok(Event::TrackingWriteFailed) => {}
+            Ok(Event::TrackingWriteFailed | Event::ChildWaitFailed) => {}
             Ok(Event::StdinClosed) => {
                 discard_output = true;
                 // The BEAM is gone. Kill the group; keep waiting for the
@@ -1285,6 +1365,7 @@ fn supervise<W: Write + Send + 'static>(
         contained: cgroup.is_some(),
         output_truncated,
         scope: None,
+        tracked_groups_truncated: None,
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();
@@ -1824,6 +1905,7 @@ mod tests {
             marker: String,
             flushes: usize,
             identities: Arc<Mutex<Vec<crate::identity::ProcessIdentity>>>,
+            cleanup_started: Arc<Mutex<Option<Instant>>>,
         }
         impl Write for FailTracked {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1845,6 +1927,7 @@ mod tests {
                         }
                     }
                 }
+                *self.cleanup_started.lock().unwrap() = Some(Instant::now());
                 Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "TRACKED delivery failed",
@@ -1867,13 +1950,19 @@ mod tests {
         )
         .unwrap();
         let identities = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_started = Arc::new(Mutex::new(None));
         let result = super::run(
             Cursor::new(input),
             FailTracked {
                 marker: marker.clone(),
                 flushes: 0,
                 identities: Arc::clone(&identities),
+                cleanup_started: Arc::clone(&cleanup_started),
             },
+        );
+        assert!(
+            cleanup_started.lock().unwrap().unwrap().elapsed() >= Duration::from_millis(140),
+            "startup cleanup skipped configured graces"
         );
         let identities = identities.lock().unwrap();
         // Always clean fixtures, including after a failed production assertion.
@@ -1916,8 +2005,34 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [libc::SIGINT, libc::SIGTERM]
             );
-            assert!(observations[1].1 - observations[0].1 >= 0.055);
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tracked_waiter_observes_exit_without_reaping_the_root_identity() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let identity = crate::identity::read(child.id()).unwrap();
+        let outcome = super::peek_child_exit(child.id(), false).unwrap().unwrap();
+        assert_eq!(outcome.status, Some(0));
+        assert_eq!(outcome.signal, None);
+        let retained = crate::identity::read_process(child.id()).unwrap();
+        assert_eq!(retained.identity, identity);
+        assert!(retained.exited);
+        assert!(child.wait().unwrap().success());
+        assert!(crate::identity::read(child.id()).is_err());
     }
 
     #[test]

@@ -400,7 +400,7 @@ defmodule Forcola.InterruptOptionsTest do
             elapsed = System.monotonic_time() - cancellation_started
             minimum = System.convert_time_unit(5_300 + @kill_grace, :millisecond, :native)
             assert elapsed >= minimum
-            assert_escalated(child)
+            assert_escalated(child, 5_300)
           end)
 
         task
@@ -457,10 +457,12 @@ defmodule Forcola.InterruptOptionsTest do
     child.dir |> Path.join("pid") |> File.read!() |> String.trim()
   end
 
-  defp assert_escalated(child) do
+  defp assert_escalated(child, grace \\ @grace) do
     pid = await_ready(child)
     assert eventually(fn -> not alive?(pid) end), "child survived the kill sequence"
-    assert ["INT " <> _int_at, "TERM " <> _term_at] = signal_lines(child)
+    assert ["INT " <> int_at, "TERM " <> term_at] = signal_lines(child)
+    # Allow handler scheduling latency while still catching a skipped grace.
+    assert String.to_integer(term_at) - String.to_integer(int_at) >= grace - 100
   end
 
   defp signal_lines(child),
