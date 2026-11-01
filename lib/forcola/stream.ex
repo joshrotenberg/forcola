@@ -680,13 +680,14 @@ defmodule Forcola.Stream do
      )}
   end
 
+  # Every EXIT frame decodes (see Tracking.report/2), so the exit clause above
+  # covers it and only the three non-report outcomes remain here.
   defp cleanup_evidence(result, state) do
     confirmation =
       case result do
         :timeout -> :timeout
         :error -> :not_started
         :shim_exited -> :transport_lost
-        _ -> :unconfirmed
       end
 
     evidence = %{
@@ -920,12 +921,9 @@ defmodule Forcola.Stream do
     end
   end
 
+  # Tracking.report/2 is total: a malformed confirmation decodes as unconfirmed.
   defp decode_terminal_exit(state, payload) do
     {:exit, Tracking.report(state.tracking, payload)}
-  rescue
-    _invalid_payload -> :malformed_exit
-  catch
-    _kind, _reason -> :malformed_exit
   end
 
   defp warn_unconfirmed_cleanup({:exit, %{confirmed: false}}) do
@@ -934,10 +932,6 @@ defmodule Forcola.Stream do
 
   defp warn_unconfirmed_cleanup(:timeout) do
     Logger.warning("forcola: stream cleanup timed out before shim confirmation")
-  end
-
-  defp warn_unconfirmed_cleanup(:malformed_exit) do
-    Logger.warning("forcola: stream cleanup received a malformed EXIT confirmation")
   end
 
   defp warn_unconfirmed_cleanup(:shim_exited) do

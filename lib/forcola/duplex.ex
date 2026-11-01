@@ -1146,6 +1146,9 @@ defmodule Forcola.Duplex do
     end
   end
 
+  # A malformed report decodes as unconfirmed with an unknown scope (see
+  # Forcola.Tracking.report/2); it cannot vouch for output completeness either.
+  # Any well-formed child status it carried is kept.
   defp exit_terminal(report, cause, tracking) do
     %Terminal{
       status: report.status,
@@ -1153,11 +1156,15 @@ defmodule Forcola.Duplex do
       cause: if(report.timed_out, do: :timeout, else: cause),
       scope: report.scope,
       contained: report.contained,
-      output: if(report.output_truncated, do: :truncated, else: :complete),
+      output: output_evidence(report),
       tracked_groups: Tracking.groups(tracking),
       tracked_groups_truncated: report.tracked_groups_truncated
     }
   end
+
+  defp output_evidence(%{valid: false}), do: :unknown
+  defp output_evidence(%{output_truncated: true}), do: :truncated
+  defp output_evidence(_report), do: :complete
 
   defp shutdown_terminal({:exit, report}, cause, tracking),
     do: exit_terminal(report, cause, tracking)

@@ -68,11 +68,14 @@ defmodule Forcola.Tracking do
   def report(%{enabled: false}, payload) do
     report = Shim.decode_exit_report(payload)
 
-    Map.put(
-      report,
-      :scope,
-      if(report.contained == true, do: :active_cgroup, else: :process_group)
-    )
+    scope =
+      cond do
+        not report.valid -> :unknown
+        report.contained == true -> :active_cgroup
+        true -> :process_group
+      end
+
+    Map.put(report, :scope, scope)
   end
 
   def report(tracking, payload) do
@@ -88,17 +91,20 @@ defmodule Forcola.Tracking do
 
     valid_flags =
       Enum.all?(
-        ["timed_out", "contained", "output_truncated", "tracked_groups_truncated"],
+        ["confirmed", "timed_out", "contained", "output_truncated", "tracked_groups_truncated"],
         fn key ->
           not Map.has_key?(report, key) or is_boolean(report[key])
         end
       )
 
+    # A tracked report is well formed only with a child status, boolean flags
+    # and a known tracking scope. Nothing else may confirm cleanup.
+    valid = status != nil and valid_flags and scope != :unknown
+
     %{
+      valid: valid,
       status: status,
-      confirmed:
-        report["confirmed"] == true and status != nil and valid_flags and
-          scope != :unknown,
+      confirmed: valid and report["confirmed"] == true,
       scope: scope,
       timed_out: report["timed_out"] == true,
       contained: contained(report["contained"]),
