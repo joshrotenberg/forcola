@@ -95,7 +95,8 @@ The optional signal/grace pair sends process-group SIGINT before the existing
 TERM/KILL sequence on timeout, explicit cancellation, and owner or BEAM death.
 It applies to Duplex close and shutdown, Stream halt, owner or BEAM death,
 Stream timeout, idle and output limits, and Daemon stop or readiness timeout.
-Cleanup waits include both graces. The Daemon child spec also includes the
+Cleanup waits include both graces and, with `cgroup` requested, the cgroup
+drain (another kill grace plus 500 ms). The Daemon child spec also includes the
 confirmation and port-close bounds so supervisor shutdown can wait for cleanup.
 A cooperative parent can use that opportunity to stop children in other groups.
 An uncooperative escaped child remains outside group cleanup on macOS.

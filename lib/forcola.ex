@@ -218,7 +218,9 @@ defmodule Forcola do
   These pre-SPAWN errors have no partial child result. Port opening is
   synchronous; its OS latency and final guard close can outlast the deadline.
   After SPAWN, timeout cancellation allows the interrupt grace, kill grace,
-  and a 5-second collection backstop; guard close has its own 5-second bound.
+  and a 5-second collection backstop; with `:cgroup` requested, another kill
+  grace plus 500 ms covers the cgroup drain. Guard close has its own 5-second
+  bound.
 
   Strict output draining keeps the run open after the root child exits until
   both pipes close or a whole-run/idle deadline cancels draining. An escaped

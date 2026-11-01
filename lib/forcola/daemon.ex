@@ -170,6 +170,8 @@ defmodule Forcola.Daemon do
   The shutdown budget includes the interrupt grace, kill grace, five seconds
   for the native confirmation, five seconds for the port guard, and one second
   of scheduling margin. With the default options this is 16,000 milliseconds.
+  With `:cgroup` set to `true` or `:required`, another kill grace plus 500
+  milliseconds covers the shim's cgroup drain before it reports EXIT.
   When the sum exceeds the supervisor's maximum timeout of `4_294_967_295`
   milliseconds, the child specification uses `:infinity`; the daemon still
   enforces its own bounded cleanup deadline. This avoids truncating an accepted
