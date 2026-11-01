@@ -29,6 +29,23 @@ defmodule ForcolaTest do
     end
   end
 
+  describe "Shim cleanup budget" do
+    test "cleanup_timeout/1 covers the shim's bounded cleanup, including a requested cgroup drain" do
+      assert Forcola.Shim.cleanup_timeout([]) == 10_000
+      assert Forcola.Shim.cleanup_timeout(kill_grace_ms: 200, interrupt_grace_ms: 300) == 5_500
+      assert Forcola.Shim.cleanup_timeout(cgroup: false) == 10_000
+      # finish_cgroup waits another kill grace plus 500 ms before EXIT.
+      assert Forcola.Shim.cleanup_timeout(cgroup: true) == 15_500
+      assert Forcola.Shim.cleanup_timeout(cgroup: :required, kill_grace_ms: 1_000) == 7_500
+    end
+
+    test "shutdown_timeout/1 follows the budget and saturates to :infinity" do
+      assert Forcola.Shim.shutdown_timeout([]) == 16_000
+      assert Forcola.Shim.shutdown_timeout(cgroup: true) == 21_500
+      assert Forcola.Shim.shutdown_timeout(kill_grace_ms: 4_294_967_295) == :infinity
+    end
+  end
+
   describe "Shim" do
     test "path/0 finds the built binary" do
       assert {:ok, path} = Forcola.Shim.path()

@@ -46,6 +46,7 @@ defmodule Forcola.Shim do
   # a backstop if the guard itself is killed or cannot finish.
   @guard_close_timeout_ms 5_000
   @cleanup_margin_ms 5_000
+  @cgroup_drain_probe_ms 500
   @supervisor_margin_ms 1_000
   @execution_options [:env_mode, :interrupt_signal, :interrupt_grace_ms]
 
@@ -189,10 +190,24 @@ defmodule Forcola.Shim do
     end
   end
 
+  # From a KILL frame or its own timeout the shim spends at most the optional
+  # INT grace, the TERM grace, a 500 ms SIGKILL probe and a 1 s output drain
+  # before EXIT. With an active cgroup, finish_cgroup also waits up to the kill
+  # grace plus 500 ms for the subtree to drain. The budget covers that drain
+  # whenever containment was requested, so a stalled cgroup is reported from
+  # the shim's unconfirmed EXIT rather than replaced by this side's backstop.
   @doc false
   def cleanup_timeout(opts) do
-    Keyword.get(opts, :kill_grace_ms, 5_000) +
-      Keyword.get(opts, :interrupt_grace_ms, 0) + @cleanup_margin_ms
+    grace = Keyword.get(opts, :kill_grace_ms, 5_000)
+
+    grace + Keyword.get(opts, :interrupt_grace_ms, 0) + cgroup_drain_ms(opts, grace) +
+      @cleanup_margin_ms
+  end
+
+  defp cgroup_drain_ms(opts, grace) do
+    if Keyword.get(opts, :cgroup, false) in [true, :required],
+      do: grace + @cgroup_drain_probe_ms,
+      else: 0
   end
 
   @doc false
