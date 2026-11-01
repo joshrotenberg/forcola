@@ -23,8 +23,8 @@ pub const TAG_EXIT: u8 = 0x13;
 pub const TAG_ERROR: u8 = 0x14;
 pub const TAG_CAPABILITIES: u8 = 0x15;
 pub const TAG_SPAWNED: u8 = 0x16;
-// 0x17 is reserved for future TRACKED frames with the same ProcessIdentity
-// payload as SPAWNED, independently selected through capability negotiation.
+/// A newly tracked process-group leader, selected independently of SPAWNED.
+pub const TAG_TRACKED: u8 = 0x17;
 
 /// Upper bound on a single frame's length (tag byte + payload).
 ///

@@ -115,6 +115,36 @@ defmodule Forcola do
       is requested. An identity does not prove that the process remains alive.
       `:spawn_observer` is not supported by `run/2` and raises `ArgumentError`
       when supplied; read identity from the result instead.
+    * `:track_descendants` - track cleanup groups for the child's whole life,
+      default `false`. Selects `track_descendants_v1` before SPAWN on Linux
+      and macOS, independently of spawn identity and structured errors. The
+      result's `:tracked_groups` contains the root group first, then each
+      observed descendant-group leader, using the identity shape documented
+      in `Forcola.Result`. Tracking alone preserves legacy collection and
+      spawn-error envelopes; negotiation counts toward `:timeout_ms`.
+      Cleanup uses the configured signal sequence for tracked groups whose
+      recorded leader identity still matches. Linux reports `:tree_contained`
+      using subreaper adoption; macOS reports `:tree_sampled`. A descendant
+      reparented before its first macOS sample is outside that guarantee.
+      Histories are bounded at 4,096 groups; missing, malformed or overflowing
+      observations mark history truncated independently of native cleanup
+      confirmation. Existing cgroup containment
+      remains a stronger backstop where available.
+    * `:track_observer` - optional `{local_pid, reference}` receiving
+      `{reference, {:tracked, identity}}` for each new group, then
+      `{reference, {:tracking_exit, evidence}}`.
+      A non-nil observer enables tracking even with `track_descendants: false`.
+      All modes support this observer. It receives no stdout/stderr and does
+      not enable `:spawn_identity`. Group identities are observations rather
+      than proof of current liveness. The terminal event is sent once on a
+      completed or failed execution path, including pre-SPAWN failure, when
+      the BEAM process survives to report it. Confirmation is `:confirmed`,
+      `:unconfirmed`, `:not_started`, `:timeout`, or `:transport_lost`.
+      Evidence contains `:scope`, `:confirmation`, `:contained` (boolean or
+      `:unknown`), and `:tracked_groups_truncated` (boolean). Incomplete history
+      leaves execution running and does not change native cleanup confirmation.
+      Missing or unknown tracking scope never confirms cleanup. Notifications
+      are unacknowledged; a dead observer does not affect execution.
     * `:output_observer` - optional `{local_pid, reference}` receiving
       `{reference, {:stdout, bytes}}` and `{reference, {:stderr, bytes}}`
       as raw output frames arrive. Notifications are sent by the collector
@@ -156,8 +186,8 @@ defmodule Forcola do
 
   New options (`:idle_timeout_ms`, `:max_output_bytes`, `:env_mode`, or the
   interrupt pair) require a versioned capability exchange before SPAWN.
-  Environment unsets require `env_unset_v1`; `:spawn_identity` and
-  `:structured_spawn_errors` select independent extensions through the same
+  Environment unsets require `env_unset_v1`; `:spawn_identity`,
+  `:track_descendants`, and `:structured_spawn_errors` select independent extensions through the same
   exchange, without enabling strict collection. Explicit `:env_mode` and
   interrupt options require `bounded_run_v1` in all four execution modes.
   The two requirement-only capabilities are checked in the response and leave

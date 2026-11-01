@@ -92,6 +92,14 @@ defmodule ForcolaTest do
                Forcola.Shim.decode_exit_report(~s({"status":0}))
 
       refute Forcola.Shim.decode_contained("{bad json")
+
+      # The per-mode report derives its scope from the same validity.
+      untracked = %Forcola.Tracking{}
+      assert %{valid: false, scope: :unknown} = Forcola.Tracking.report(untracked, "{bad json")
+      assert %{valid: true, scope: :process_group} = Forcola.Tracking.report(untracked, ~s({"status":0}))
+
+      assert %{valid: true, scope: :active_cgroup} =
+               Forcola.Tracking.report(untracked, ~s({"status":0,"contained":true}))
     end
   end
 end
