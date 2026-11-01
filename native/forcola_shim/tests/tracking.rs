@@ -281,7 +281,9 @@ def fork_group(label, session):
         stay(label)
     return pid
 install('root')
-if mode == 'groups':
+if mode in ('groups', 'blocked_groups'):
+    if mode == 'blocked_groups' and os.isatty(0):
+        tty.setraw(0)
     fork_group('session', True)
     fork_group('group', False)
 elif mode == 'late':
@@ -644,6 +646,97 @@ fn scanning_and_cancellation_continue_when_the_child_does_not_read_stdin() {
         assert_tracking_exit(&shim.finish().unwrap());
         assert_gone(root);
         assert_gone(late);
+    }
+}
+
+#[test]
+fn closed_protocol_output_cleans_all_groups_when_stdin_reader_is_blocked_without_timer() {
+    fn read_protocol(reader: &mut impl Read) -> (u8, Vec<u8>) {
+        let mut size = [0; 4];
+        reader.read_exact(&mut size).unwrap();
+        let mut frame = vec![0; u32::from_be_bytes(size) as usize];
+        reader.read_exact(&mut frame).unwrap();
+        (frame[0], frame[1..].to_vec())
+    }
+
+    for pty in [false, true] {
+        let fixture = Fixture::new();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_forcola_shim"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let (_sender, frames) = mpsc::channel();
+        let mut shim = Shim {
+            stdin: child.stdin.take(),
+            child,
+            frames,
+            reader: None,
+            tracked: Vec::new(),
+        };
+        shim.send(HELLO, br#"{"features":["track_descendants_v1"]}"#);
+        assert_eq!(read_protocol(&mut output).0, CAPABILITIES);
+        let mut request = fixture.request("blocked_groups", pty);
+        request.as_object_mut().unwrap().remove("timeout_ms");
+        // Leave output pumps parked on credit. No output write failure or run
+        // timer can rescue a reader blocked on forwarding child input.
+        request["window_bytes"] = json!(4096);
+        request["strict_output"] = json!(true);
+        shim.spawn(request);
+        let root = fixture.ready("root");
+        let session = fixture.ready("session");
+        let group = fixture.ready("group");
+        while shim.tracked.len() < 3 {
+            let (tag, payload) = read_protocol(&mut output);
+            assert_eq!(tag, TRACKED);
+            shim.tracked.push(serde_json::from_slice(&payload).unwrap());
+        }
+        assert!(shim.tracked.iter().any(|identity| identity["pid"] == root));
+        assert!(shim
+            .tracked
+            .iter()
+            .any(|identity| identity["pid"] == session));
+        assert!(shim.tracked.iter().any(|identity| identity["pid"] == group));
+        let mut input = shim.stdin.take().unwrap();
+        let (written, completion) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let payload = vec![b'x'; 1024 * 1024];
+            let result = (|| -> std::io::Result<()> {
+                for _ in 0..20 {
+                    input.write_all(&((payload.len() + 1) as u32).to_be_bytes())?;
+                    input.write_all(&[STDIN])?;
+                    input.write_all(&payload)?;
+                }
+                Ok(())
+            })();
+            let _ = written.send(result);
+        });
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(shim.child.try_wait().unwrap().is_none());
+        // Close only the peer read end. The blocked producer still owns the
+        // protocol input fd, so neither a KILL frame nor StdinClosed can arrive.
+        drop(output);
+        for pid in [root, session, group] {
+            assert_gone(pid);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while shim.child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "shim lingered after peer closure"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        completion
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .ok();
+        writer.join().unwrap();
     }
 }
 

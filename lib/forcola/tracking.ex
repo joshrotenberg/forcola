@@ -9,7 +9,6 @@ defmodule Forcola.Tracking do
             observer: nil,
             groups: [],
             seen: MapSet.new(),
-            valid: true,
             truncated: false,
             finished: false
 
@@ -42,7 +41,7 @@ defmodule Forcola.Tracking do
   def record(tracking, payload) do
     case Shim.decode_identity(payload) do
       {:ok, %{pid: pid, pgid: pid} = identity} -> record_identity(tracking, identity)
-      _ -> {%{tracking | valid: false}, nil}
+      _ -> {%{tracking | truncated: true}, nil}
     end
   end
 
@@ -52,7 +51,7 @@ defmodule Forcola.Tracking do
         {tracking, nil}
 
       MapSet.size(tracking.seen) >= @limit ->
-        {%{tracking | valid: false, truncated: true}, nil}
+        {%{tracking | truncated: true}, nil}
 
       true ->
         {%{
@@ -99,12 +98,12 @@ defmodule Forcola.Tracking do
       status: status,
       confirmed:
         report["confirmed"] == true and status != nil and valid_flags and
-          scope != :unknown and tracking.valid and tracking.groups != [] and
-          report["tracked_groups_truncated"] != true,
+          scope != :unknown,
       scope: scope,
       timed_out: report["timed_out"] == true,
       contained: contained(report["contained"]),
-      tracked_groups_truncated: tracking.truncated or report["tracked_groups_truncated"] == true,
+      tracked_groups_truncated:
+        tracking.truncated or tracking.groups == [] or report["tracked_groups_truncated"] == true,
       output_truncated: report["output_truncated"] == true
     }
   end
@@ -152,7 +151,7 @@ defmodule Forcola.Tracking do
        }}
     )
 
-    %{tracking | finished: true}
+    %{tracking | finished: true, truncated: tracking.truncated or truncated}
   end
 
   def startup_failed(opts), do: opts |> new() |> finish(:unknown, :not_started)

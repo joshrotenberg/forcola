@@ -109,9 +109,9 @@ defmodule Forcola.Stream do
         the shim reported an incomplete drain
       * `:tracked_groups` - observed cleanup-group identities, root first,
         including observations consumed during cancellation; defaults to `[]`
-      * `:tracked_groups_truncated` - whether the history bound or native
-        notification queue dropped observations. Execution continues, but
-        incomplete history cannot confirm cleanup.
+      * `:tracked_groups_truncated` - whether observations are missing,
+        malformed, or dropped by a history/notification bound. Execution and
+        native cleanup confirmation are independent of this history fact.
       * `:contained` - the native cgroup-placement flag, or `:unknown` if
         unavailable, independently of the tree cleanup scope
       * `:scope` / `:confirmation` - the reported cleanup mechanism and its
@@ -247,9 +247,10 @@ defmodule Forcola.Stream do
   through subreaper adoption; macOS reports `:tree_sampled`. A descendant
   reparented before its first macOS sample is outside the sampled guarantee.
   Histories contain the root group first and at most 4,096 group identities.
-  Missing or malformed history, overflow, and unknown scope prevent positive
-  tracking confirmation. Tracking composes with the other capabilities and
-  counts negotiation toward the whole-run timeout.
+  Missing, malformed or overflowing observations mark history truncated without
+  changing native cleanup confirmation. Unknown scope or malformed EXIT cannot
+  confirm cleanup. Tracking composes with the other capabilities and counts
+  negotiation toward the whole-run timeout.
 
   Optional `:track_observer` accepts `{local_pid, reference}` and enables
   tracking even with `track_descendants: false`. It receives

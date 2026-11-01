@@ -156,7 +156,8 @@ running.
 ## The design
 
 A port program, not a NIF: the shim is a separate OS process, so a bug in it
-cannot crash the BEAM, and BEAM death reaches it as stdin EOF.
+cannot crash the BEAM. BEAM death closes the protocol pipes; tracking also
+checks for peer hang-up independently of stdin reads.
 
 ```text
 BEAM <--stdin/stdout pipes--> forcola_shim <--forks--> child (own process group)
@@ -173,8 +174,11 @@ BEAM <--stdin/stdout pipes--> forcola_shim <--forks--> child (own process group)
   `{:error, {:timeout, partial_result}}` with output captured so far, and
   the group is confirmed dead before the call returns (or the result is
   explicitly marked `{:signal, :unconfirmed}`).
-- If the BEAM dies, even by `kill -9`, the shim sees stdin EOF and kills the
-  group before exiting.
+- If the BEAM dies, even by `kill -9`, protocol EOF triggers cleanup. Tracking
+  also detects pipe hang-up while child stdin is blocked. The untracked path
+  writes child stdin synchronously, so a child refusing input can delay EOF,
+  KILL and timer handling until that write completes. See the
+  [process groups guide](https://hexdocs.pm/forcola/process_groups.html#beam-death-as-stdin-eof).
 - Shim binaries ship precompiled per target via GitHub Releases with SHA256
   verification. Consumers need no Rust, C, or C++ toolchain.
 
@@ -229,7 +233,8 @@ and `{reference, {:tracking_exit, evidence}}`, where evidence includes `scope`,
 process survives to report completion. Native cleanup continues
 on brutal owner or BEAM death, but no final observer event is guaranteed then.
 Run results, Duplex terminals and Stream errors retain `tracked_groups` and
-`tracked_groups_truncated`. Their cleanup evidence also exposes `contained`
+`tracked_groups_truncated`. History truncation is separate from native cleanup
+confirmation. Their cleanup evidence also exposes `contained`
 (`true`, `false` or `:unknown`) independently of the tree scope. Duplex and Daemon
 also expose `tracked/1` for polling. Tracking negotiates the
 `track_descendants_v1` capability before SPAWN and leaves defaults unchanged.

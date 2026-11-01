@@ -55,15 +55,31 @@ respectively.
 ## BEAM death as stdin EOF
 
 The shim is a port program, a separate OS process, not a NIF. The BEAM holds
-the write end of the shim's stdin pipe. When the BEAM dies, that pipe closes,
-and the shim reads EOF on stdin. The shim treats stdin EOF as the signal to
-kill the group and exit.
+the write end of the shim's stdin pipe and the read end of its stdout pipe.
+When the BEAM dies or closes the port, both protocol pipes close. Observed stdin
+EOF starts cleanup.
 
-This path does not depend on the BEAM running any cleanup code, so it covers
-`kill -9` of the VM, where no `terminate/2` callback or `after` block would
-run. It also covers a `Forcola.Stream`, `Forcola.Daemon`, or `Forcola.Duplex`
-process being killed brutally: the port closes, the shim sees EOF, and the
-group dies.
+With tracking enabled, each native scan also checks the protocol output fd for
+peer hang-up without reading stdin: Linux uses `poll` and macOS uses a kqueue
+write filter with `EV_EOF`. This still starts cleanup when the stdin reader is
+blocked behind a child that refuses input. Strict output drain and post-EXIT
+linger perform the same check, so they do not depend on that reader delivering
+an EOF event. Final guarded-port closure discards queued protocol input instead
+of flushing it before closing the OS pipes. The shim remains responsible for
+OS process kills. This works after `kill -9` of the VM or a brutally killed port
+owner, without a BEAM callback or `after` block.
+
+A Duplex server suspended while sending input cannot yet handle a queued
+`close/1`, `shutdown/1` or owner-down message. Those operations wait until the
+send resumes. Independent hang-up detection covers actual port closure and
+BEAM death; it does not bypass that server's pending input operation.
+
+The untracked path still writes child stdin synchronously. If that write blocks,
+its supervision loop cannot handle KILL, its run timer, or EOF until the write
+completes. Closing the port alone does not unblock that child-input write.
+Use tracking when cleanup must remain responsive to port closure while sending
+to a child that may stop reading. Post-EXIT linger checks hang-up in both paths,
+but the legacy supervision loop has this blocked-input limitation.
 
 ## Confirmation before the call returns
 
@@ -94,7 +110,9 @@ deadline (`timeout_ms + interrupt_grace_ms + kill_grace_ms` plus a margin) in ca
 reports back at all, for example if the shim is wedged or the BEAM-to-shim pipe
 is stuck. If that deadline fires first, the result's status is
 `{:signal, :unconfirmed}`: death was requested but not confirmed. Closing the
-port is the remaining kill lever (the shim treats stdin EOF as BEAM death).
+port is the remaining kill lever with tracking: peer hang-up starts cleanup
+independently of blocked stdin. The untracked blocked-input exception is
+described above.
 
 `{:signal, :unconfirmed}` also appears when the shim exits without sending an
 EXIT or ERROR frame (for example it crashed, or was itself SIGKILLed). A
@@ -199,9 +217,10 @@ Every execution mode can opt in to `interrupt_signal: :int` together with a posi
 `interrupt_grace_ms` (at most `4_294_967_295`). The native supervisor sends INT
 to its process group, waits that grace, and then runs the existing TERM/KILL
 sequence if the group is still alive. Timeout, explicit KILL, normal leader
-exit cleanup, and stdin EOF all use this single sequence. Defaults retain the
-existing behavior. Closing an owner's port or SIGKILLing a BEAM still reaches
-the native EOF path, with no second BEAM-side process killer. The paired options
+exit cleanup, and observed protocol EOF all use this single sequence. Defaults
+retain the existing behavior, including the untracked blocked-input exception
+above. Tracking detects port hang-up independently of its stdin reader, with no
+second BEAM-side process killer. The paired options
 require the same `bounded_run_v1` capability in Run, Duplex, Stream and Daemon.
 Elixir cleanup waits include both graces, and Daemon's generated child spec
 allows time for cleanup confirmation and guard close. An overriding supervisor
@@ -221,7 +240,8 @@ The root is observed with `waitid(..., WNOWAIT)` and reaped after cleanup, keepi
 its original group identity valid for signals to unsampled same-group members.
 On macOS, `proc_listpids` inventories that pinned group after the root exits.
 Dead groups are pruned from the native live set. Retained Elixir history can be
-truncated without stopping the command; truncation makes cleanup unconfirmed.
+truncated without stopping the command or changing native cleanup confirmation.
+History completeness and live-set cleanup are independent facts.
 Persistent inventory failures or live capacity exhaustion still stop a tracked
 command, as detailed in the tracking guide.
 Before each signal, the current leader must match its recorded start time and

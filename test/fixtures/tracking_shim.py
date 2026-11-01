@@ -53,7 +53,7 @@ if "track_descendants_v1" in selected and MODE != "missing_root":
         frame(0x17, b"{broken")
     if MODE == "not_leader":
         frame(0x17, {**CHILD, "pgid": 789})
-    if MODE in ("overflow", "overflow_wait"):
+    if MODE.startswith("overflow"):
         for pid in range(1000, 5097):
             frame(0x17, {**CHILD, "pid": pid, "pgid": pid})
 if MODE == "overflow_wait":
@@ -80,8 +80,15 @@ if MODE.startswith("contained_"):
         del report["contained"]
     elif MODE == "contained_invalid":
         report["contained"] = "invalid"
-if MODE == "native_overflow":
+if MODE.startswith("native_overflow"):
     report["tracked_groups_truncated"] = True
+if MODE in ("overflow_true", "overflow_false", "native_overflow_true", "native_overflow_false"):
+    report["status"] = 7
+    report["confirmed"] = MODE.endswith("_true")
+if MODE == "invalid_flags":
+    report["timed_out"] = "false"
+if MODE == "invalid_status":
+    report["status"] = "zero"
 if "track_descendants_v1" in selected:
     if MODE == "unknown_scope":
         report["scope"] = "invented_scope"
@@ -89,6 +96,6 @@ if "track_descendants_v1" in selected:
         report["scope"] = "process_group"
     elif MODE != "missing_scope":
         report["scope"] = "tree_sampled"
-frame(0x13, report)
+frame(0x13, b"{broken" if MODE == "invalid_exit" else report)
 while read_frame() is not None:
     pass

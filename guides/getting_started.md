@@ -758,8 +758,10 @@ supervisor. Tracking without an observer still performs cleanup.
 `Forcola.Result.tracked_groups`, `Forcola.Duplex.Terminal.tracked_groups` and
 `Forcola.Stream.Error.tracked_groups` retain the first 4,096 distinct group
 identities. `tracked_groups_truncated: true` records later history overflow or
-a native observation queue overflow. Either prevents positive cleanup confirmation
-but does not stop a healthy command. Native tracking continues for the live set.
+a native observation queue overflow. Discarded malformed observations or missing
+root history also mark the retained history incomplete. History truncation neither
+stops a healthy command nor changes cleanup confirmation: that comes from the
+validated native EXIT report for the live set.
 The observer receives at most the retained history; persist those observations
 if they are needed after the session is released.
 Duplex also sends `{:forcola_tracked, session, identity}` to its owner.
@@ -806,16 +808,32 @@ not remove the need to reap adopted children. The native tracker retains at most
 4,096 current groups and 65,536 process records, pruning dead groups and processes
 so repeated short-lived groups do not consume a lifetime quota. A bounded stdin
 channel applies backpressure to the sender while the supervision loop continues
-sampling. A KILL frame behind blocked input waits for that input, as on the
-default path; the native run timer remains independent.
+sampling. A KILL frame behind blocked input waits for that input. Tracking checks
+protocol-output hang-up independently on every scan, so closing the port or
+losing the BEAM still starts cleanup even when the stdin reader is blocked. The
+native run timer also remains independent. Final guarded-port closure discards
+queued protocol input so Erlang does not keep the OS pipes open to flush it;
+the shim still performs the process kills. Strict output drain and post-EXIT
+linger check hang-up without waiting for the reader's EOF event.
+
+Backpressure can also suspend a Duplex server that is sending input. Its
+`close/1`, `shutdown/1` and owner-down handling wait behind that send until the
+server resumes. Hang-up cleanup starts when the port actually closes or the
+BEAM dies, not while a shutdown request is still queued in that server.
+
+Untracked execution writes child stdin synchronously. A child refusing input can
+block its supervision loop, delaying KILL, timer and EOF handling until the write
+completes. The independent hang-up check covers post-EXIT linger in both paths;
+it does not remove that legacy supervision limitation.
 
 A single transient metadata or child-inventory read error is retried at the next
 scan. Three consecutive incomplete scans start bounded cleanup. Invalid metadata,
 unsupported discovery, live inventory capacity exhaustion, reaping failures and
 signal failures also prevent positive confirmation and trigger cleanup where it
 has not already begun. Transport loss still triggers cleanup. History truncation
-alone does not stop the command. Missing/malformed TRACKED or EXIT evidence cannot
-confirm cleanup on the Elixir side. Observer terminal confirmation is
+alone does not stop the command or prevent cleanup confirmation. A valid native
+EXIT confirms the live set independently of the retained observation history;
+missing/malformed EXIT evidence or an unknown scope cannot confirm cleanup. Observer terminal confirmation is
 `:confirmed` or `:unconfirmed`, with `:not_started` for startup failure,
 `:timeout` for a missing report at the backstop, and `:transport_lost` for a
 lost shim. Missing scope is `:unknown`.
@@ -876,7 +894,9 @@ before TERM/KILL on every native termination path, including owner/VM death.
 These two options must be supplied together; the grace is a positive integer
 at most `4_294_967_295`. All modes use the existing INT, TERM, KILL sequence.
 Duplex close/shutdown, Stream halt or consumer failure, owner death, and BEAM
-death through shim stdin EOF all use it. Stream whole-run and idle timeouts,
+death through observed protocol EOF all use it. Tracking additionally detects
+hang-up independently when stdin is blocked; untracked execution has the
+blocked-input exception described in the tracking section. Stream whole-run and idle timeouts,
 Stream/Duplex output limits, and Daemon readiness timeout also use it. Duplex
 `recv/2` timeout only stops waiting, and `send_eof/1` only closes child stdin.
 

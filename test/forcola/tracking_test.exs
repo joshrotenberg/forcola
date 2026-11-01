@@ -1,7 +1,7 @@
 defmodule Forcola.TrackingTest do
   use ExUnit.Case, async: false
 
-  alias Forcola.{Daemon, Duplex, Result}
+  alias Forcola.{Daemon, Duplex, Result, Shim}
 
   @moduletag :tmp_dir
   @moduletag :capture_log
@@ -281,6 +281,81 @@ defmodule Forcola.TrackingTest do
     end
   end
 
+  test "closing the guarded port cleans tracked groups when stdin is blocked without a timer", %{
+    tmp_dir: dir
+  } do
+    for pty <- [false, true] do
+      child = tree(dir, "setsid")
+      fixture = Path.join(child.dir, "blocked_input.py")
+
+      File.write!(
+        fixture,
+        @tree
+        |> File.read!()
+        |> String.replace(
+          "kind, directory = sys.argv[1:]",
+          "kind, directory = sys.argv[1:]\nif os.isatty(0):\n    import tty\n    tty.setraw(0)"
+        )
+      )
+
+      child = %{child | argv: [System.find_executable("python3"), fixture, "setsid", child.dir]}
+      {:ok, port} = Shim.open()
+      {:os_pid, shim_pid} = Port.info(port, :os_pid)
+      assert :ok = Shim.negotiate(port, 5_000, ["track_descendants_v1"])
+
+      # No timeout is sent. The child and its escaped groups never read stdin.
+      options = [kill_grace_ms: 100, pty: pty, window_bytes: 4_096, strict_output: true]
+      assert Shim.send_frame(port, Shim.tag_spawn(), Shim.encode_spawn(child.argv, options))
+
+      root = await_pid(child, "root")
+      descendant = await_pid(child, "descendant")
+      assert_port_tracked(port, root)
+      assert_port_tracked(port, descendant)
+      File.write!(Path.join(child.dir, "spawn_second"), "go")
+      second = await_pid(child, "second")
+      assert_port_tracked(port, second)
+
+      sender =
+        Task.async(fn ->
+          payload = :binary.copy("x", 1_048_576)
+
+          try do
+            Enum.reduce_while(1..8, :sent, fn _, _ ->
+              if Shim.send_frame(port, Shim.tag_stdin(), payload),
+                do: {:cont, :sent},
+                else: {:halt, :closed}
+            end)
+          rescue
+            # A suspended Port.command can raise while port shutdown is still
+            # clearing Port.info. The pre-close Task.yield rejects early errors.
+            ArgumentError -> :closed
+          end
+        end)
+
+      try do
+        assert eventually(fn ->
+                 case Port.info(port, :queue_size) do
+                   {:queue_size, bytes} -> bytes > 0
+                   _ -> false
+                 end
+               end),
+               "protocol input never queued behind the blocked child"
+
+        assert Task.yield(sender, 100) == nil, "input did not reach backpressure"
+        Enum.each([root, descendant, second], &assert(alive?(&1)))
+        assert :ok = Shim.close(port)
+        # Port.command reports queue acceptance, not delivery. The producer
+        # can finish either just before closure or with a closed-port result.
+        assert Task.await(sender, 5_000) in [:sent, :closed]
+        Enum.each([root, descendant, second, shim_pid], &assert_gone/1)
+        assert eventually(fn -> Port.info(port) == nil end)
+      after
+        if Port.info(port), do: Shim.close(port)
+        if Process.alive?(sender.pid), do: Task.shutdown(sender, :brutal_kill)
+      end
+    end
+  end
+
   test "tracking validation precedes opening the shim and defaults remain opt-in" do
     for mode <- @modes,
         invalid <- [
@@ -456,15 +531,15 @@ defmodule Forcola.TrackingTest do
     end
   end
 
-  test "malformed or missing tracking evidence never confirms tree cleanup", %{tmp_dir: dir} do
+  test "malformed terminal evidence never confirms tree cleanup", %{tmp_dir: dir} do
     for mode <- @modes,
         peer <- [
-          "malformed",
-          "not_leader",
-          "missing_root",
           "unknown_scope",
           "group_scope",
-          "missing_scope"
+          "missing_scope",
+          "invalid_exit",
+          "invalid_flags",
+          "invalid_status"
         ] do
       ref = make_ref()
       handle = start(mode, ["unused"], opts(ref, shim_path: fake_shim(dir, peer)))
@@ -474,6 +549,24 @@ defmodule Forcola.TrackingTest do
         assert_receive {^ref, {:tracking_exit, evidence}}, 5_000
         refute evidence.confirmation == :confirmed
         refute_confirmed(outcome)
+      after
+        stop(handle)
+      end
+    end
+  end
+
+  test "missing or malformed history leaves native cleanup confirmation intact", %{tmp_dir: dir} do
+    for mode <- @modes, peer <- ["malformed", "not_leader", "missing_root"] do
+      ref = make_ref()
+      handle = start(mode, ["unused"], opts(ref, shim_path: fake_shim(dir, peer)))
+
+      try do
+        outcome = finish(handle, :exit)
+        assert_receive {^ref, {:tracking_exit, evidence}}, 5_000
+        assert evidence.confirmation == :confirmed
+        assert evidence.tracked_groups_truncated
+        assert_truncated_history(outcome)
+        assert_cleanup_confirmation(outcome, :confirmed)
       after
         stop(handle)
       end
@@ -495,8 +588,9 @@ defmodule Forcola.TrackingTest do
         File.write!(Path.join(dir, "release"), "go")
         outcome = finish(handle, :exit)
         assert_receive {^ref, {:tracking_exit, evidence}}, 5_000
-        assert evidence.confirmation == :unconfirmed
+        assert evidence.confirmation == :confirmed
         assert evidence.tracked_groups_truncated
+        assert_cleanup_confirmation(outcome, :confirmed)
         assert_history_bound(outcome)
         assert_truncated_history(outcome)
         assert File.read!(Path.join(dir, "continued")) == "after-release"
@@ -507,17 +601,20 @@ defmodule Forcola.TrackingTest do
     end
   end
 
-  test "native notification truncation reaches each evidence surface", %{tmp_dir: dir} do
-    for mode <- @modes do
+  test "local and native history truncation preserve the native cleanup report", %{tmp_dir: dir} do
+    for mode <- @modes, peer <- ["overflow", "native_overflow"], confirmed <- [true, false] do
       ref = make_ref()
-      handle = start(mode, ["unused"], opts(ref, shim_path: fake_shim(dir, "native_overflow")))
+      confirmation = if confirmed, do: :confirmed, else: :unconfirmed
+      shim = fake_shim(dir, "#{peer}_#{confirmed}")
+      handle = start(mode, ["unused"], opts(ref, shim_path: shim))
 
       try do
         outcome = finish(handle, :exit)
         assert_receive {^ref, {:tracking_exit, evidence}}, 5_000
         assert evidence.tracked_groups_truncated
-        assert evidence.confirmation == :unconfirmed
+        assert evidence.confirmation == confirmation
         assert_truncated_history(outcome)
+        assert_cleanup_confirmation(outcome, confirmation)
       after
         stop(handle)
       end
@@ -587,7 +684,21 @@ defmodule Forcola.TrackingTest do
   defp assert_truncated_history({:stream_error, error}),
     do: assert(error.tracked_groups_truncated)
 
+  # Successful streams and Daemons expose terminal history through the observer.
+  defp assert_truncated_history({:lines, _}), do: :ok
   defp assert_truncated_history(:closed), do: :ok
+
+  defp assert_cleanup_confirmation({:ok, %Result{evidence: evidence}}, expected),
+    do: assert(evidence.cleanup == expected)
+
+  defp assert_cleanup_confirmation({:ok, %Duplex.Terminal{confirmation: actual}}, expected),
+    do: assert(actual == expected)
+
+  defp assert_cleanup_confirmation({:stream_error, %{confirmation: actual}}, expected),
+    do: assert(actual == expected)
+
+  defp assert_cleanup_confirmation({:lines, _}, :confirmed), do: :ok
+  defp assert_cleanup_confirmation(:closed, _expected), do: :ok
 
   defp assert_contained({:ok, %Result{evidence: evidence}}, expected),
     do: assert(evidence.contained == expected)
@@ -742,6 +853,11 @@ defmodule Forcola.TrackingTest do
 
   defp stop({:daemon, daemon}) do
     if Process.alive?(daemon), do: GenServer.stop(daemon, :normal, :infinity)
+  end
+
+  defp assert_port_tracked(port, pid) do
+    assert_receive {^port, {:data, <<0x17, payload::binary>>}}, 5_000
+    assert {:ok, %{pid: ^pid, pgid: ^pid}} = Shim.decode_identity(payload)
   end
 
   defp assert_first_tracked(ref, pid) do

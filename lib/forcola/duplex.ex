@@ -132,13 +132,13 @@ defmodule Forcola.Duplex do
 
     `:tracked_groups` retains the observed cleanup-group identities in order,
     root first, including frames consumed during shutdown. It defaults to `[]`.
-    `:tracked_groups_truncated` becomes true when the history bound or native
-    notification queue drops observations. Execution continues, but the
-    incomplete history cannot confirm cleanup.
+    `:tracked_groups_truncated` becomes true when observations are missing,
+    malformed, or dropped by the history bound or native notification queue.
+    Execution continues; native cleanup confirmation is independent of history.
     See `Forcola.Result` for the identity shape and Linux/macOS scope meanings.
     A macOS descendant reparented before its first sample is outside the
-    sampled guarantee. Missing or malformed tracking history, overflow, and
-    unknown tree scope cannot produce positive confirmation.
+    sampled guarantee. Unknown tree scope or malformed native EXIT cannot
+    produce positive confirmation.
 
     `:spawn_error` retains the native failure reason when `:cause` is
     `:spawn_error`: a `Forcola.SpawnError` when structured errors were

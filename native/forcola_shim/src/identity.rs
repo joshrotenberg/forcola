@@ -76,27 +76,31 @@ fn parse_stat(stat: &[u8]) -> io::Result<(u32, u32, u64, bool)> {
     let fields = std::str::from_utf8(&stat[end + 1..]).map_err(|_| invalid())?;
     let mut fields = fields.split_whitespace();
     // The suffix starts at field 3 (state), followed by ppid and pgrp.
-    let exited = matches!(fields.next().ok_or_else(invalid)?, "Z" | "X" | "x");
+    let state = fields.next().ok_or_else(invalid)?;
     let ppid = fields
         .next()
         .ok_or_else(invalid)?
         .parse::<u32>()
         .map_err(|_| invalid())?;
-    let pgid = fields
-        .next()
-        .ok_or_else(invalid)?
-        .parse::<u32>()
-        .map_err(|_| invalid())?;
+    let pgid_field = fields.next().ok_or_else(invalid)?;
+    // do_task_stat leaves pgrp at -1 if release_task cleared sighand before
+    // its locked read. The state was captured earlier and can still say S/Z.
+    // A zero pgrp also cannot identify a signalable process group.
+    let pgid = if pgid_field == "-1" {
+        0
+    } else {
+        pgid_field.parse::<u32>().map_err(|_| invalid())?
+    };
     // starttime is field 22, seventeen fields after pgrp.
     let ticks = fields
         .nth(16)
         .ok_or_else(invalid)?
         .parse::<u64>()
         .map_err(|_| invalid())?;
-    if pgid == 0 {
-        return Err(invalid());
+    if pgid == 0 || matches!(state, "X" | "x") {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
     }
-    Ok((ppid, pgid, ticks, exited))
+    Ok((ppid, pgid, ticks, state == "Z"))
 }
 
 #[cfg(target_os = "macos")]
@@ -236,5 +240,55 @@ mod tests {
             assert!(super::parse_stat(bad.as_bytes()).is_err());
         }
         assert!(super::parse_stat(b"123 (name) S 1 123 \xff").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_stat(state: &str, pgid: &str, ticks: &str) -> String {
+        format!("123 (name) {state} 1 {pgid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {ticks} 0")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn released_process_stats_are_gone_instead_of_corrupt() {
+        for state in ["S", "Z", "X", "x"] {
+            for pgid in ["0", "-1"] {
+                let stat = process_stat(state, pgid, "98765");
+                let error = super::parse_stat(stat.as_bytes()).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::ESRCH), "{stat}");
+            }
+        }
+        for state in ["X", "x"] {
+            let stat = process_stat(state, "123", "98765");
+            assert_eq!(
+                super::parse_stat(stat.as_bytes())
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ESRCH),
+                "{stat}"
+            );
+        }
+        // An unreaped zombie still pins the leader identity for WNOWAIT cleanup.
+        assert_eq!(
+            super::parse_stat(process_stat("Z", "123", "98765").as_bytes()).unwrap(),
+            (1, 123, 98765, true)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_process_stats_remain_invalid_data() {
+        for stat in [
+            process_stat("S", "invalid", "98765"),
+            process_stat("S", "-2", "98765"),
+            process_stat("S", "0", "invalid"),
+            process_stat("X", "123", "invalid"),
+            "123 (name) X 1 123".to_owned(),
+        ] {
+            assert_eq!(
+                super::parse_stat(stat.as_bytes()).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData,
+                "{stat}"
+            );
+        }
     }
 }

@@ -19,7 +19,9 @@ use rustix::process::{self, Pid, Signal};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,21 +57,112 @@ struct ChildOutcome {
 /// delay the EXIT report forever.
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
+/// Observe closure of the BEAM's read end without consuming protocol input.
+/// The protocol writer owns `fd` for longer than this monitor. Monitoring the
+/// output pipe remains possible when the reader is blocked on child stdin.
+struct PeerMonitor {
+    #[cfg(target_os = "macos")]
+    queue: OwnedFd,
+    #[cfg(not(target_os = "macos"))]
+    fd: RawFd,
+}
+
+impl PeerMonitor {
+    fn new(fd: RawFd) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let raw = unsafe { libc::kqueue() };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: kqueue returned a new descriptor owned by this monitor.
+            let queue = unsafe { OwnedFd::from_raw_fd(raw) };
+            if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let event = libc::kevent {
+                ident: fd as usize,
+                filter: libc::EVFILT_WRITE,
+                flags: libc::EV_ADD | libc::EV_ENABLE,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            if unsafe { libc::kevent(raw, &event, 1, std::ptr::null_mut(), 0, std::ptr::null()) }
+                < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { queue })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(Self { fd })
+        }
+    }
+
+    fn disconnected(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let result = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    &timeout,
+                )
+            };
+            if result < 0 {
+                return io::Error::last_os_error().kind() != io::ErrorKind::Interrupted;
+            }
+            result > 0
+                && unsafe { event.assume_init() }.flags & (libc::EV_EOF | libc::EV_ERROR) != 0
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut event = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut event, 1, 0) };
+            if result < 0 {
+                return io::Error::last_os_error().kind() != io::ErrorKind::Interrupted;
+            }
+            result > 0 && event.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+        }
+    }
+}
+
 /// Runs the shim: read one SPAWN frame, supervise the child, and keep
 /// handling protocol frames until the child has exited.
 pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
     stdin: R,
     stdout: W,
+    protocol_fd: Option<RawFd>,
 ) -> io::Result<()> {
-    run_with_capabilities(stdin, stdout, supported_features)
+    run_with_capabilities(stdin, stdout, supported_features, protocol_fd)
 }
 
-fn run_with_capabilities<R, W, F>(mut stdin: R, stdout: W, capabilities: F) -> io::Result<()>
+fn run_with_capabilities<R, W, F>(
+    mut stdin: R,
+    stdout: W,
+    capabilities: F,
+    protocol_fd: Option<RawFd>,
+) -> io::Result<()>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
     F: FnOnce() -> Vec<&'static str>,
 {
+    let peer = protocol_fd.map(PeerMonitor::new).transpose()?;
     let out = Arc::new(Mutex::new(stdout));
 
     // SPAWN is mandatory, with an optional capability request before it.
@@ -305,6 +398,7 @@ where
         tx,
         tracked_child,
         tracked_input,
+        peer.as_ref(),
     );
 
     // Backpressure linger: the child is reaped and the EXIT frame is written,
@@ -316,7 +410,7 @@ where
     // after it has consumed EXIT. Skipped when the BEAM is already gone, and
     // never entered on the eager path, so the default behavior is unchanged.
     if (credit.is_some() || stderr_credit.is_some()) && !beam_gone {
-        drain_inbound_until_closed(&rx);
+        drain_inbound_until_closed(&rx, peer.as_ref());
     }
 
     Ok(())
@@ -448,15 +542,19 @@ fn abort_spawn(mut child: Child, cgroup: Option<&Cgroup>, grace: Duration) {
 }
 
 /// Drains inbound events after EXIT so late CREDIT writes from the BEAM are
-/// absorbed and the shim's stdin stays open until the BEAM closes the port
-/// (reported as `StdinClosed`) or the reader thread ends. Blocks on `recv`, so
-/// it does not busy-spin.
-fn drain_inbound_until_closed(rx: &Receiver<Event>) {
+/// absorbed and the shim's stdin stays open until the BEAM closes the port.
+/// A timed receive also checks peer hang-up independently of the reader, which
+/// may be blocked forwarding child stdin and unable to report `StdinClosed`.
+fn drain_inbound_until_closed(rx: &Receiver<Event>, peer: Option<&PeerMonitor>) {
     loop {
-        match rx.recv() {
+        if peer.is_some_and(PeerMonitor::disconnected) {
+            return;
+        }
+        match rx.recv_timeout(tracking::SAMPLE_INTERVAL) {
             Ok(Event::StdinClosed) | Ok(Event::StdinError(_)) => return,
             Ok(_) => continue,
-            Err(_) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -977,6 +1075,7 @@ fn supervise_tracked<W: Write + Send + 'static>(
     interrupt_grace: Option<Duration>,
     mut tracker: Tracker,
     events: Sender<Event>,
+    peer: Option<&PeerMonitor>,
 ) -> bool {
     // Bound pending observations independently of the live group inventory.
     // If the consumer falls behind, report truncated history without stopping
@@ -1006,6 +1105,13 @@ fn supervise_tracked<W: Write + Send + 'static>(
     let confirmed = loop {
         let now = Instant::now();
         if now >= next_scan {
+            // The protocol reader can be blocked forwarding child stdin.
+            // Port closure is independently visible on the output pipe.
+            if !beam_gone && peer.is_some_and(PeerMonitor::disconnected) {
+                beam_gone = true;
+                discard_output = true;
+                tracker.begin_cleanup(now, interrupt_grace, kill_grace);
+            }
             tracker.scan();
             for identity in tracker.take_new_groups() {
                 if !beam_gone {
@@ -1095,8 +1201,18 @@ fn supervise_tracked<W: Write + Send + 'static>(
     let final_confirmed = tracker.finish_scan();
     // The waiter used WNOWAIT, so only this path reaps the root. Keeping it
     // through the final inventory prevents reuse of its group identifier.
-    if outcome.is_some() {
-        let _ = child.wait();
+    if outcome.is_none() {
+        // A late/missing waiter notification must not leave the owned root
+        // unreaped or invent an EXIT with no status. Its unreaped PID cannot
+        // have been reused, so this final direct kill is safe.
+        let _ = child.kill();
+    }
+    let reaped = child.wait();
+    if let Ok(status) = &reaped {
+        outcome = Some(ChildOutcome {
+            status: status.code(),
+            signal: status.signal(),
+        });
     }
     let cgroup_confirmed = cgroup.is_none_or(|cg| finish_cgroup(cg, kill_grace));
     if beam_gone {
@@ -1117,7 +1233,7 @@ fn supervise_tracked<W: Write + Send + 'static>(
     }
     let (output_truncated, disappeared) = if strict_output && !discard_output {
         let (drained, cancelled, disappeared) =
-            drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit);
+            drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit, peer);
         (!drained || cancelled, disappeared)
     } else {
         if let Some(c) = credit {
@@ -1148,7 +1264,7 @@ fn supervise_tracked<W: Write + Send + 'static>(
         status: outcome.status,
         signal: outcome.signal,
         timed_out,
-        confirmed: confirmed && cgroup_confirmed && final_confirmed && !history_truncated,
+        confirmed: confirmed && cgroup_confirmed && final_confirmed && reaped.is_ok(),
         contained: cgroup.is_some(),
         output_truncated,
         scope: Some(tracking::scope()),
@@ -1183,6 +1299,7 @@ fn supervise<W: Write + Send + 'static>(
     events: Sender<Event>,
     tracked_child: Option<Child>,
     tracked_input: Option<TrackedInput>,
+    peer: Option<&PeerMonitor>,
 ) -> bool {
     if let Some(tracker) = tracker {
         return supervise_tracked(
@@ -1200,6 +1317,7 @@ fn supervise<W: Write + Send + 'static>(
             interrupt_grace,
             tracker,
             events,
+            peer,
         );
     }
     let mut timed_out = false;
@@ -1346,7 +1464,7 @@ fn supervise<W: Write + Send + 'static>(
             (true, false)
         } else {
             let (drained, cancelled, disappeared) =
-                drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit);
+                drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit, peer);
             (!drained || cancelled, disappeared)
         }
     } else {
@@ -1431,10 +1549,20 @@ fn drain_pumps_strict(
     rx: &Receiver<Event>,
     stdout_credit: Option<&Credit>,
     stderr_credit: Option<&Credit>,
+    peer: Option<&PeerMonitor>,
 ) -> (bool, bool, bool) {
     let mut completed = 0;
 
     while completed < pumps {
+        if peer.is_some_and(PeerMonitor::disconnected) {
+            if let Some(c) = stdout_credit {
+                c.cancel();
+            }
+            if let Some(c) = stderr_credit {
+                c.cancel();
+            }
+            return (false, true, true);
+        }
         while let Ok(event) = rx.try_recv() {
             match event {
                 Event::Stdin(f) if f.tag == TAG_CREDIT => {
@@ -1772,6 +1900,7 @@ mod tests {
                     ))
                 })
             },
+            None,
         )
         .unwrap();
 
@@ -1861,7 +1990,7 @@ mod tests {
             bytes: Arc::clone(&bytes),
             flushes: 0,
         };
-        assert!(super::run(Cursor::new(input), writer).is_err());
+        assert!(super::run(Cursor::new(input), writer, None).is_err());
         let mut frames = Cursor::new(bytes.lock().unwrap().clone());
         assert_eq!(
             read_frame(&mut frames).unwrap().unwrap().tag,
@@ -1959,6 +2088,7 @@ mod tests {
                 identities: Arc::clone(&identities),
                 cleanup_started: Arc::clone(&cleanup_started),
             },
+            None,
         );
         assert!(
             cleanup_started.lock().unwrap().unwrap().elapsed() >= Duration::from_millis(140),
@@ -2043,12 +2173,178 @@ mod tests {
         events.send(super::Event::TrackingWriteFailed).unwrap();
         let started = Instant::now();
         assert_eq!(
-            super::drain_pumps_strict(1, &pumps, &incoming, Some(&credit), None),
+            super::drain_pumps_strict(1, &pumps, &incoming, Some(&credit), None, None),
             (false, true, true)
         );
         assert!(started.elapsed() < Duration::from_secs(1));
         // Sender remains open throughout; transport loss cannot wait for EOF.
         drop(events);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn peer_hangup_releases_drain_and_linger_without_stdin_events() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // A parallel unit test can fork between pipe() and fcntl(), inheriting
+        // the read end and postponing EOF until that unrelated child exits.
+        // Isolate pipe creation as well as marking both descriptors CLOEXEC.
+        const MARKER: &str = "FORCOLA_TEST_PEER_HANGUP";
+        if std::env::var_os(MARKER).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::peer_hangup_releases_drain_and_linger_without_stdin_events",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(result.success());
+            return;
+        }
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let peer = super::PeerMonitor::new(writer.as_raw_fd()).unwrap();
+        assert!(!peer.disconnected());
+        let (sender, incoming) = std::sync::mpsc::channel();
+        let closer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(reader);
+        });
+        let started = Instant::now();
+        // Keep sender alive: a reader stuck on child stdin cannot send EOF.
+        super::drain_inbound_until_closed(&incoming, Some(&peer));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(peer.disconnected());
+        let (_pump_sender, pumps) = std::sync::mpsc::channel();
+        let credit = Credit::new();
+        assert_eq!(
+            super::drain_pumps_strict(1, &pumps, &incoming, Some(&credit), None, Some(&peer)),
+            (false, true, true)
+        );
+        drop(sender);
+        closer.join().unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn missing_tracked_waiter_outcomes_are_reaped_and_report_actual_status() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // Native tracking on Linux inventories this shim's children. Isolate
+        // this regression from the other unit tests' subprocesses.
+        const MARKER: &str = "FORCOLA_TEST_MISSING_WAITER";
+        if std::env::var_os(MARKER).is_none() {
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "supervisor::tests::missing_tracked_waiter_outcomes_are_reaped_and_report_actual_status", "--nocapture"])
+                .env(MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(result.success());
+            return;
+        }
+
+        for wait_failed in [false, true] {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                if wait_failed {
+                    "exit 23"
+                } else {
+                    "exec sleep 30"
+                },
+            ]);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+            let child = command.spawn().unwrap();
+            let pid = child.id();
+            let root = crate::identity::read(pid).unwrap();
+            if wait_failed {
+                let outcome = super::peek_child_exit(pid, false).unwrap().unwrap();
+                assert_eq!(outcome.status, Some(23));
+            }
+            let shim = crate::identity::read(std::process::id()).unwrap();
+            let tracker = crate::tracking::Tracker::new(shim, root);
+            let (events, incoming) = std::sync::mpsc::channel();
+            events
+                .send(if wait_failed {
+                    super::Event::ChildWaitFailed
+                } else {
+                    super::Event::TimedOut
+                })
+                .unwrap();
+            // No waiter notification follows. Deadline cleanup must collect
+            // the actual status itself rather than serializing two nulls.
+            let (input, _sender) = super::TrackedInput::new(None);
+            let (_pump_sender, pumps) = std::sync::mpsc::channel();
+            let output = Arc::new(Mutex::new(Vec::new()));
+            assert!(!super::supervise_tracked(
+                &incoming,
+                Duration::ZERO,
+                input,
+                child,
+                &output,
+                0,
+                &pumps,
+                None,
+                None,
+                None,
+                false,
+                None,
+                tracker,
+                events,
+                None,
+            ));
+            let mut frames = Cursor::new(output.lock().unwrap().clone());
+            let mut exit = None;
+            while let Some(frame) = read_frame(&mut frames).unwrap() {
+                if frame.tag == crate::frame::TAG_EXIT {
+                    exit =
+                        Some(serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap());
+                }
+            }
+            let exit = exit.expect("missing EXIT");
+            if wait_failed {
+                assert_eq!(exit["status"], 23);
+                assert!(exit["signal"].is_null());
+                assert_eq!(exit["timed_out"], false);
+            } else {
+                assert_eq!(exit["signal"], libc::SIGKILL);
+                assert!(exit["status"].is_null());
+                assert_eq!(exit["timed_out"], true);
+            }
+            assert_eq!(exit["confirmed"], false);
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert!(crate::identity::read(pid).is_err());
+        }
     }
 
     // Decodes concatenated frames back into their joined payload bytes.

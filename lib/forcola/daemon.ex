@@ -62,8 +62,9 @@ defmodule Forcola.Daemon do
       Histories are bounded at 4,096 group identities. Linux reports
       `:tree_contained` through subreaper adoption; macOS reports
       `:tree_sampled`. A descendant reparented before its first macOS sample
-      is outside that guarantee. Missing or malformed history, overflow,
-      and unknown scope prevent positive tracking confirmation.
+      is outside that guarantee. Incomplete observations mark history truncated,
+      independently of native cleanup confirmation. Unknown scope or malformed
+      EXIT cannot confirm cleanup.
     * `:track_observer` - optional `{local_pid, reference}` receiving
       `{reference, {:tracked, identity}}` and one terminal
       `{reference, {:tracking_exit, evidence}}`

@@ -126,8 +126,9 @@ defmodule Forcola do
       recorded leader identity still matches. Linux reports `:tree_contained`
       using subreaper adoption; macOS reports `:tree_sampled`. A descendant
       reparented before its first macOS sample is outside that guarantee.
-      Histories are bounded at 4,096 groups; overflow or incomplete tracking
-      prevents positive cleanup confirmation. Existing cgroup containment
+      Histories are bounded at 4,096 groups; missing, malformed or overflowing
+      observations mark history truncated independently of native cleanup
+      confirmation. Existing cgroup containment
       remains a stronger backstop where available.
     * `:track_observer` - optional `{local_pid, reference}` receiving
       `{reference, {:tracked, identity}}` for each new group, then
@@ -140,8 +141,8 @@ defmodule Forcola do
       the BEAM process survives to report it. Confirmation is `:confirmed`,
       `:unconfirmed`, `:not_started`, `:timeout`, or `:transport_lost`.
       Evidence contains `:scope`, `:confirmation`, `:contained` (boolean or
-      `:unknown`), and `:tracked_groups_truncated` (boolean). History overflow
-      leaves execution running and prevents positive cleanup confirmation.
+      `:unknown`), and `:tracked_groups_truncated` (boolean). Incomplete history
+      leaves execution running and does not change native cleanup confirmation.
       Missing or unknown tracking scope never confirms cleanup. Notifications
       are unacknowledged; a dead observer does not affect execution.
     * `:output_observer` - optional `{local_pid, reference}` receiving

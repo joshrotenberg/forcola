@@ -42,8 +42,8 @@ defmodule Forcola.Shim do
   @typedoc "The child or process-group leader's native identity."
   @type identity :: %{pid: pos_integer(), pgid: pos_integer(), start_time: start_time()}
 
-  # Port.close is synchronous, but the guard may still be relaying messages.
-  # Healthy cleanup ends immediately at its final marker; this bound is only
+  # Forced port shutdown is asynchronous; the guard may still relay messages.
+  # Healthy cleanup ends at its final marker; this bound is only
   # a backstop if the guard itself is killed or cannot finish.
   @guard_close_timeout_ms 5_000
   @cleanup_margin_ms 5_000
@@ -472,7 +472,11 @@ defmodule Forcola.Shim do
   end
 
   defp close_guarded_port(port) do
-    Port.close(port)
+    # A normal Port.close flushes queued protocol input before closing its OS
+    # pipes. A child refusing stdin can prevent that flush indefinitely. Abort
+    # the port queue so the shim can observe peer loss and perform OS cleanup;
+    # the guard traps this port exit and keeps it from killing the caller.
+    :erlang.exit(port, :kill)
   catch
     :error, :badarg -> :ok
   end
@@ -481,8 +485,9 @@ defmodule Forcola.Shim do
   Closes the port and drains its remaining relayed messages.
 
   Call once from the process that opened the port, after consuming its result.
-  The OS port is closed synchronously; draining normally finishes immediately.
-  If the guard itself fails to finish, draining is bounded by five seconds and
+  Queued protocol input is discarded so a blocked child cannot defer OS pipe
+  closure. The shim remains responsible for process cleanup. The guard's exit
+  is awaited; if it fails to finish, draining is bounded by five seconds and
   returns `{:error, :guard_close_timeout}`.
   """
   @spec close(port()) :: :ok | {:error, :guard_close_timeout}

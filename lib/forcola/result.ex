@@ -29,9 +29,9 @@ defmodule Forcola.Result do
   PID with a different start time is a distinct entry. The list defaults to
   `[]`, is bounded at 4,096 entries, and survives in partial results. It is
   not a list of processes known to be alive. `:tracked_groups_truncated` is
-  true once the history limit or native observation queue drops an entry;
-  execution continues and cleanup
-  cannot be confirmed from the incomplete history. Root identity in this history
+  true when history is missing, malformed, or exceeds its retention/notification
+  bound. Execution continues and cleanup confirmation comes independently from
+  the native live-set report. Root identity in this history
   does not populate `:pid`, `:pgid`, or `:start_time` without `:spawn_identity`.
 
   `:evidence` defaults to `nil` for source-compatible struct construction.
@@ -47,7 +47,8 @@ defmodule Forcola.Result do
     * `:contained` - `true` or `false` when cgroup placement was reported, or
       `:unknown` when unavailable. Independent of the tree cleanup scope.
     * `:tracked_groups_truncated` - whether the 4,096-entry history limit or
-      native observation queue dropped an entry. This makes cleanup unconfirmed without stopping the child.
+      native observation queue dropped an entry, or observations were missing
+      or malformed. Independent of native cleanup confirmation.
     * `:cleanup` - `:confirmed`, `:unconfirmed`, or `:unknown`. Only an explicit,
       valid native EXIT confirmation yields `:confirmed`.
     * `:scope` - `:process_group`, `:active_cgroup`, `:tree_contained`,
@@ -56,9 +57,9 @@ defmodule Forcola.Result do
       native tree scope: Linux subreaper adoption is `:tree_contained`, while
       macOS sampling is `:tree_sampled`. A descendant reparented before its
       first macOS sample is outside the sampled guarantee. Tracking never
-      infers a tree scope from the older `contained` flag. Missing root
-      history, malformed observations, overflow, or unknown scope prevent
-      positive tracking confirmation even if the native report says true.
+      infers a tree scope from the older `contained` flag. A valid native EXIT
+      with a recognized scope supplies cleanup confirmation independently of
+      observation history. Unknown scope or malformed EXIT cannot confirm it.
     * `:guard_close` - `:ok` or `{:error, :guard_close_timeout}`. Closing the
       transport is separate from native cleanup confirmation.
 
