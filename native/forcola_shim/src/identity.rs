@@ -76,13 +76,14 @@ pub fn read(pid: u32) -> io::Result<ProcessIdentity> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: proc_pidinfo writes at most size bytes to this correctly sized,
-    // aligned buffer. We inspect it only after a complete result. TBSDINFO
-    // supports unreaped zombies as well as running processes.
+    // aligned buffer. We inspect it only after a complete result. TBSDINFO's
+    // nonzero arg includes unreaped zombies as well as running processes;
+    // arg=0 would return ESRCH for a child that exited before this lookup.
     let result = unsafe {
         libc::proc_pidinfo(
             pid as libc::c_int,
             libc::PROC_PIDTBSDINFO,
-            0,
+            1,
             info.as_mut_ptr().cast(),
             size,
         )
@@ -134,6 +135,59 @@ mod tests {
         assert_eq!(first.pid, pid);
         assert!(first.pgid > 0);
         assert_eq!(first, super::read(pid).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_identity_survives_an_unreaped_child_exit() {
+        use std::io;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // cat stays alive on its open stdin while we capture the original
+        // identity. A separate process group makes the expected pgid explicit.
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let running = super::read(pid);
+        drop(child.stdin.take());
+
+        let mut status = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        let waited = loop {
+            // SAFETY: waitid writes to a correctly sized/aligned status buffer.
+            // WNOWAIT leaves this exited child unreaped and its pid reserved.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    status.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                break Err(error);
+            }
+        };
+        let exited = super::read(pid);
+        // Reap before any assertions, including when either identity lookup or
+        // waitid failed, so a failing regression cannot leave a zombie behind.
+        let reaped = child.wait();
+
+        waited.unwrap();
+        assert!(reaped.unwrap().success());
+        let running = running.unwrap();
+        assert_eq!(running.pid, pid);
+        assert_eq!(running.pgid, pid);
+        assert_eq!(exited.unwrap(), running);
     }
 
     #[cfg(target_os = "linux")]
