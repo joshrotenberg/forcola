@@ -70,6 +70,21 @@ defmodule Forcola.DuplexTest do
   end
 
   describe "round-trip" do
+    test "send_line rejects non-iodata without ending the session" do
+      {:ok, session} = Forcola.Duplex.open(["/bin/cat"], [])
+
+      for bad <- [:not_iodata, 42, [300], %{}] do
+        assert_raise ArgumentError, ~r/expects iodata/, fn ->
+          Forcola.Duplex.send_line(session, bad)
+        end
+      end
+
+      # The rejected calls never reached the session: the child still echoes.
+      assert :ok = Forcola.Duplex.send_line(session, "still here")
+      assert_receive {:forcola_line, ^session, "still here"}, 5_000
+      :ok = Forcola.Duplex.close(session)
+    end
+
     test "lines echo through cat" do
       {:ok, session} = Forcola.Duplex.open(["/bin/cat"], kill_grace_ms: 1_000)
 

@@ -306,13 +306,35 @@ defmodule Forcola.Duplex do
   Write a line to the child's stdin.
 
   A newline is appended. Returns `{:error, :closed}` once the session is
-  over or the child's stdin has been closed with `send_eof/1`.
+  over or the child's stdin has been closed with `send_eof/1`. Raises
+  `ArgumentError` when `line` is not iodata; the session and the child are
+  unaffected by the rejected call.
   """
   @spec send_line(session(), iodata()) :: :ok | {:error, term()}
   def send_line(%__MODULE__{pid: pid}, line) do
+    validate_iodata!(line)
     GenServer.call(pid, {:send_line, line})
   catch
     :exit, _ -> {:error, :closed}
+  end
+
+  # Port.command/2 raises badarg for anything that is not iodata. Inside the
+  # session that raise is indistinguishable from a crash: it kills the child's
+  # process group and hands the caller {:error, :closed}. Reject bad input in
+  # the caller instead.
+  defp validate_iodata!(line) do
+    unless iodata?(line) do
+      raise ArgumentError,
+            "Forcola.Duplex.send_line/2 expects iodata (a binary, or a list of " <>
+              "binaries and bytes), got: #{inspect(line)}"
+    end
+  end
+
+  defp iodata?(line) do
+    IO.iodata_length(line)
+    true
+  rescue
+    ArgumentError -> false
   end
 
   @doc """
