@@ -182,6 +182,14 @@ options, and return/message shapes for each mode.
 
 ## Process groups and cleanup
 
+Pass `spawn_identity: true` to record the child's OS identity. One-shot
+results include `pid`, `pgid`, and `start_time`; Duplex and Daemon send
+`{:forcola_spawned, session, identity}` to their owner and expose `spawned/1`.
+Stream accepts `spawn_observer: {pid, reference}`, which enables identity
+reporting and sends `{reference, {:spawned, identity}}` before the first line.
+The [identity example](https://hexdocs.pm/forcola/getting_started.html#record-process-identity)
+shows how to record a Duplex child's identity before sending input.
+
 The group kill covers the child and everything it keeps in its process group:
 ordinary grandchildren die with the command. Deliberate daemonizers (double-fork
 plus `setsid`) leave the group; on Linux the opt-in `cgroup: true` layer

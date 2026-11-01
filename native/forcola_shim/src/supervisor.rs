@@ -4,11 +4,14 @@
 use crate::cgroup::{self, Cgroup};
 use crate::credit::{Credit, Permit};
 use crate::frame::{
-    self, Frame, TAG_CREDIT, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_KILL, TAG_SPAWN, TAG_STDERR,
-    TAG_STDERR_CREDIT, TAG_STDIN, TAG_STDOUT,
+    self, Frame, TAG_CAPABILITIES, TAG_CREDIT, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_HELLO, TAG_KILL,
+    TAG_SPAWN, TAG_SPAWNED, TAG_STDERR, TAG_STDERR_CREDIT, TAG_STDIN, TAG_STDOUT,
 };
+use crate::identity;
 use crate::privdrop::{self, DropPlan};
-use crate::protocol::{CgroupMode, EnvMode, ErrorReport, ExitReport, SpawnRequest};
+use crate::protocol::{
+    Capabilities, CgroupMode, EnvMode, ErrorReport, ExitReport, HelloRequest, SpawnRequest,
+};
 
 use rustix::process::{self, Pid, Signal};
 use std::fs::File;
@@ -57,15 +60,25 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
     // SPAWN is mandatory, with an optional capability request before it.
     // Optional capability exchange MUST finish before any child is spawned.
     // Old shims reject this first tag instead of ignoring new SPAWN keys.
+    let mut report_identity = false;
     let first = frame::read_frame(&mut stdin)?;
     let first = match first {
-        Some(f) if f.tag == 0x07 => {
+        Some(f) if f.tag == TAG_HELLO => {
+            let features = supported_features();
+            report_identity = match select_features(&f.payload, &features) {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    write_error(&out, &reason);
+                    return Ok(());
+                }
+            };
+            let capabilities = Capabilities {
+                protocol: 1,
+                features,
+            };
+            let payload = serde_json::to_vec(&capabilities)?;
             let mut w = out.lock().unwrap();
-            frame::write_frame(
-                &mut *w,
-                0x15,
-                br#"{"protocol":1,"features":["bounded_run_v1"]}"#,
-            )?;
+            frame::write_frame(&mut *w, TAG_CAPABILITIES, &payload)?;
             drop(w);
             frame::read_frame(&mut stdin)?
         }
@@ -109,6 +122,30 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
 
     let pgid = Pid::from_child(&child);
     let kill_grace = Duration::from_millis(request.kill_grace_ms);
+
+    if report_identity {
+        // No output pumps or waiter exist yet. Fast exits remain unreaped,
+        // retaining their native start time and preventing pid reuse until the
+        // identity has been captured. The shared writer preserves this frame
+        // ahead of every stdout/stderr frame, including for pty children.
+        let identity = match identity::read(child.id()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                abort_spawn(child, cgroup.as_ref(), kill_grace);
+                write_error(&out, &format!("spawn identity failed: {error}"));
+                return Ok(());
+            }
+        };
+        let written = serde_json::to_vec(&identity)
+            .map_err(io::Error::other)
+            .and_then(|payload| {
+                frame::write_frame(&mut *out.lock().unwrap(), TAG_SPAWNED, &payload)
+            });
+        if let Err(error) = written {
+            abort_spawn(child, cgroup.as_ref(), kill_grace);
+            return Err(error);
+        }
+    }
 
     // Backpressure is opt-in: a `window_bytes` in the SPAWN payload gates the
     // stdout pump on a shared read budget. Absent, the pump reads eagerly and
@@ -221,6 +258,46 @@ pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
     }
 
     Ok(())
+}
+
+fn supported_features() -> Vec<&'static str> {
+    let mut features = vec!["bounded_run_v1"];
+    if identity::SUPPORTED {
+        features.push("spawn_identity_v1");
+    }
+    features
+}
+
+fn select_features(payload: &[u8], supported: &[&str]) -> Result<bool, String> {
+    let request = if payload.is_empty() {
+        HelloRequest::default()
+    } else {
+        serde_json::from_slice::<HelloRequest>(payload)
+            .map_err(|error| format!("invalid HELLO payload: {error}"))?
+    };
+    for feature in &request.features {
+        if !supported.contains(&feature.as_str()) {
+            return Err(format!("unsupported feature: {feature}"));
+        }
+    }
+    Ok(request
+        .features
+        .iter()
+        .any(|feature| feature == "spawn_identity_v1"))
+}
+
+/// Startup reporting failed before the waiter took ownership. Stop the owned
+/// group immediately, including a cgroup backstop when present, then reap the
+/// child and remove its cgroup. No early error may leave a live child behind.
+fn abort_spawn(mut child: Child, cgroup: Option<&Cgroup>, grace: Duration) {
+    let _ = process::kill_process_group(Pid::from_child(&child), Signal::KILL);
+    if let Some(cgroup) = cgroup {
+        cgroup.kill();
+    }
+    let _ = child.wait();
+    if let Some(cgroup) = cgroup {
+        finish_cgroup(cgroup, grace);
+    }
 }
 
 /// Drains inbound events after EXIT so late CREDIT writes from the BEAM are
@@ -967,6 +1044,71 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn failed_identity_delivery_kills_and_reaps_the_child() {
+        use crate::frame::{write_frame, TAG_CAPABILITIES, TAG_HELLO, TAG_SPAWN, TAG_SPAWNED};
+        use std::io::{self, Write};
+
+        struct FailIdentity {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            flushes: usize,
+        }
+
+        impl Write for FailIdentity {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.flushes == 2 {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "identity delivery failed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let mut input = Vec::new();
+        write_frame(
+            &mut input,
+            TAG_HELLO,
+            br#"{"features":["spawn_identity_v1"]}"#,
+        )
+        .unwrap();
+        write_frame(
+            &mut input,
+            TAG_SPAWN,
+            br#"{"argv":["sleep","30"],"kill_grace_ms":0}"#,
+        )
+        .unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = FailIdentity {
+            bytes: Arc::clone(&bytes),
+            flushes: 0,
+        };
+        assert!(super::run(Cursor::new(input), writer).is_err());
+        let mut frames = Cursor::new(bytes.lock().unwrap().clone());
+        assert_eq!(
+            read_frame(&mut frames).unwrap().unwrap().tag,
+            TAG_CAPABILITIES
+        );
+        let identity = read_frame(&mut frames).unwrap().unwrap();
+        assert_eq!(identity.tag, TAG_SPAWNED);
+        let identity: serde_json::Value = serde_json::from_slice(&identity.payload).unwrap();
+        let pid = rustix::process::Pid::from_raw(identity["pid"].as_i64().unwrap() as i32).unwrap();
+        assert_eq!(rustix::process::test_kill_process(pid), Err(Errno::SRCH));
+        assert_eq!(
+            rustix::process::test_kill_process_group(pid),
+            Err(Errno::SRCH)
+        );
+    }
 
     // Decodes concatenated frames back into their joined payload bytes.
     fn joined_payloads(bytes: &[u8]) -> Vec<u8> {

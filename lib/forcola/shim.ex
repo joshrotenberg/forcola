@@ -15,7 +15,7 @@ defmodule Forcola.Shim do
   Frames are `{:packet, 4}`-style: a 4-byte big-endian length prefix
   (handled by the Erlang port itself), then a 1-byte tag, then the
   payload. This module owns the tag constants and the JSON payload
-  shapes for SPAWN/EXIT/ERROR; `Forcola.run/2` drives the protocol.
+  shapes for SPAWN/EXIT/ERROR/SPAWNED. Each execution mode drives the protocol.
   """
 
   # Inbound tag: BEAM -> shim.
@@ -31,6 +31,15 @@ defmodule Forcola.Shim do
   @tag_stderr 0x12
   @tag_exit 0x13
   @tag_error 0x14
+  @tag_spawned 0x16
+
+  @typedoc "Native start identity, stable for the life of a process."
+  @type start_time ::
+          %{kind: :linux, boot_id: String.t(), ticks: non_neg_integer()}
+          | %{kind: :macos, seconds: non_neg_integer(), microseconds: non_neg_integer()}
+
+  @typedoc "The child or process-group leader's native identity."
+  @type identity :: %{pid: pos_integer(), pgid: pos_integer(), start_time: start_time()}
 
   # Port.close is synchronous, but the guard may still be relaying messages.
   # Healthy cleanup ends immediately at its final marker; this bound is only
@@ -57,14 +66,17 @@ defmodule Forcola.Shim do
   def tag_exit, do: @tag_exit
   @doc false
   def tag_error, do: @tag_error
+  @doc false
+  def tag_spawned, do: @tag_spawned
 
   @doc false
-  def negotiate(port, timeout_ms) when is_integer(timeout_ms) and timeout_ms >= 0 do
-    send_frame(port, 0x07)
+  def negotiate(port, timeout_ms, required_features \\ ["bounded_run_v1"])
+      when is_integer(timeout_ms) and timeout_ms >= 0 do
+    send_frame(port, 0x07, :json.encode(%{"features" => required_features}))
 
     receive do
       {^port, {:data, <<0x15, payload::binary>>}} ->
-        decode_capabilities(payload)
+        decode_capabilities(payload, required_features)
 
       {^port, {:data, <<@tag_error, payload::binary>>}} ->
         # Legacy shims explicitly reject HELLO because they expect SPAWN.
@@ -86,13 +98,13 @@ defmodule Forcola.Shim do
     end
   end
 
-  defp decode_capabilities(payload) do
+  defp decode_capabilities(payload, required_features) do
     case decode_json(payload) do
       {:ok, %{"protocol" => protocol, "features" => features}}
       when is_integer(protocol) and is_list(features) ->
         cond do
           not Enum.all?(features, &is_binary/1) -> {:error, :invalid_handshake}
-          protocol == 1 and "bounded_run_v1" in features -> :ok
+          protocol == 1 and Enum.all?(required_features, &(&1 in features)) -> :ok
           true -> {:error, :incompatible_shim}
         end
 
@@ -100,6 +112,95 @@ defmodule Forcola.Shim do
         {:error, :invalid_handshake}
     end
   end
+
+  @doc false
+  def validate_spawn_identity!(opts) do
+    unless Keyword.get(opts, :spawn_identity, false) in [true, false],
+      do: raise(ArgumentError, "spawn_identity must be a boolean")
+  end
+
+  @doc false
+  def validate_spawn_observer!(opts) do
+    case Keyword.get(opts, :spawn_observer) do
+      nil -> :ok
+      {pid, ref} when is_pid(pid) and node(pid) == node() and is_reference(ref) -> :ok
+      _ -> raise ArgumentError, "spawn_observer must be {local_pid, reference} or nil"
+    end
+  end
+
+  @doc false
+  def identity_requested?(opts), do: Keyword.get(opts, :spawn_identity, false)
+
+  @doc false
+  def identity_features(opts, features \\ []) do
+    if identity_requested?(opts), do: features ++ ["spawn_identity_v1"], else: features
+  end
+
+  @doc false
+  def open_with_identity(opts, timeout_ms \\ 5_000) do
+    case identity_features(opts) do
+      [] -> open(opts)
+      features -> open_negotiated(opts, timeout_ms, features)
+    end
+  end
+
+  defp open_negotiated(opts, timeout_ms, features) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    with {:ok, port} <- open(opts) do
+      remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      with :ok <- negotiate(port, remaining, features),
+           true <- System.monotonic_time(:millisecond) < deadline do
+        {:ok, port}
+      else
+        false ->
+          close(port)
+          {:error, :handshake_timeout}
+
+        {:error, _reason} = error ->
+          close(port)
+          error
+      end
+    end
+  end
+
+  @doc """
+  Decodes a native process identity without creating atoms from wire data.
+
+  Linux uses `/proc/<pid>/stat` field 22 (`:ticks`, in clock ticks since
+  boot) paired with the kernel `:boot_id`. macOS uses `kp_proc.p_starttime`
+  as Unix `:seconds` and `:microseconds`. Preserve every field when recording
+  an identity; these values guard against PID reuse, and are not evidence
+  that the process is still alive. The same payload shape is reserved for
+  future tracked process-group identities.
+  """
+  @spec decode_identity(binary()) :: {:ok, identity()} | {:error, :invalid_identity}
+  def decode_identity(payload) do
+    with {:ok, %{"pid" => pid, "pgid" => pgid, "start_time" => start_time}} <-
+           decode_json(payload),
+         true <- is_integer(pid) and pid > 0 and is_integer(pgid) and pgid > 0,
+         {:ok, start_time} <- decode_start_time(start_time) do
+      {:ok, %{pid: pid, pgid: pgid, start_time: start_time}}
+    else
+      _ -> {:error, :invalid_identity}
+    end
+  end
+
+  defp decode_start_time(%{"kind" => "linux", "boot_id" => boot_id, "ticks" => ticks})
+       when is_binary(boot_id) and byte_size(boot_id) > 0 and is_integer(ticks) and ticks >= 0,
+       do: {:ok, %{kind: :linux, boot_id: boot_id, ticks: ticks}}
+
+  defp decode_start_time(%{
+         "kind" => "macos",
+         "seconds" => seconds,
+         "microseconds" => microseconds
+       })
+       when is_integer(seconds) and seconds >= 0 and is_integer(microseconds) and
+              microseconds >= 0 and microseconds < 1_000_000,
+       do: {:ok, %{kind: :macos, seconds: seconds, microseconds: microseconds}}
+
+  defp decode_start_time(_), do: {:error, :invalid_identity}
 
   @doc false
   def reject_run_options!(opts, mode, supported \\ []) do

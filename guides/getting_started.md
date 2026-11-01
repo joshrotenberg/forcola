@@ -536,6 +536,80 @@ are produced. Passing `merge_stderr: false` with `pty: true` raises
 same as in pipe mode. There is no dynamic resize yet; `:pty_rows`/`:pty_cols`
 set the initial size only.
 
+## Record process identity
+
+Identity reporting is opt-in and requires a shim advertising
+`spawn_identity_v1`. With `spawn_identity: true`, `Forcola.run/2` populates
+`result.pid`, `result.pgid`, and `result.start_time`, including on partial
+results after timeout. These fields are `nil` when identity is not requested.
+Duplex and Daemon notify the process that opened them before delivering any
+child output:
+
+```elixir
+{:ok, session} =
+  Forcola.Duplex.open(["/bin/cat"], spawn_identity: true)
+
+try do
+  receive do
+    {:forcola_spawned, ^session, identity} ->
+      # Persist identity here and wait for the durable write to finish.
+      :ok = RecoveryStore.record(identity)
+      {:ok, ^identity} = Forcola.Duplex.spawned(session)
+      :ok = Forcola.Duplex.send_line(session, "first input")
+
+    {:forcola_exit, ^session, reason} ->
+      raise "child did not start: #{inspect(reason)}"
+  after
+    5_000 -> raise "identity was not received"
+  end
+after
+  Forcola.Duplex.close(session)
+end
+```
+
+`RecoveryStore` stands for the application's durable store. The notification
+does not pause the executable: the child may already be running or may have
+exited. Waiting before `send_line/2` only gates input controlled by the caller.
+The identity is observation, not a liveness or cleanup guarantee.
+
+`spawned/1` returns `{:ok, identity}` once observed, `{:error, :pending}` while
+waiting, `{:error, :not_requested}` for a live session with reporting disabled,
+or `{:error, :closed}` when unavailable after shutdown. Duplex retains its
+identity alongside terminal evidence after natural exit until `close/1`,
+`forget_terminal/1`, or owner exit releases the record. Daemon queries require a live daemon;
+its owner should retain the notification for later use. When started by a
+supervisor, the supervisor is the Daemon owner.
+
+For a line stream, supply `spawn_observer: {local_pid, reference}`. This
+enables identity reporting and sends `{reference, {:spawned, identity}}`
+before the first yielded line, including when backpressure is enabled.
+Observer delivery is unacknowledged; the observer must persist the value
+itself. Streams close stdin immediately and do not wait for that persistence.
+
+The identity map has atom keys:
+
+- `pid`: the child's OS process ID.
+- `pgid`: its process group ID at capture, equal to `pid` after `setsid`.
+- `start_time`: on Linux, `%{kind: :linux, boot_id: string, ticks: integer}`,
+  using `/proc/sys/kernel/random/boot_id` and field 22 of `/proc/<pid>/stat`.
+  Ticks are native clock ticks since boot, not milliseconds or wall time.
+  On macOS, `%{kind: :macos, seconds: integer, microseconds: integer}` is the
+  kernel process start timestamp, equivalent to `kp_proc.p_starttime`, with
+  seconds since the Unix epoch and a microsecond fraction.
+
+Keep the full native value when recording identity. Formatted `ps` output
+loses precision. A later recovery process must reread the leader's native
+identity and compare it before signalling; the stored PID alone can be
+reused, and Linux records must also match the boot ID. Identity values are
+for the same host and PID namespace. This API does not implement recovery
+or make checking identity and sending a signal atomic.
+
+Without either identity option, existing wire behavior is unchanged. A shim
+without the capability rejects the request before the child executes.
+`SPAWNED` uses tag `0x16` and the shared identity payload; `0x17` is reserved
+for the future `TRACKED` frame from descendant tracking work. Tracking is
+not enabled by selecting spawn identity.
+
 ## Next steps
 
 - The [process groups guide](process_groups.html) covers the kill mechanism

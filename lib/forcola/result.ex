@@ -9,6 +9,19 @@ defmodule Forcola.Result do
   which means the shim could not confirm death before its own deadline;
   treat it as leaked and investigate.
 
+  With `spawn_identity: true`, `:pid`, `:pgid`, and `:start_time` describe
+  the successfully spawned child. They are `nil` when identity was not
+  requested or no valid identity frame arrived. They remain available in
+  partial results after timeout or transport loss. `:pgid` equals `:pid`
+  because the shim creates a new session for the child.
+
+  `:start_time` is `%{kind: :linux, boot_id: string, ticks: integer}` on
+  Linux, with ticks from `/proc/<pid>/stat` field 22, or
+  `%{kind: :macos, seconds: integer, microseconds: integer}` on macOS,
+  from `kp_proc.p_starttime`. Preserve the complete map when recording it
+  to distinguish a reused PID. An identity is an observation at spawn,
+  not proof that the child is still alive.
+
   `:evidence` defaults to `nil` for source-compatible struct construction.
   `Forcola.run/2` populates a map with these independent observations:
 
@@ -45,10 +58,13 @@ defmodule Forcola.Result do
         }
 
   @enforce_keys [:status]
-  defstruct [:status, stdout: "", stderr: "", evidence: nil]
+  defstruct [:status, :pid, :pgid, :start_time, stdout: "", stderr: "", evidence: nil]
 
   @type t :: %__MODULE__{
           status: non_neg_integer() | {:signal, atom() | non_neg_integer()},
+          pid: pos_integer() | nil,
+          pgid: pos_integer() | nil,
+          start_time: Forcola.Shim.start_time() | nil,
           stdout: binary(),
           stderr: binary(),
           evidence: evidence() | nil

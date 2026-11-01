@@ -3,6 +3,20 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Explicitly selected optional features. An empty HELLO payload is the
+/// original capability query and selects no additional outbound frames.
+#[derive(Debug, Default, Deserialize)]
+pub struct HelloRequest {
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Capabilities {
+    pub protocol: u32,
+    pub features: Vec<&'static str>,
+}
+
 /// Payload of an inbound SPAWN frame.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpawnRequest {

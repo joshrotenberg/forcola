@@ -17,6 +17,10 @@ defmodule Forcola.Duplex do
 
   The process that called `open/2` (the owner) receives:
 
+    * `{:forcola_spawned, session, identity}` - with `spawn_identity: true`,
+      the child's `%{pid: integer, pgid: integer, start_time: map}` before
+      any output. This message also arrives in pull mode. See
+      `Forcola.Result` for the platform-specific start-time fields.
     * `{:forcola_line, session, line}` - a stdout line, without its
       trailing newline. A partial line held across frames is delivered
       once its newline arrives; a final partial line is delivered before
@@ -163,6 +167,10 @@ defmodule Forcola.Duplex do
 
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
     * `:shim_path` - trusted absolute shim path, as in `Forcola.run/2`.
+    * `:spawn_identity` - request the child's native identity, default
+      `false`. Requires `spawn_identity_v1` negotiation before SPAWN, with
+      a five-second handshake bound. An incompatible shim returns an error
+      without starting the child. `spawned/1` reads the latest observation.
     * `:user`, `:group` - run the child as a different user/group, as in
       `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
       privileged shim; failures fail closed and arrive as
@@ -210,6 +218,8 @@ defmodule Forcola.Duplex do
     # The owner owns the table, so the terminal record survives the session
     # process but is reclaimed automatically when the owner exits.
     table = :ets.new(:forcola_duplex_terminal, [:set, :public])
+    identity_status = if Shim.identity_requested?(opts), do: :pending, else: :not_requested
+    :ets.insert(table, {:spawn_identity, identity_status})
 
     case GenServer.start(__MODULE__, {self(), ref, table, argv, opts}) do
       {:ok, pid} ->
@@ -225,6 +235,44 @@ defmodule Forcola.Duplex do
         :ets.delete(table)
         {:error, reason}
     end
+  end
+
+  @doc """
+  Returns the recorded child identity without waiting for a spawn.
+
+  Returns `{:error, :pending}` while an enabled session has not received
+  its identity, `{:error, :not_requested}` when disabled, and
+  `{:error, :closed}` when no identity is available after the session ends
+  or its retained record was released. A recorded identity survives natural
+  exit until `close/1`, `forget_terminal/1`, or owner death releases the table.
+
+  To record identity before providing input, wait for the owner message:
+
+      {:ok, session} = Forcola.Duplex.open(["my-cli"], spawn_identity: true)
+      receive do
+        {:forcola_spawned, ^session, identity} -> persist_identity(identity)
+        {:forcola_exit, ^session, reason} -> raise inspect(reason)
+      end
+      :ok = Forcola.Duplex.send_line(session, input)
+
+  The child may already run before the message arrives; the caller controls
+  when it sends stdin, not when the child begins executing.
+  """
+  @spec spawned(session()) ::
+          {:ok, Shim.identity()} | {:error, :pending | :not_requested | :closed}
+  def spawned(%__MODULE__{pid: pid, terminal_table: table}) do
+    case :ets.lookup(table, :spawn_identity) do
+      [{:spawn_identity, identity}] when is_map(identity) ->
+        {:ok, identity}
+
+      [{:spawn_identity, :not_requested}] ->
+        if Process.alive?(pid), do: {:error, :not_requested}, else: {:error, :closed}
+
+      _ ->
+        if Process.alive?(pid), do: {:error, :pending}, else: {:error, :closed}
+    end
+  catch
+    :error, :badarg -> {:error, :closed}
   end
 
   @doc """
@@ -369,7 +417,7 @@ defmodule Forcola.Duplex do
     max_output_bytes = Keyword.get(opts, :max_output_bytes, @default_max_output_bytes)
     max_pending_bytes = Keyword.get(opts, :max_pending_bytes, max_line_bytes + 1)
 
-    case Shim.open(opts) do
+    case Shim.open_with_identity(opts) do
       {:ok, port} ->
         spawn_opts =
           opts
@@ -394,6 +442,8 @@ defmodule Forcola.Duplex do
            buffers: %{stdout: "", stderr: ""},
            stdin_open: true,
            exit: nil,
+           identity_enabled: Shim.identity_requested?(opts),
+           identity: nil,
            terminal: nil,
            terminal_recipient: Keyword.get(opts, :terminal_recipient),
            shutdown_cause: :explicit_close,
@@ -550,6 +600,7 @@ defmodule Forcola.Duplex do
   ## Option validation
 
   defp validate_opts!(argv, opts) do
+    Shim.validate_spawn_identity!(opts)
     Shim.reject_run_options!(opts, __MODULE__, [:max_output_bytes])
     validate_timeout_opt!(opts)
     validate_pty_opt!(opts)
@@ -659,10 +710,31 @@ defmodule Forcola.Duplex do
     cond do
       tag == Shim.tag_stdout() -> emit(state, :stdout, payload)
       tag == Shim.tag_stderr() -> emit(state, :stderr, payload)
+      tag == Shim.tag_spawned() -> record_identity(state, payload)
       tag == Shim.tag_exit() -> child_exited(state, payload)
       tag == Shim.tag_error() -> spawn_failed(state, payload)
       true -> state
     end
+  end
+
+  defp record_identity(%{identity_enabled: true, identity: nil} = state, payload) do
+    case Shim.decode_identity(payload) do
+      {:ok, identity} ->
+        store_identity(state.session.terminal_table, identity)
+        send(state.owner, {:forcola_spawned, state.session, identity})
+        %{state | identity: identity}
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp record_identity(state, _payload), do: state
+
+  defp store_identity(table, identity) do
+    :ets.insert(table, {:spawn_identity, identity})
+  catch
+    :error, :badarg -> :ok
   end
 
   defp child_exited(state, payload) do
@@ -853,7 +925,7 @@ defmodule Forcola.Duplex do
     result =
       try do
         Shim.send_frame(port, Shim.tag_kill())
-        await_exit(port, kill_grace_ms + @backstop_margin_ms)
+        await_exit(state, kill_grace_ms + @backstop_margin_ms)
       catch
         :error, :badarg -> :transport_lost
       end
@@ -870,12 +942,12 @@ defmodule Forcola.Duplex do
     terminal
   end
 
-  defp await_exit(port, timeout_ms) do
+  defp await_exit(state, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    do_await_exit(port, deadline)
+    do_await_exit(state, deadline)
   end
 
-  defp do_await_exit(port, deadline) do
+  defp do_await_exit(%{port: port} = state, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     receive do
@@ -883,7 +955,8 @@ defmodule Forcola.Duplex do
         cond do
           tag == Shim.tag_exit() -> {:exit, payload}
           tag == Shim.tag_error() -> {:spawn_error, payload}
-          true -> do_await_exit(port, deadline)
+          tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
+          true -> do_await_exit(state, deadline)
         end
 
       {^port, {:exit_status, _status}} ->

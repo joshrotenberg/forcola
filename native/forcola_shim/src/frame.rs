@@ -14,12 +14,17 @@ pub const TAG_KILL: u8 = 0x04;
 pub const TAG_CREDIT: u8 = 0x05;
 /// Grants read credit to the stderr pump in duplex pull mode.
 pub const TAG_STDERR_CREDIT: u8 = 0x06;
+pub const TAG_HELLO: u8 = 0x07;
 
 /// Outbound tag: shim -> BEAM.
 pub const TAG_STDOUT: u8 = 0x11;
 pub const TAG_STDERR: u8 = 0x12;
 pub const TAG_EXIT: u8 = 0x13;
 pub const TAG_ERROR: u8 = 0x14;
+pub const TAG_CAPABILITIES: u8 = 0x15;
+pub const TAG_SPAWNED: u8 = 0x16;
+// 0x17 is reserved for future TRACKED frames with the same ProcessIdentity
+// payload as SPAWNED, independently selected through capability negotiation.
 
 /// Upper bound on a single frame's length (tag byte + payload).
 ///

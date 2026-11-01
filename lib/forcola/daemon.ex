@@ -30,6 +30,14 @@ defmodule Forcola.Daemon do
     * `:name` - optional GenServer registration name.
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
     * `:shim_path` - trusted absolute shim path, as in `Forcola.run/2`.
+    * `:spawn_identity` - request the child's native identity, default
+      `false`. The process calling `start_link/1` receives
+      `{:forcola_spawned, daemon_pid, identity}` before output is routed,
+      where identity is `%{pid: integer, pgid: integer, start_time: map}`.
+      See `Forcola.Result` for the platform-specific start-time fields.
+      This also applies during readiness polling. Requires
+      `spawn_identity_v1` negotiation with a five-second handshake bound;
+      an incompatible shim fails before starting the child.
     * `:user`, `:group` - run the child as a different user/group, as in
       `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
       privileged shim; failures fail closed and surface as the daemon's
@@ -126,18 +134,35 @@ defmodule Forcola.Daemon do
     validate_opts!(opts)
     {name, opts} = Keyword.pop(opts, :name)
     gen_opts = if name, do: [name: name], else: []
-    GenServer.start_link(__MODULE__, opts, gen_opts)
+    GenServer.start_link(__MODULE__, {self(), opts}, gen_opts)
+  end
+
+  @doc """
+  Returns the live daemon's recorded child identity without waiting.
+
+  Returns `{:error, :pending}` before an enabled daemon receives the frame,
+  `{:error, :not_requested}` when disabled, and `{:error, :closed}` after
+  the daemon exits. The caller of `start_link/1` can retain its
+  `{:forcola_spawned, daemon_pid, identity}` notification beyond that point.
+  An observed identity is not proof that the process remains alive.
+  """
+  @spec spawned(GenServer.server()) ::
+          {:ok, Shim.identity()} | {:error, :pending | :not_requested | :closed}
+  def spawned(daemon) do
+    GenServer.call(daemon, :spawned)
+  catch
+    :exit, _ -> {:error, :closed}
   end
 
   @impl true
-  def init(opts) do
+  def init({owner, opts}) do
     # Trap exits so terminate/2 runs on supervisor shutdown and on owner
     # (parent) crash; both must kill the process group.
     Process.flag(:trap_exit, true)
 
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
 
-    case Shim.open(opts) do
+    case Shim.open_with_identity(opts) do
       {:ok, port} ->
         argv = Keyword.fetch!(opts, :argv)
         payload = Shim.encode_spawn(argv, Keyword.put(opts, :kill_grace_ms, kill_grace_ms))
@@ -145,6 +170,9 @@ defmodule Forcola.Daemon do
 
         state = %{
           port: port,
+          owner: owner,
+          identity_enabled: Shim.identity_requested?(opts),
+          identity: nil,
           output: Keyword.get(opts, :output, :logger),
           log_level: Keyword.get(opts, :log_output, :info),
           log_prefix: Keyword.get(opts, :log_prefix, ""),
@@ -169,6 +197,15 @@ defmodule Forcola.Daemon do
         {:stop, {:spawn, reason}}
     end
   end
+
+  @impl true
+  def handle_call(:spawned, _from, %{identity_enabled: false} = state),
+    do: {:reply, {:error, :not_requested}, state}
+
+  def handle_call(:spawned, _from, %{identity: nil} = state),
+    do: {:reply, {:error, :pending}, state}
+
+  def handle_call(:spawned, _from, state), do: {:reply, {:ok, state.identity}, state}
 
   @impl true
   def handle_info({port, {:data, <<tag, payload::binary>>}}, %{port: port} = state) do
@@ -210,6 +247,7 @@ defmodule Forcola.Daemon do
   ## Option validation
 
   defp validate_opts!(opts) do
+    Shim.validate_spawn_identity!(opts)
     Shim.reject_run_options!(opts, __MODULE__)
 
     if Keyword.has_key?(opts, :timeout_ms) do
@@ -326,11 +364,25 @@ defmodule Forcola.Daemon do
     cond do
       tag == Shim.tag_stdout() -> emit(state, :stdout, payload)
       tag == Shim.tag_stderr() -> emit(state, :stderr, payload)
+      tag == Shim.tag_spawned() -> record_identity(state, payload)
       tag == Shim.tag_exit() -> handle_exit(state, payload)
       tag == Shim.tag_error() -> %{state | exit: {:spawn_error, Shim.decode_error(payload)}}
       true -> state
     end
   end
+
+  defp record_identity(%{identity_enabled: true, identity: nil} = state, payload) do
+    case Shim.decode_identity(payload) do
+      {:ok, identity} ->
+        send(state.owner, {:forcola_spawned, self(), identity})
+        %{state | identity: identity}
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp record_identity(state, _payload), do: state
 
   defp handle_exit(state, payload) do
     if Shim.decode_contained(payload) do
@@ -388,11 +440,11 @@ defmodule Forcola.Daemon do
 
   # The child may still be running: kill the group and wait for the
   # shim's EXIT frame (the shim confirms group death before sending it).
-  defp shutdown(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms}) do
+  defp shutdown(%{port: port, exit: nil, kill_grace_ms: kill_grace_ms} = state) do
     confirmation =
       try do
         Shim.send_frame(port, Shim.tag_kill())
-        await_exit(port, kill_grace_ms + @backstop_margin_ms)
+        await_exit(state, kill_grace_ms + @backstop_margin_ms)
       catch
         # The port raced us shut (shim already gone); its death killed the
         # group by the shim's stdin-EOF rule, so there is nothing to wait on.
@@ -409,12 +461,12 @@ defmodule Forcola.Daemon do
     close_port(port)
   end
 
-  defp await_exit(port, timeout_ms) do
+  defp await_exit(state, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    do_await_exit(port, deadline)
+    do_await_exit(state, deadline)
   end
 
-  defp do_await_exit(port, deadline) do
+  defp do_await_exit(%{port: port} = state, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     receive do
@@ -422,7 +474,8 @@ defmodule Forcola.Daemon do
         cond do
           tag == Shim.tag_exit() -> exit_confirmation(payload)
           tag == Shim.tag_error() -> :ok
-          true -> do_await_exit(port, deadline)
+          tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
+          true -> do_await_exit(state, deadline)
         end
 
       {^port, {:exit_status, _status}} ->

@@ -37,9 +37,12 @@
 //!   0x06 STDERR_CREDIT  same payload, for the separately gated stderr pump
 //!
 //!   0x07 HELLO   optional first frame, before SPAWN; no child runs yet
+//!                Empty payload queries capabilities without selecting new
+//!                frames. JSON {features: ["spawn_identity_v1"]} selects
+//!                features explicitly; unsupported selections fail closed.
 //!
 //! shim -> BEAM:
-//!   0x15 HELLO   JSON {protocol: 1, features: ["bounded_run_v1"]}
+//!   0x15 HELLO   JSON {protocol: 1, features: ["bounded_run_v1", ...]}
 //!                Confirms strict credit drain, env replacement and INT grace.
 //!                An old shim rejects HELLO rather than ignoring SPAWN keys.
 //!   0x11 STDOUT  payload: bytes from the child's stdout
@@ -47,10 +50,20 @@
 //!   0x13 EXIT    payload: JSON {status | signal, timed_out, confirmed,
 //!                               contained, output_truncated}
 //!   0x14 ERROR   payload: JSON {reason} (spawn failure etc.)
+//!   0x16 SPAWNED JSON {pid, pgid, start_time}, before any output and only
+//!                with spawn_identity_v1 selected. start_time is tagged:
+//!                Linux {kind: "linux", boot_id: string, ticks: integer}
+//!                macOS {kind: "macos", seconds: integer, microseconds: integer}
+//!                Linux ticks are /proc/<pid>/stat field 22 since boot;
+//!                macOS uses the native process-start timeval. Compare every
+//!                field when checking identity, including the Linux boot id.
+//!   0x17         reserved for future TRACKED frames with the same identity
+//!                payload and a separate capability selection.
 
 mod cgroup;
 mod credit;
 mod frame;
+mod identity;
 mod privdrop;
 mod protocol;
 mod supervisor;

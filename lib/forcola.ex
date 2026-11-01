@@ -89,6 +89,17 @@ defmodule Forcola do
       inherited environment before applying `:env`, including when it is empty.
       Supply an absolute executable path when clearing PATH.
     * `:merge_stderr` - route stderr into stdout; default `false`.
+    * `:spawn_identity` - request the child's PID, process group ID, and
+      native start time, default `false`. The shim reports identity before
+      output; `Forcola.Result` retains it in `:pid`, `:pgid`, and
+      `:start_time`, including in partial results. See that module for the
+      platform-specific start-time fields. This requires a negotiated
+      `spawn_identity_v1` capability on macOS or Linux and fails before
+      SPAWN with an incompatible shim. Negotiation counts toward
+      `:timeout_ms`, which must be an integer in `0..4_294_967_295`.
+      Identity alone keeps the legacy output and spawn-error behavior.
+      Without the option, identity fields are `nil` and no identity frame
+      is requested. An identity does not prove that the process remains alive.
     * `:output_observer` - optional `{local_pid, reference}` receiving
       `{reference, {:stdout, bytes}}` and `{reference, {:stderr, bytes}}`
       as raw output frames arrive. Notifications are sent by the collector
