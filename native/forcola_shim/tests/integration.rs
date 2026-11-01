@@ -6,6 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const TAG_SPAWN: u8 = 0x01;
+const TAG_STDIN: u8 = 0x02;
 const TAG_KILL: u8 = 0x04;
 
 const TAG_STDOUT: u8 = 0x11;
@@ -468,6 +469,140 @@ fn stdin_eof_kills_the_group() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(!alive, "grandchild pid {grandchild_pid} survived stdin EOF");
+
+    let _ = child.wait();
+}
+
+/// Feeds a child that never reads stdin far more than the OS pipe buffer
+/// holds (64 KiB on Linux and macOS). Before #111 the supervision thread
+/// blocked in that write and every cleanup path waited behind it until the
+/// child's own exit.
+fn feed_unread_stdin<W: Write>(stdin: &mut W) {
+    let chunk = vec![b'x'; 8192];
+    for _ in 0..32 {
+        write_frame(stdin, TAG_STDIN, &chunk);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+#[test]
+fn kill_reaches_a_child_that_stopped_reading_stdin() {
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &spawn_payload(&["sleep", "30"], None, Some(200), false),
+    );
+    feed_unread_stdin(&mut stdin);
+
+    let start = Instant::now();
+    write_frame(&mut stdin, TAG_KILL, b"");
+    let (_out, exit_frame) = drain_until_exit(&mut stdout);
+    let elapsed = start.elapsed();
+
+    let exit_frame = exit_frame.expect("expected an EXIT frame");
+    let report: serde_json::Value = serde_json::from_slice(&exit_frame.payload).unwrap();
+    assert_eq!(report["confirmed"], true);
+    assert_eq!(report["timed_out"], false);
+    assert!(
+        report["signal"].is_number(),
+        "child should have died from the group signal, not its own exit: {report}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "KILL waited behind unread stdin: {elapsed:?}"
+    );
+
+    let _ = child.wait();
+}
+
+#[test]
+fn timeout_fires_while_a_child_has_stopped_reading_stdin() {
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &spawn_payload(&["sleep", "30"], Some(300), Some(200), false),
+    );
+    let start = Instant::now();
+    feed_unread_stdin(&mut stdin);
+
+    let (_out, exit_frame) = drain_until_exit(&mut stdout);
+    let elapsed = start.elapsed();
+
+    let exit_frame = exit_frame.expect("expected an EXIT frame");
+    let report: serde_json::Value = serde_json::from_slice(&exit_frame.payload).unwrap();
+    assert_eq!(report["timed_out"], true);
+    assert_eq!(report["confirmed"], true);
+    assert!(
+        report["signal"].is_number(),
+        "a timeout must report the kill, not a normal exit: {report}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "timeout waited behind unread stdin: {elapsed:?}"
+    );
+
+    let _ = child.wait();
+}
+
+#[test]
+fn stdin_eof_kills_a_child_that_stopped_reading_stdin() {
+    let mut child = start_shim();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    // The shell reports its pid, then becomes sleep under the same pid.
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &spawn_payload(
+            &["sh", "-c", "echo $$; exec sleep 30"],
+            None,
+            Some(200),
+            false,
+        ),
+    );
+    let mut stdout_bytes = Vec::new();
+    let mut pid: Option<i32> = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pid.is_none() && Instant::now() < deadline {
+        match read_frame(&mut stdout) {
+            Some(f) if f.tag == TAG_STDOUT => {
+                stdout_bytes.extend_from_slice(&f.payload);
+                let text = String::from_utf8_lossy(&stdout_bytes);
+                if let Some(line) = text.lines().next() {
+                    if text.contains('\n') {
+                        pid = line.trim().parse().ok();
+                    }
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    let pid = pid.expect("did not observe the child pid");
+    feed_unread_stdin(&mut stdin);
+
+    // BEAM death: a raw close with no EOF or KILL frame.
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut alive = true;
+    while Instant::now() < deadline {
+        alive = unsafe { libc_kill(pid, 0) == 0 };
+        if !alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!alive, "child {pid} survived stdin EOF behind unread input");
 
     let _ = child.wait();
 }

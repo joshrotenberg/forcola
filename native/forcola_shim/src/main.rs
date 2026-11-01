@@ -33,7 +33,10 @@
 //!                               interrupt_signal, interrupt_grace_ms}
 //!                env values are strings to set or null to remove a variable.
 //!                env_mode replace clears inheritance before applying env.
-//!   0x02 STDIN   payload: bytes for the child's stdin (duplex mode)
+//!   0x02 STDIN   payload: bytes for the child's stdin (duplex mode). Written
+//!                by a dedicated thread; input a non-reading child has not
+//!                consumed is held by the shim without bound on the default
+//!                path, so KILL, timeout and EOF handling never wait on it.
 //!   0x03 EOF     close the child's stdin
 //!   0x04 KILL    kill the group now
 //!   0x05 CREDIT  payload: 8-byte big-endian byte count; grants the stdout
