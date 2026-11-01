@@ -185,6 +185,34 @@ defmodule Forcola.DuplexTest do
       refute alive?(grandchild), "grandchild survived close (group kill failed)"
     end
 
+    test "close reaches a child that stopped reading stdin" do
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sleep", "30"], kill_grace_ms: 200, spawn_identity: true)
+
+      pid =
+        receive do
+          {:forcola_spawned, ^session, %{pid: pid}} -> Integer.to_string(pid)
+        after
+          5_000 -> flunk("no spawn identity")
+        end
+
+      # Far more than the OS pipe buffer holds; sleep never reads any of it.
+      line = String.duplicate("x", 8191)
+      for _ <- 1..128, do: :ok = Forcola.Duplex.send_line(session, line)
+      Process.sleep(200)
+
+      started = System.monotonic_time(:millisecond)
+
+      assert {:ok, %Forcola.Duplex.Terminal{status: {:signal, 15}, confirmation: :confirmed}} =
+               Forcola.Duplex.shutdown(session)
+
+      # Settled by the kill itself, not by the cleanup backstop (grace plus
+      # five seconds), which is where the unread input used to leave it.
+      assert System.monotonic_time(:millisecond) - started < 3_000
+      refute alive?(pid), "child survived shutdown behind unread stdin"
+      Forcola.Duplex.forget_terminal(session)
+    end
+
     test "owner death kills the group", %{tmp_dir: tmp_dir} do
       pid_file = Path.join(tmp_dir, "pids")
       script = ~S(sleep 60 & echo "$$ $!" > "$PID_FILE"; echo ready; while read l; do :; done)

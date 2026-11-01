@@ -85,6 +85,11 @@ defmodule Forcola.Duplex do
   the port closes, the shim sees stdin EOF, and the group is killed
   anyway.
 
+  A child that has stopped reading its stdin cannot delay any of this. The
+  shim writes input from a dedicated thread; without `track_descendants`,
+  input the child has not read is buffered by the shim without bound, so the
+  owner controls how much it sends.
+
   For CLIs that exit when their stdin closes, `send_eof/1` closes the
   child's stdin without killing anything; the child's own exit then
   arrives as a `:forcola_exit` message.

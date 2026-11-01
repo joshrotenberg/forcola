@@ -297,7 +297,7 @@ where
     // can forward STDIN frames and close it on EOF frames. For the pty path,
     // stdin and stdout share the master fd; we write STDIN frames to the
     // master and read child output from it.
-    let mut child_stdin: Option<Box<dyn Write + Send>>;
+    let child_stdin: Option<Box<dyn Write + Send>>;
     let mut pumps = 0;
 
     match pty_master {
@@ -360,12 +360,7 @@ where
         }
     }
 
-    let (tracked_input, input_sender) = if tracker.is_some() {
-        let (input, sender) = TrackedInput::new(child_stdin.take());
-        (Some(input), Some(sender))
-    } else {
-        (None, None)
-    };
+    let (input, input_sender) = ChildInput::new(child_stdin, tracker.is_some());
     spawn_stdin_reader(stdin, tx.clone(), input_sender);
     // Tracked runs keep the exited root unreaped until cleanup finishes. Its
     // identity still authorizes group signals to unsampled same-group members.
@@ -385,7 +380,7 @@ where
         &rx,
         pgid,
         kill_grace,
-        &mut child_stdin,
+        input,
         &out,
         pumps,
         &pump_done_rx,
@@ -397,7 +392,6 @@ where
         tracker,
         tx,
         tracked_child,
-        tracked_input,
         peer.as_ref(),
     );
 
@@ -898,27 +892,28 @@ fn pump_gated<P: Read, W: Write>(
 }
 
 /// Reads protocol frames off the shim's stdin and forwards them as
-/// `Event`s. Clean EOF is reported as `Event::StdinClosed`.
+/// `Event`s. Clean EOF is reported as `Event::StdinClosed`. Child input and
+/// its EOF never reach the supervision loop: a blocking write there would
+/// stall KILL, timeout and BEAM-death handling behind a child that stopped
+/// reading (#111).
 fn spawn_stdin_reader<R: Read + Send + 'static>(
     mut stdin: R,
     tx: Sender<Event>,
-    mut tracked_input: Option<TrackedInputSender>,
+    mut input: ChildInputSender,
 ) {
     thread::spawn(move || loop {
         match frame::read_frame(&mut stdin) {
             Ok(Some(f)) => {
-                if let Some(input) = tracked_input.as_mut() {
-                    match f.tag {
-                        TAG_STDIN => {
-                            input.send(f.payload);
-                            continue;
-                        }
-                        TAG_EOF => {
-                            input.sender = None;
-                            continue;
-                        }
-                        _ => {}
+                match f.tag {
+                    TAG_STDIN => {
+                        input.send(f.payload);
+                        continue;
                     }
+                    TAG_EOF => {
+                        input.finish();
+                        continue;
+                    }
+                    _ => {}
                 }
                 if tx.send(Event::Stdin(f)).is_err() {
                     return;
@@ -1002,27 +997,57 @@ fn spawn_timeout_timer(timeout_ms: u64, tx: Sender<Event>) {
     });
 }
 
-/// A separate writer keeps blocked child input outside the tracking loop.
-/// The protocol reader blocks on this bounded queue, applying the same upstream
-/// backpressure as the default write path instead of terminating a slow child.
-struct TrackedInput {
+/// A dedicated writer keeps a blocked child-stdin write out of both
+/// supervision loops, so KILL, the timeout timer and BEAM-death EOF are
+/// handled while a child that stopped reading keeps its pipe full.
+///
+/// The two paths differ in what happens to the protocol reader meanwhile.
+/// The default path queues input without bound, so the reader never blocks
+/// and the KILL, EOF and CREDIT frames queued behind unread input always
+/// reach the loop; the shim holds what the child has not read, and the owner
+/// controls how much it sends. The tracking path keeps one frame queued and
+/// lets the reader wait for space, as #110 designed: its loop detects a
+/// closed peer through the output pipe instead.
+struct ChildInput {
     closed: Arc<AtomicBool>,
 }
 
-struct TrackedInputSender {
-    sender: Option<SyncSender<Vec<u8>>>,
+struct ChildInputSender {
+    sender: Option<InputQueue>,
     closed: Arc<AtomicBool>,
 }
 
-impl TrackedInput {
-    fn new(writer: Option<Box<dyn Write + Send>>) -> (Self, TrackedInputSender) {
+enum InputQueue {
+    Bounded(SyncSender<Vec<u8>>),
+    Unbounded(Sender<Vec<u8>>),
+}
+
+impl InputQueue {
+    fn send(&self, bytes: Vec<u8>) -> bool {
+        match self {
+            InputQueue::Bounded(sender) => sender.send(bytes).is_ok(),
+            InputQueue::Unbounded(sender) => sender.send(bytes).is_ok(),
+        }
+    }
+}
+
+impl ChildInput {
+    fn new(writer: Option<Box<dyn Write + Send>>, bounded: bool) -> (Self, ChildInputSender) {
         let closed = Arc::new(AtomicBool::new(false));
         let sender = writer.map(|mut writer| {
-            // At most one frame waits behind the in-progress write. The frame
-            // reader itself, not the supervision loop, waits for queue space.
-            let (sender, input) = mpsc::sync_channel::<Vec<u8>>(1);
+            let (sender, input) = if bounded {
+                let (sender, input) = mpsc::sync_channel::<Vec<u8>>(1);
+                (InputQueue::Bounded(sender), input)
+            } else {
+                let (sender, input) = mpsc::channel::<Vec<u8>>();
+                (InputQueue::Unbounded(sender), input)
+            };
             let cancelled = Arc::clone(&closed);
             thread::spawn(move || {
+                // Dropping `writer` on exit closes the child's stdin. After an
+                // EOF frame the sender is gone, so queued input is flushed
+                // first; after cleanup starts, the rest is discarded. A write
+                // in progress returns once the child's end of the pipe closes.
                 while let Ok(bytes) = input.recv() {
                     if cancelled.load(Ordering::Acquire) || writer.write_all(&bytes).is_err() {
                         break;
@@ -1035,16 +1060,17 @@ impl TrackedInput {
             Self {
                 closed: Arc::clone(&closed),
             },
-            TrackedInputSender { sender, closed },
+            ChildInputSender { sender, closed },
         )
     }
 
+    /// Stop forwarding input: cleanup has started or the child is gone.
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
     }
 }
 
-impl TrackedInputSender {
+impl ChildInputSender {
     fn send(&mut self, bytes: Vec<u8>) {
         if self.closed.load(Ordering::Acquire) {
             self.sender = None;
@@ -1052,10 +1078,16 @@ impl TrackedInputSender {
         if self
             .sender
             .as_ref()
-            .is_some_and(|sender| sender.send(bytes).is_err())
+            .is_some_and(|sender| !sender.send(bytes))
         {
             self.sender = None;
         }
+    }
+
+    /// An EOF frame: no more input. The writer closes the pipe once queued
+    /// input has been written.
+    fn finish(&mut self) {
+        self.sender = None;
     }
 }
 
@@ -1063,7 +1095,7 @@ impl TrackedInputSender {
 fn supervise_tracked<W: Write + Send + 'static>(
     rx: &Receiver<Event>,
     kill_grace: Duration,
-    input: TrackedInput,
+    input: ChildInput,
     mut child: Child,
     out: &Arc<Mutex<W>>,
     pumps: usize,
@@ -1286,7 +1318,7 @@ fn supervise<W: Write + Send + 'static>(
     rx: &Receiver<Event>,
     pgid: Pid,
     kill_grace: Duration,
-    child_stdin: &mut Option<Box<dyn Write + Send>>,
+    input: ChildInput,
     out: &Arc<Mutex<W>>,
     pumps: usize,
     pump_done: &Receiver<()>,
@@ -1298,14 +1330,13 @@ fn supervise<W: Write + Send + 'static>(
     tracker: Option<Tracker>,
     events: Sender<Event>,
     tracked_child: Option<Child>,
-    tracked_input: Option<TrackedInput>,
     peer: Option<&PeerMonitor>,
 ) -> bool {
     if let Some(tracker) = tracker {
         return supervise_tracked(
             rx,
             kill_grace,
-            tracked_input.expect("tracking input is initialized before its reader"),
+            input,
             tracked_child.expect("tracking retains the root until cleanup finishes"),
             out,
             pumps,
@@ -1333,16 +1364,9 @@ fn supervise<W: Write + Send + 'static>(
 
     let outcome = loop {
         match rx.recv() {
-            Ok(Event::Stdin(f)) if f.tag == TAG_STDIN => {
-                if let Some(w) = child_stdin.as_mut() {
-                    let _ = w.write_all(&f.payload);
-                }
-            }
-            Ok(Event::Stdin(f)) if f.tag == TAG_EOF => {
-                *child_stdin = None; // drop closes the pipe
-            }
             Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
                 discard_output = true;
+                input.close();
                 if !group_cleanup_started {
                     group_cleanup_started = true;
                     group_confirmed = kill_group(pgid, kill_grace, cgroup, interrupt_grace);
@@ -1368,6 +1392,7 @@ fn supervise<W: Write + Send + 'static>(
             Ok(Event::TrackingWriteFailed | Event::ChildWaitFailed) => {}
             Ok(Event::StdinClosed) => {
                 discard_output = true;
+                input.close();
                 // The BEAM is gone. Kill the group; keep waiting for the
                 // real exit event from the waiter thread so we reap the
                 // child properly, but there's no one left to report to.
@@ -1379,6 +1404,7 @@ fn supervise<W: Write + Send + 'static>(
             }
             Ok(Event::StdinError(e)) => {
                 discard_output = true;
+                input.close();
                 eprintln!("forcola_shim: stdin read error, treating as BEAM death: {e}");
                 beam_gone = true;
                 if !group_cleanup_started {
@@ -1389,12 +1415,14 @@ fn supervise<W: Write + Send + 'static>(
             Ok(Event::TimedOut) => {
                 discard_output = true;
                 timed_out = true;
+                input.close();
                 if !group_cleanup_started {
                     group_cleanup_started = true;
                     group_confirmed = kill_group(pgid, kill_grace, cgroup, interrupt_grace);
                 }
             }
             Ok(Event::ChildExited(outcome)) => {
+                input.close();
                 // The direct child can exit after starting background work that
                 // remains in its process group. Reaping the leader alone does
                 // not terminate those descendants: they are reparented to pid
@@ -2295,7 +2323,7 @@ mod tests {
                 .unwrap();
             // No waiter notification follows. Deadline cleanup must collect
             // the actual status itself rather than serializing two nulls.
-            let (input, _sender) = super::TrackedInput::new(None);
+            let (input, _sender) = super::ChildInput::new(None, true);
             let (_pump_sender, pumps) = std::sync::mpsc::channel();
             let output = Arc::new(Mutex::new(Vec::new()));
             assert!(!super::supervise_tracked(
