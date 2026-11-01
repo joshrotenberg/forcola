@@ -41,7 +41,7 @@ defmodule Forcola.SpawnErrorTest do
     refute File.exists?(Path.join(dir, "executed"))
   end
 
-  test "required cgroup setup failures are typed in every mode", %{tmp_dir: dir} do
+  test "required cgroups report setup failures or confirmed containment", %{tmp_dir: dir} do
     case Forcola.run(["/bin/true"], timeout_ms: 5_000, cgroup: :required) do
       {:error, {:spawn, _reason}} ->
         for mode <- @modes do
@@ -53,8 +53,10 @@ defmodule Forcola.SpawnErrorTest do
 
         refute File.exists?(Path.join(dir, "executed"))
 
-      {:ok, _result} ->
-        IO.puts("SKIP unavailable cgroup setup: this host has a delegated cgroup")
+      {:ok, result} ->
+        assert result.status == 0
+        assert result.evidence.scope == :active_cgroup
+        assert result.evidence.cleanup == :confirmed
     end
   end
 
@@ -274,7 +276,7 @@ defmodule Forcola.SpawnErrorTest do
              Shim.decode_error(payload, true)
   end
 
-  test "malformed structured errors are rejected without guessing from the message" do
+  test "malformed structured errors retain the legacy reason without guessing details" do
     detail = %{stage: "cwd", reason: "enoent", errno: 2, path: "/missing"}
 
     for invalid <- [
@@ -289,12 +291,38 @@ defmodule Forcola.SpawnErrorTest do
                json(%{reason: "spawn failed: ENOENT", spawn_error: invalid}),
                true
              ) ==
-               :invalid_error
+               "spawn failed: ENOENT"
     end
 
     assert Shim.decode_error("{broken", true) == :invalid_error
     assert Shim.decode_error(json(%{reason: 1}), true) == :invalid_error
     assert Shim.decode_error(json(%{reason: "legacy"})) == "legacy"
+  end
+
+  test "malformed details preserve the original reason in every mode", %{tmp_dir: dir} do
+    shim = fake_shim(dir, "malformed_details")
+
+    for mode <- @modes, structured? <- [false, true] do
+      assert mode_error(mode, ["unused"],
+               structured_spawn_errors: structured?,
+               shim_path: shim
+             ) == "original spawn failure"
+    end
+  end
+
+  test "unreadable frames and invalid reasons surface invalid_error in every mode", %{
+    tmp_dir: dir
+  } do
+    for fixture_mode <- ["malformed_frame", "invalid_reason"] do
+      shim = fake_shim(dir, fixture_mode)
+
+      for mode <- @modes, structured? <- [false, true] do
+        assert mode_error(mode, ["unused"],
+                 structured_spawn_errors: structured?,
+                 shim_path: shim
+               ) == :invalid_error
+      end
+    end
   end
 
   test "invalid options raise before a shim is opened" do

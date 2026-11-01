@@ -597,8 +597,9 @@ Each mode keeps its existing error envelope:
 Without the option, callers continue to receive the existing error string and
 the shim sends the original ERROR payload. Negotiated payloads retain that
 string alongside the structured details. Protocol and handshake errors remain
-separate from typed spawn failures. No SPAWNED frame is emitted for a failed
-spawn.
+separate from typed spawn failures. Malformed structured details fall back to a
+valid legacy reason. Unreadable ERROR frames or invalid top-level reasons
+return `:invalid_error`. No SPAWNED frame is emitted for a failed spawn.
 
 ## Record process identity
 

@@ -629,19 +629,27 @@ defmodule Forcola.Shim do
 
   When structured errors were negotiated, native spawn details become a
   `Forcola.SpawnError` containing the original string in `:message`.
-  Plain protocol errors remain strings. Malformed reports return
-  `:invalid_error` without guessing a stage or reason.
+  Plain protocol errors remain strings. Malformed structured details fall
+  back to the valid legacy reason. An unreadable frame or an invalid
+  top-level reason returns `:invalid_error` without guessing a reason.
   """
   @spec decode_error(binary(), boolean()) :: String.t() | Forcola.SpawnError.t() | :invalid_error
   def decode_error(payload, structured? \\ false) do
     case decode_json(payload) do
       {:ok, %{"reason" => reason} = report} when is_binary(reason) ->
         if structured? and Map.has_key?(report, "spawn_error"),
-          do: Forcola.SpawnError.from_report(report["spawn_error"], reason),
+          do: decode_spawn_error(report["spawn_error"], reason),
           else: reason
 
       _ ->
         :invalid_error
+    end
+  end
+
+  defp decode_spawn_error(report, reason) do
+    case Forcola.SpawnError.from_report(report, reason) do
+      :invalid_error -> reason
+      error -> error
     end
   end
 end

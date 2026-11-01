@@ -385,29 +385,11 @@ fn spawn_child(
     // std performs current_dir before pre_exec, hiding which syscall failed.
     // With structured reporting, perform the same chdir in our child hook and
     // report its actual errno. Legacy spawning retains std's original path.
-    let cwd = if structured {
-        request
-            .cd
-            .as_ref()
-            .map(|cd| {
-                CString::new(cd.as_bytes()).map_err(|_| {
-                    SpawnFailure::new(
-                        Stage::Cwd,
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "nul byte found in provided data",
-                        ),
-                        Some(cd.clone()),
-                    )
-                })
-            })
-            .transpose()?
-    } else {
+    if !structured {
         if let Some(cd) = &request.cd {
             cmd.current_dir(cd);
         }
-        None
-    };
+    }
     if request.env_mode == EnvMode::Replace {
         cmd.env_clear();
     }
@@ -453,6 +435,29 @@ fn spawn_child(
         (Some(reader), Some(reporter))
     } else {
         (None, None)
+    };
+    // std defers reporting invalid current_dir bytes until spawn, after our
+    // parent-side setup. Convert here to preserve that failure precedence
+    // when account resolution, required cgroup preparation or pty setup fails.
+    let cwd = if structured {
+        request
+            .cd
+            .as_ref()
+            .map(|cd| {
+                CString::new(cd.as_bytes()).map_err(|_| {
+                    SpawnFailure::new(
+                        Stage::Cwd,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "nul byte found in provided data",
+                        ),
+                        Some(cd.clone()),
+                    )
+                })
+            })
+            .transpose()?
+    } else {
+        None
     };
     let setup = ChildSetup {
         cwd,

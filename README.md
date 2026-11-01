@@ -180,7 +180,7 @@ BEAM <--stdin/stdout pipes--> forcola_shim <--forks--> child (own process group)
 The [getting started guide](https://hexdocs.pm/forcola/getting_started.html) has a runnable example,
 options, and return/message shapes for each mode.
 
-## Process groups and cleanup
+## Spawn errors
 
 Pass `structured_spawn_errors: true` in any mode to distinguish a missing
 working directory from a missing executable, permission failures, credential
@@ -189,6 +189,8 @@ changes, and cgroup failures. Errors carry a `%Forcola.SpawnError{}` with
 capability negotiation; callers that leave it disabled keep string errors.
 See the [spawn error guide](https://hexdocs.pm/forcola/getting_started.html#distinguish-spawn-failures)
 for each mode's error shape.
+
+## Process groups and cleanup
 
 Pass `spawn_identity: true` to record the child's OS identity. One-shot
 results include `pid`, `pgid`, and `start_time`; Duplex sends

@@ -129,8 +129,9 @@ defmodule Forcola.Duplex do
 
     `:spawn_error` retains the native failure reason when `:cause` is
     `:spawn_error`: a `Forcola.SpawnError` when structured errors were
-    requested, otherwise the legacy string. Malformed reports use
-    `:invalid_error`; other terminal causes leave the field `nil`.
+    requested, otherwise the legacy string. Malformed structured details
+    retain a valid legacy reason. Unreadable frames or invalid top-level
+    reasons use `:invalid_error`; other terminal causes leave the field `nil`.
     This also exposes failures in pull mode, which sends no exit message,
     and when shutdown consumes the failure before normal frame handling.
     """

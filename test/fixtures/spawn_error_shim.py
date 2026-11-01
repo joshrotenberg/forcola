@@ -16,12 +16,23 @@ def read_frame():
 
 
 def frame(tag, payload):
-    data = bytes([tag]) + json.dumps(payload).encode()
+    if not isinstance(payload, bytes):
+        payload = json.dumps(payload).encode()
+    data = bytes([tag]) + payload
     sys.stdout.buffer.write(struct.pack(">I", len(data)) + data)
     sys.stdout.buffer.flush()
 
 
 def error():
+    if MODE == "malformed_details":
+        frame(0x14, {"reason": "original spawn failure", "spawn_error": {}})
+        return
+    if MODE == "malformed_frame":
+        frame(0x14, b"{broken")
+        return
+    if MODE == "invalid_reason":
+        frame(0x14, {"reason": 42})
+        return
     frame(0x14, {
         "reason": "spawn failed: Permission denied (os error 13)",
         "spawn_error": {

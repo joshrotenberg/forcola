@@ -183,6 +183,55 @@ fn cwd_exec_and_privdrop_failures_have_typed_reasons_on_pipes_and_ptys() {
 }
 
 #[test]
+fn nul_cwd_preserves_parent_setup_failure_precedence_on_pipes_and_ptys() {
+    let cwd = "nul\0directory";
+    for pty in [false, true] {
+        for (extra, stage, reason, path) in [
+            (json!({}), "cwd", "invalid_input", Some(cwd)),
+            (
+                json!({"user":"forcola-no-such-account-103"}),
+                "privdrop",
+                "not_found",
+                None,
+            ),
+            (
+                json!({"user":"forcola-no-such-account-103","cgroup":"required"}),
+                "privdrop",
+                "not_found",
+                None,
+            ),
+        ] {
+            let mut request = json!({"argv":["/bin/echo","never"],"cd":cwd,"pty":pty});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let legacy = failed(request.clone(), None);
+            let report = failed(request, Some(&["structured_spawn_errors_v1"]));
+            assert_eq!(report["reason"], legacy["reason"]);
+            assert_eq!(report["spawn_error"]["stage"], stage);
+            assert_eq!(report["spawn_error"]["reason"], reason);
+            assert!(report["spawn_error"]["errno"].is_null());
+            assert_eq!(report["spawn_error"]["path"], json!(path));
+        }
+
+        let request = json!({"argv":["/bin/echo","never"],"cd":cwd,"pty":pty,"cgroup":"required"});
+        let legacy = failed(request.clone(), None);
+        let report = failed(request, Some(&["structured_spawn_errors_v1"]));
+        assert_eq!(report["reason"], legacy["reason"]);
+        // Required cgroups always fail in parent setup off Linux. On Linux a
+        // delegated hierarchy can prepare successfully, reaching the NUL cwd.
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(report["spawn_error"]["stage"], "cgroup");
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            report["spawn_error"]["stage"].as_str(),
+            Some("cgroup" | "cwd")
+        ));
+    }
+}
+
+#[test]
 fn actual_child_privilege_drop_failure_is_attributed() {
     for pty in [false, true] {
         // gid_t(-1) is invalid for setgid, including when the tests run as root.
