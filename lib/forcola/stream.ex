@@ -680,13 +680,14 @@ defmodule Forcola.Stream do
      )}
   end
 
+  # Every EXIT frame decodes (see Tracking.report/2), so the exit clause above
+  # covers it and only the three non-report outcomes remain here.
   defp cleanup_evidence(result, state) do
     confirmation =
       case result do
         :timeout -> :timeout
         :error -> :not_started
         :shim_exited -> :transport_lost
-        _ -> :unconfirmed
       end
 
     evidence = %{
