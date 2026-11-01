@@ -126,7 +126,7 @@ recipient's mailbox indefinitely; notifications remain unacknowledged.
 `result.evidence` keeps raw `child_status` and `child_signal`, `termination`,
 `reason`, `output_truncated`, `cleanup`, `scope`, and `guard_close` independent
 of the legacy status. Only explicit valid EXIT evidence confirms cleanup.
-Strict drain waits for pipe closure after root exit. An escaped descendant
+Strict drain waits for pipe closure after root exit. Without descendant tracking, an escaped descendant
 holding a pipe can cause `reason: :timeout` or `:idle_timeout` even with
 `child_status: 0`; wrappers must consume those facts independently.
 `:process_group` confirmation never proves whole-tree containment. Early JSON
@@ -156,7 +156,8 @@ running.
 ## The design
 
 A port program, not a NIF: the shim is a separate OS process, so a bug in it
-cannot crash the BEAM, and BEAM death reaches it as stdin EOF.
+cannot crash the BEAM. BEAM death closes the protocol pipes; tracking also
+checks for peer hang-up independently of stdin reads.
 
 ```text
 BEAM <--stdin/stdout pipes--> forcola_shim <--forks--> child (own process group)
@@ -173,8 +174,11 @@ BEAM <--stdin/stdout pipes--> forcola_shim <--forks--> child (own process group)
   `{:error, {:timeout, partial_result}}` with output captured so far, and
   the group is confirmed dead before the call returns (or the result is
   explicitly marked `{:signal, :unconfirmed}`).
-- If the BEAM dies, even by `kill -9`, the shim sees stdin EOF and kills the
-  group before exiting.
+- If the BEAM dies, even by `kill -9`, protocol EOF triggers cleanup. Tracking
+  also detects pipe hang-up while child stdin is blocked. The untracked path
+  writes child stdin synchronously, so a child refusing input can delay EOF,
+  KILL and timer handling until that write completes. See the
+  [process groups guide](https://hexdocs.pm/forcola/process_groups.html#beam-death-as-stdin-eof).
 - Shim binaries ship precompiled per target via GitHub Releases with SHA256
   verification. Consumers need no Rust, C, or C++ toolchain.
 
@@ -214,9 +218,31 @@ The [identity example](https://hexdocs.pm/forcola/getting_started.html#record-pr
 shows how to record a Duplex child's identity before sending input.
 
 The group kill covers the child and everything it keeps in its process group:
-ordinary grandchildren die with the command. Deliberate daemonizers (double-fork
-plus `setsid`) leave the group; on Linux the opt-in `cgroup: true` layer
-contains them when active; `cgroup: :required` refuses to execute without it.
+ordinary grandchildren die with the command. Pass `track_descendants: true` in
+any mode to discover descendants that leave the group and apply the same
+INT/TERM/KILL sequence to their recorded groups on every cleanup path. Linux
+uses a child subreaper and reports `:tree_contained`; macOS samples the tree
+and reports `:tree_sampled`. A macOS descendant reparented before any sample
+can escape. Identity checks skip reused leaders, but checking and signalling
+are not atomic.
+
+An optional `track_observer: {pid, reference}` enables tracking and receives
+`{reference, {:tracked, identity}}` as groups appear, starting with the root,
+and `{reference, {:tracking_exit, evidence}}`, where evidence includes `scope`,
+`confirmation`, `contained` and `tracked_groups_truncated`, when the Elixir
+process survives to report completion. Native cleanup continues
+on brutal owner or BEAM death, but no final observer event is guaranteed then.
+Run results, Duplex terminals and Stream errors retain `tracked_groups` and
+`tracked_groups_truncated`. History truncation is separate from native cleanup
+confirmation. Their cleanup evidence also exposes `contained`
+(`true`, `false` or `:unknown`) independently of the tree scope. Duplex and Daemon
+also expose `tracked/1` for polling. Tracking negotiates the
+`track_descendants_v1` capability before SPAWN and leaves defaults unchanged.
+The [tracking guide](https://hexdocs.pm/forcola/getting_started.html#track-descendant-groups)
+describes platform limits and evidence.
+
+On Linux, `cgroup: true` remains the stronger backstop when active;
+`cgroup: :required` refuses to execute without it.
 Daemon control channels like docker and work handed
 to system schedulers stay out of reach of any process-based mechanism. The
 [process groups guide](https://hexdocs.pm/forcola/process_groups.html) covers

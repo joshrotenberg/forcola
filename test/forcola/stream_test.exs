@@ -772,4 +772,39 @@ defmodule Forcola.StreamTest do
       true = :code.replace_path(:forcola, String.to_charlist(real_ebin))
     end
   end
+
+  describe "malformed EXIT" do
+    @tag :tmp_dir
+    test "raises unconfirmed after the lines before it, without a cleanup stall", %{
+      tmp_dir: tmp_dir
+    } do
+      shim_path = terminal_fixture(tmp_dir)
+      started = System.monotonic_time(:millisecond)
+      test_pid = self()
+
+      error =
+        assert_raise Forcola.Stream.Error, fn ->
+          ["malformed_exit"]
+          |> Forcola.Stream.lines(shim_path: shim_path, timeout_ms: 5_000, kill_grace_ms: 100)
+          |> Stream.each(&send(test_pid, {:line, &1}))
+          |> Stream.run()
+        end
+
+      assert_received {:line, "ready"}
+      assert error.status == {:signal, :unconfirmed}
+      refute error.timed_out
+      refute error.idle_timed_out
+
+      # Raised from the frame itself, not from the KILL-and-wait backstop.
+      assert System.monotonic_time(:millisecond) - started < 3_000
+    end
+  end
+
+  defp terminal_fixture(tmp_dir) do
+    source = Path.expand("../fixtures/duplex_terminal_shim.py", __DIR__)
+    destination = Path.join(tmp_dir, "duplex_terminal_shim.py")
+    File.cp!(source, destination)
+    File.chmod!(destination, 0o755)
+    destination
+  end
 end

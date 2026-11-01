@@ -231,7 +231,7 @@ order. Key properties:
 #### cgroup containment
 
 The process-group kill reaches every descendant that stays in the child's
-process group, but a target that deliberately daemonizes (double-fork plus
+process group. Without descendant tracking, a target that deliberately daemonizes (double-fork plus
 `setsid`, or a `--daemon` flag) leaves the group and survives. On Linux,
 `cgroup: true` can add a backstop: when placement succeeds, the child runs in a
 dedicated cgroup v2 cgroup. Descendants it forks inherit the cgroup, and on
@@ -261,7 +261,9 @@ Key properties:
   `Forcola.Duplex` report their exit through messages or a raise and do not
   emit it). When an EXIT report arrives, `Forcola.Duplex.Terminal.scope`
   reports `:active_cgroup` when placement was active or `:process_group` on
-  fallback. With `cgroup: :required`, the shim instead verifies placement and
+  fallback when tracking is disabled. With tracking enabled, scope instead
+  identifies `:tree_contained` on Linux or `:tree_sampled` on macOS; the native
+  `contained` flag separately records active cgroup placement. With `cgroup: :required`, the shim instead verifies placement and
   writable `cgroup.kill` before starting the child; failure takes the mode's
   normal spawn-error path, and the command never executes. Required mode is
   Linux-only. It cannot contain work that a separate daemon or scheduler owns.
@@ -702,9 +704,142 @@ empty HELLO, so inaccessible process metadata disables the feature before SPAWN.
 The probe does not guarantee later access to a child after a privilege change
 or a change in permissions. If child identity capture then fails, the shim
 kills and reaps the child, which may already have executed.
-`SPAWNED` uses tag `0x16` and the shared identity payload; `0x17` is reserved
-for the future `TRACKED` frame from descendant tracking work. Tracking is
-not enabled by selecting spawn identity.
+`SPAWNED` uses tag `0x16`. `TRACKED` uses `0x17` with the same identity payload.
+Tracking is not enabled by selecting spawn identity.
+
+## Track descendant groups
+
+Every mode accepts `track_descendants: true`. It selects the independent
+`track_descendants_v1` capability before SPAWN; a shim without working native
+identity and descendant discovery support rejects the request before executing
+the command. The option composes with spawn identity, structured spawn errors,
+environment replacement, cgroups and the cooperative interrupt sequence.
+Defaults continue to clean the original process group only.
+
+```elixir
+ref = make_ref()
+{:ok, session} = Forcola.Duplex.open(["some-tool"],
+  track_observer: {self(), ref},
+  interrupt_signal: :int,
+  interrupt_grace_ms: 1_000,
+  kill_grace_ms: 1_000)
+
+receive do
+  {^ref, {:tracked, identity}} -> RecoveryStore.record(identity)
+end
+
+{:ok, groups} = Forcola.Duplex.tracked(session)
+terminal = Forcola.Duplex.shutdown(session)
+```
+
+`track_observer: {local_pid, reference}` enables tracking, even if
+`track_descendants: false` was supplied. Notifications are unacknowledged:
+`{reference, {:tracked, identity}}` reports each retained distinct identity
+once, starting with the root group before output delivery. The identity has the same native
+`pid`, `pgid`, and `start_time` shape as SPAWNED, with `pid == pgid`.
+A process that changes groups may produce another distinct group identity. The
+native shim can report an identity again after its group was pruned and later
+reappears; Elixir deduplicates identities within its retained history.
+Receiving a notification does not pause the executable. Persist it and its
+full start time if recovery code needs it later.
+
+When the Elixir process survives to report completion, the observer receives
+one terminal event,
+`{reference, {:tracking_exit, evidence}}`. The evidence map contains `scope`,
+`confirmation`, `contained` and `tracked_groups_truncated`.
+Native EOF cleanup still runs after brutal consumer/server or BEAM death, but
+that path cannot promise a final observer event. A Duplex session surviving
+its owner's death can still report to a surviving explicit observer. This
+event reports cleanup; queued pull output can keep `Duplex.await_terminal/2`
+pending until consumption or shutdown.
+Successful Stream and Daemon execution can be observed this way without
+changing line or output delivery. Daemon never implicitly messages its
+supervisor. Tracking without an observer still performs cleanup.
+`Forcola.Result.tracked_groups`, `Forcola.Duplex.Terminal.tracked_groups` and
+`Forcola.Stream.Error.tracked_groups` retain the first 4,096 distinct group
+identities. `tracked_groups_truncated: true` records later history overflow or
+a native observation queue overflow. Discarded malformed observations or missing
+root history also mark the retained history incomplete. History truncation neither
+stops a healthy command nor changes cleanup confirmation: that comes from the
+validated native EXIT report for the live set.
+The observer receives at most the retained history; persist those observations
+if they are needed after the session is released.
+Duplex also sends `{:forcola_tracked, session, identity}` to its owner.
+`Duplex.tracked/1` retains history after natural exit until release;
+`Daemon.tracked/2` queries a live daemon, with a default 5,000 ms timeout.
+Disabled tracking returns `{:error, :not_requested}`, a closed record returns
+`{:error, :closed}`, and a daemon that cannot reply in time returns
+`{:error, :pending}`. An enabled session with no observations yet returns
+`{:ok, []}`. A paused stream consumer delays observer delivery, but native
+tracking continues independently.
+
+On Linux the shim enables `PR_SET_CHILD_SUBREAPER` before spawning, walks
+children of every thread, retains verified descendants, and discovers
+orphans adopted by the shim. It reaps adopted zombies while the command runs.
+On macOS it samples children through `proc_listchildpids`, retaining verified
+observations after reparenting. Both use a 50 ms polling interval and scan at
+the start of cleanup; inventory work adds to that interval. A macOS descendant
+that is reparented before any sample can escape; `:tree_sampled` never proves whole-tree containment. Platforms
+without these mechanisms reject the negotiated feature.
+
+The shim observes root exit without reaping it until tracked cleanup finishes.
+The retained root identity keeps its original group signalable. On macOS,
+`proc_listpids` inventories that pinned group after root exit, including ordinary
+same-group descendants that were never individually sampled. This
+preserves original-group cleanup on macOS; descendants that escape the group
+and are reparented before a sample remain outside the guarantee.
+
+Normal child exit, child SIGKILL, timeout, idle/output bounds, stream halt,
+Duplex close, Daemon shutdown/readiness failure, owner death and BEAM EOF all
+use tracking cleanup. Every verified target receives the configured interrupt
+and TERM/KILL sequence concurrently, within a shared deadline rather than one
+grace per group. A newly found target can shorten the available grace; the
+report is unconfirmed if the full sequence could not be completed. Before
+signalling a group, the shim rereads its leader's start time and group. A
+missing or mismatched leader is never used to signal that numeric group;
+retained members are checked and signalled individually. Checking identity
+and sending a POSIX signal are separate operations, so a narrow race remains.
+
+A valid tracking EXIT reports `:tree_contained` on Linux or `:tree_sampled` on
+macOS. Confirmation covers every tracked live group/member, including cleanup
+after the root has already exited. `cgroup: true` remains the stronger Linux
+backstop; `cgroup: :required` still requires placement before exec. Cgroups do
+not remove the need to reap adopted children. The native tracker retains at most
+4,096 current groups and 65,536 process records, pruning dead groups and processes
+so repeated short-lived groups do not consume a lifetime quota. A bounded stdin
+channel applies backpressure to the sender while the supervision loop continues
+sampling. A KILL frame behind blocked input waits for that input. Tracking checks
+protocol-output hang-up independently on every scan, so closing the port or
+losing the BEAM still starts cleanup even when the stdin reader is blocked. The
+native run timer also remains independent. Final guarded-port closure discards
+queued protocol input so Erlang does not keep the OS pipes open to flush it;
+the shim still performs the process kills. Strict output drain and post-EXIT
+linger check hang-up without waiting for the reader's EOF event.
+
+Backpressure can also suspend a Duplex server that is sending input. Its
+`close/1`, `shutdown/1` and owner-down handling wait behind that send until the
+server resumes. Hang-up cleanup starts when the port actually closes or the
+BEAM dies, not while a shutdown request is still queued in that server.
+
+Untracked execution writes child stdin synchronously. A child refusing input can
+block its supervision loop, delaying KILL, timer and EOF handling until the write
+completes. The independent hang-up check covers post-EXIT linger in both paths;
+it does not remove that legacy supervision limitation.
+
+A single transient metadata or child-inventory read error is retried at the next
+scan. Three consecutive incomplete scans start bounded cleanup. Invalid metadata,
+unsupported discovery, live inventory capacity exhaustion, reaping failures and
+signal failures also prevent positive confirmation and trigger cleanup where it
+has not already begun. Transport loss still triggers cleanup. History truncation
+alone does not stop the command or prevent cleanup confirmation. A valid native
+EXIT confirms the live set independently of the retained observation history;
+missing/malformed EXIT evidence or an unknown scope cannot confirm cleanup. Observer terminal confirmation is
+`:confirmed` or `:unconfirmed`, with `:not_started` for startup failure,
+`:timeout` for a missing report at the backstop, and `:transport_lost` for a
+lost shim. Missing scope is `:unknown`.
+
+Neither tracking nor cgroups reach work owned by a separate daemon or scheduler.
+See the [process groups guide](process_groups.html) for the remaining limits.
 
 ## Next steps
 
@@ -759,7 +894,9 @@ before TERM/KILL on every native termination path, including owner/VM death.
 These two options must be supplied together; the grace is a positive integer
 at most `4_294_967_295`. All modes use the existing INT, TERM, KILL sequence.
 Duplex close/shutdown, Stream halt or consumer failure, owner death, and BEAM
-death through shim stdin EOF all use it. Stream whole-run and idle timeouts,
+death through observed protocol EOF all use it. Tracking additionally detects
+hang-up independently when stdin is blocked; untracked execution has the
+blocked-input exception described in the tracking section. Stream whole-run and idle timeouts,
 Stream/Duplex output limits, and Daemon readiness timeout also use it. Duplex
 `recv/2` timeout only stops waiting, and `send_eof/1` only closes child stdin.
 

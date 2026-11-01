@@ -5,7 +5,7 @@ use crate::cgroup::{self, Cgroup};
 use crate::credit::{Credit, Permit};
 use crate::frame::{
     self, Frame, TAG_CAPABILITIES, TAG_CREDIT, TAG_EOF, TAG_ERROR, TAG_EXIT, TAG_HELLO, TAG_KILL,
-    TAG_SPAWN, TAG_SPAWNED, TAG_STDERR, TAG_STDERR_CREDIT, TAG_STDIN, TAG_STDOUT,
+    TAG_SPAWN, TAG_SPAWNED, TAG_STDERR, TAG_STDERR_CREDIT, TAG_STDIN, TAG_STDOUT, TAG_TRACKED,
 };
 use crate::identity;
 use crate::privdrop::{self, DropPlan};
@@ -13,15 +13,19 @@ use crate::protocol::{
     Capabilities, CgroupMode, EnvMode, ErrorReport, ExitReport, HelloRequest, SpawnRequest,
 };
 use crate::spawn_error::{self, ChildReporter, ReportReader, SpawnFailure, Stage};
+use crate::tracking::{self, Tracker};
 
 use rustix::process::{self, Pid, Signal};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,7 +38,9 @@ enum Event {
     StdinClosed,
     StdinError(io::Error),
     ChildExited(ChildOutcome),
+    ChildWaitFailed,
     TimedOut,
+    TrackingWriteFailed,
 }
 
 /// How the child ended, in a form ready to become an EXIT frame.
@@ -51,21 +57,112 @@ struct ChildOutcome {
 /// delay the EXIT report forever.
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
+/// Observe closure of the BEAM's read end without consuming protocol input.
+/// The protocol writer owns `fd` for longer than this monitor. Monitoring the
+/// output pipe remains possible when the reader is blocked on child stdin.
+struct PeerMonitor {
+    #[cfg(target_os = "macos")]
+    queue: OwnedFd,
+    #[cfg(not(target_os = "macos"))]
+    fd: RawFd,
+}
+
+impl PeerMonitor {
+    fn new(fd: RawFd) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let raw = unsafe { libc::kqueue() };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: kqueue returned a new descriptor owned by this monitor.
+            let queue = unsafe { OwnedFd::from_raw_fd(raw) };
+            if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let event = libc::kevent {
+                ident: fd as usize,
+                filter: libc::EVFILT_WRITE,
+                flags: libc::EV_ADD | libc::EV_ENABLE,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            if unsafe { libc::kevent(raw, &event, 1, std::ptr::null_mut(), 0, std::ptr::null()) }
+                < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { queue })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(Self { fd })
+        }
+    }
+
+    fn disconnected(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let result = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    &timeout,
+                )
+            };
+            if result < 0 {
+                return io::Error::last_os_error().kind() != io::ErrorKind::Interrupted;
+            }
+            result > 0
+                && unsafe { event.assume_init() }.flags & (libc::EV_EOF | libc::EV_ERROR) != 0
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut event = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut event, 1, 0) };
+            if result < 0 {
+                return io::Error::last_os_error().kind() != io::ErrorKind::Interrupted;
+            }
+            result > 0 && event.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+        }
+    }
+}
+
 /// Runs the shim: read one SPAWN frame, supervise the child, and keep
 /// handling protocol frames until the child has exited.
 pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
     stdin: R,
     stdout: W,
+    protocol_fd: Option<RawFd>,
 ) -> io::Result<()> {
-    run_with_capabilities(stdin, stdout, supported_features)
+    run_with_capabilities(stdin, stdout, supported_features, protocol_fd)
 }
 
-fn run_with_capabilities<R, W, F>(mut stdin: R, stdout: W, capabilities: F) -> io::Result<()>
+fn run_with_capabilities<R, W, F>(
+    mut stdin: R,
+    stdout: W,
+    capabilities: F,
+    protocol_fd: Option<RawFd>,
+) -> io::Result<()>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
     F: FnOnce() -> Vec<&'static str>,
 {
+    let peer = protocol_fd.map(PeerMonitor::new).transpose()?;
     let out = Arc::new(Mutex::new(stdout));
 
     // SPAWN is mandatory, with an optional capability request before it.
@@ -123,6 +220,18 @@ where
         return Ok(());
     }
 
+    let prepared_tracking = if selected.track_descendants {
+        match tracking::prepare() {
+            Ok(shim) => Some(shim),
+            Err(error) => {
+                write_error(&out, &format!("descendant tracking unavailable: {error}"));
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     let (mut child, pty_master, cgroup) =
         match spawn_child(&request, selected.structured_spawn_errors) {
             Ok(c) => c,
@@ -134,8 +243,10 @@ where
 
     let pgid = Pid::from_child(&child);
     let kill_grace = Duration::from_millis(request.kill_grace_ms);
+    let interrupt_grace = request.interrupt_grace_ms.map(Duration::from_millis);
 
-    if selected.spawn_identity {
+    let mut tracker = None;
+    if selected.spawn_identity || selected.track_descendants {
         // No output pumps or waiter exist yet. Fast exits remain unreaped,
         // retaining their native start time and preventing pid reuse until the
         // identity has been captured. The shared writer preserves this frame
@@ -143,18 +254,28 @@ where
         let identity = match identity::read(child.id()) {
             Ok(identity) => identity,
             Err(error) => {
-                abort_spawn(child, cgroup.as_ref(), kill_grace);
+                let tracker = prepared_tracking.map(|shim| Tracker::failed_start(shim, child.id()));
+                abort_startup(child, cgroup.as_ref(), kill_grace, interrupt_grace, tracker);
                 write_error(&out, &format!("spawn identity failed: {error}"));
                 return Ok(());
             }
         };
-        let written = serde_json::to_vec(&identity)
-            .map_err(io::Error::other)
-            .and_then(|payload| {
-                frame::write_frame(&mut *out.lock().unwrap(), TAG_SPAWNED, &payload)
-            });
+        // Tracking exists before any potentially failing initial frame write,
+        // so startup transport errors also clean observed/adopted descendants.
+        tracker = prepared_tracking.map(|shim| Tracker::new(shim, identity.clone()));
+        let written = (|| -> io::Result<()> {
+            let payload = serde_json::to_vec(&identity).map_err(io::Error::other)?;
+            if selected.spawn_identity {
+                frame::write_frame(&mut *out.lock().unwrap(), TAG_SPAWNED, &payload)?;
+            }
+            if let Some(prepared) = tracker.as_mut() {
+                frame::write_frame(&mut *out.lock().unwrap(), TAG_TRACKED, &payload)?;
+                prepared.take_new_groups(); // root was delivered synchronously
+            }
+            Ok(())
+        })();
         if let Err(error) = written {
-            abort_spawn(child, cgroup.as_ref(), kill_grace);
+            abort_startup(child, cgroup.as_ref(), kill_grace, interrupt_grace, tracker);
             return Err(error);
         }
     }
@@ -187,7 +308,15 @@ where
             // independent. Duplicate it so the pump thread and the stdin
             // writer each own a handle.
             let read_half = master;
-            let write_half = read_half.try_clone()?;
+            let write_half = match read_half.try_clone() {
+                Ok(write_half) => write_half,
+                Err(error) => {
+                    if tracker.is_some() {
+                        abort_startup(child, cgroup.as_ref(), kill_grace, interrupt_grace, tracker);
+                    }
+                    return Err(error);
+                }
+            };
             pumps += spawn_output_pump(
                 Some(File::from(read_half)),
                 TAG_STDOUT,
@@ -231,12 +360,22 @@ where
         }
     }
 
-    spawn_stdin_reader(stdin, tx.clone());
-    // The waiter thread takes ownership of `child` entirely: it is the
-    // single, sole caller of `Child::wait`, so there is never a double
-    // reap race. The supervising loop only ever learns the child's exit
-    // through `Event::ChildExited`.
-    spawn_waiter(child, tx.clone());
+    let (tracked_input, input_sender) = if tracker.is_some() {
+        let (input, sender) = TrackedInput::new(child_stdin.take());
+        (Some(input), Some(sender))
+    } else {
+        (None, None)
+    };
+    spawn_stdin_reader(stdin, tx.clone(), input_sender);
+    // Tracked runs keep the exited root unreaped until cleanup finishes. Its
+    // identity still authorizes group signals to unsampled same-group members.
+    let tracked_child = if tracker.is_some() {
+        spawn_tracked_waiter(child.id(), tx.clone());
+        Some(child)
+    } else {
+        spawn_waiter(child, tx.clone());
+        None
+    };
 
     if let Some(timeout_ms) = request.timeout_ms {
         spawn_timeout_timer(timeout_ms, tx.clone());
@@ -255,6 +394,11 @@ where
         stderr_credit.as_ref(),
         request.strict_output,
         request.interrupt_grace_ms.map(Duration::from_millis),
+        tracker,
+        tx,
+        tracked_child,
+        tracked_input,
+        peer.as_ref(),
     );
 
     // Backpressure linger: the child is reaped and the EXIT frame is written,
@@ -266,7 +410,7 @@ where
     // after it has consumed EXIT. Skipped when the BEAM is already gone, and
     // never entered on the eager path, so the default behavior is unchanged.
     if (credit.is_some() || stderr_credit.is_some()) && !beam_gone {
-        drain_inbound_until_closed(&rx);
+        drain_inbound_until_closed(&rx, peer.as_ref());
     }
 
     Ok(())
@@ -298,16 +442,20 @@ where
     // change. The post-spawn read still fails closed and cleans up that child.
     if *identity_available.get_or_init(|| probe().is_ok()) {
         features.push("spawn_identity_v1");
+        if tracking::available() {
+            features.push("track_descendants_v1");
+        }
     }
     features
 }
 
 /// Selected outbound extensions are independent of advertised capabilities.
-/// Future TRACKED selection can add its own field without changing SPAWNED.
+/// TRACKED, SPAWNED and structured errors are independent selections.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SelectedFeatures {
     spawn_identity: bool,
     structured_spawn_errors: bool,
+    track_descendants: bool,
 }
 
 fn select_features(payload: &[u8], supported: &[&str]) -> Result<SelectedFeatures, String> {
@@ -331,12 +479,57 @@ fn select_features(payload: &[u8], supported: &[&str]) -> Result<SelectedFeature
             .features
             .iter()
             .any(|feature| feature == "structured_spawn_errors_v1"),
+        track_descendants: request
+            .features
+            .iter()
+            .any(|feature| feature == "track_descendants_v1"),
     })
 }
 
-/// Startup reporting failed before the waiter took ownership. Stop the owned
-/// group immediately, including a cgroup backstop when present, then reap the
-/// child and remove its cgroup. No early error may leave a live child behind.
+/// Startup reporting failed before supervision began. Honor the configured
+/// tracking sequence while keeping the owned root unreaped through cleanup.
+fn abort_startup(
+    mut child: Child,
+    cgroup: Option<&Cgroup>,
+    grace: Duration,
+    interrupt_grace: Option<Duration>,
+    tracker: Option<Tracker>,
+) {
+    let Some(mut tracker) = tracker else {
+        return abort_spawn(child, cgroup, grace);
+    };
+    // Discover before cleanup on macOS; Linux also finds adopted orphans.
+    let root_known = tracker.root_known();
+    tracker.scan();
+    if !root_known {
+        // Identity failure prevents checked escalation of the root. It remains
+        // our unreaped child, so its original group number cannot be reused.
+        let _ = process::kill_process_group(Pid::from_child(&child), Signal::KILL);
+    }
+    tracker.begin_cleanup(Instant::now(), interrupt_grace, grace);
+    loop {
+        // No waiter thread exists on this path.
+        let exited = peek_child_exit(child.id(), true).is_ok_and(|outcome| outcome.is_some());
+        tracker.scan();
+        if tracker.advance(Instant::now()).done {
+            if !exited {
+                // A later metadata failure must not block Child::wait forever.
+                // This exact still-owned child cannot have had its PID reused.
+                let _ = process::kill_process(Pid::from_child(&child), Signal::KILL);
+            }
+            break;
+        }
+        thread::sleep(tracking::SAMPLE_INTERVAL);
+    }
+    tracker.finish_scan();
+    let _ = child.wait();
+    if let Some(cg) = cgroup {
+        finish_cgroup(cg, grace);
+    }
+}
+
+/// Stop the owned group immediately, including a cgroup backstop when present,
+/// then reap the child and remove its cgroup after a startup failure.
 fn abort_spawn(mut child: Child, cgroup: Option<&Cgroup>, grace: Duration) {
     let _ = process::kill_process_group(Pid::from_child(&child), Signal::KILL);
     if let Some(cgroup) = cgroup {
@@ -349,15 +542,19 @@ fn abort_spawn(mut child: Child, cgroup: Option<&Cgroup>, grace: Duration) {
 }
 
 /// Drains inbound events after EXIT so late CREDIT writes from the BEAM are
-/// absorbed and the shim's stdin stays open until the BEAM closes the port
-/// (reported as `StdinClosed`) or the reader thread ends. Blocks on `recv`, so
-/// it does not busy-spin.
-fn drain_inbound_until_closed(rx: &Receiver<Event>) {
+/// absorbed and the shim's stdin stays open until the BEAM closes the port.
+/// A timed receive also checks peer hang-up independently of the reader, which
+/// may be blocked forwarding child stdin and unable to report `StdinClosed`.
+fn drain_inbound_until_closed(rx: &Receiver<Event>, peer: Option<&PeerMonitor>) {
     loop {
-        match rx.recv() {
+        if peer.is_some_and(PeerMonitor::disconnected) {
+            return;
+        }
+        match rx.recv_timeout(tracking::SAMPLE_INTERVAL) {
             Ok(Event::StdinClosed) | Ok(Event::StdinError(_)) => return,
             Ok(_) => continue,
-            Err(_) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -702,10 +899,27 @@ fn pump_gated<P: Read, W: Write>(
 
 /// Reads protocol frames off the shim's stdin and forwards them as
 /// `Event`s. Clean EOF is reported as `Event::StdinClosed`.
-fn spawn_stdin_reader<R: Read + Send + 'static>(mut stdin: R, tx: Sender<Event>) {
+fn spawn_stdin_reader<R: Read + Send + 'static>(
+    mut stdin: R,
+    tx: Sender<Event>,
+    mut tracked_input: Option<TrackedInputSender>,
+) {
     thread::spawn(move || loop {
         match frame::read_frame(&mut stdin) {
             Ok(Some(f)) => {
+                if let Some(input) = tracked_input.as_mut() {
+                    match f.tag {
+                        TAG_STDIN => {
+                            input.send(f.payload);
+                            continue;
+                        }
+                        TAG_EOF => {
+                            input.sender = None;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 if tx.send(Event::Stdin(f)).is_err() {
                     return;
                 }
@@ -741,6 +955,45 @@ fn spawn_waiter(mut child: Child, tx: Sender<Event>) {
     });
 }
 
+/// Observe a direct child's exit without reaping it. WNOWAIT leaves the root's
+/// start time and process-group identifier valid until tracking cleanup ends.
+fn peek_child_exit(pid: u32, nonblocking: bool) -> io::Result<Option<ChildOutcome>> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let options = libc::WEXITED | libc::WNOWAIT | if nonblocking { libc::WNOHANG } else { 0 };
+        // SAFETY: this is our direct child and info points to a full siginfo_t.
+        let result = unsafe { libc::waitid(libc::P_PID, pid, info.as_mut_ptr(), options) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: waitid initialized the zeroed buffer; si_pid is zero when a
+        // nonblocking call found no exit. si_status is valid for WEXITED events.
+        let info = unsafe { info.assume_init() };
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
+        let status = unsafe { info.si_status() };
+        return Ok(Some(ChildOutcome {
+            status: (info.si_code == libc::CLD_EXITED).then_some(status),
+            signal: matches!(info.si_code, libc::CLD_KILLED | libc::CLD_DUMPED).then_some(status),
+        }));
+    }
+}
+
+fn spawn_tracked_waiter(pid: u32, tx: Sender<Event>) {
+    thread::spawn(move || {
+        let event = match peek_child_exit(pid, false) {
+            Ok(Some(outcome)) => Event::ChildExited(outcome),
+            _ => Event::ChildWaitFailed,
+        };
+        let _ = tx.send(event);
+    });
+}
+
 /// Sends `Event::TimedOut` after `timeout_ms` elapses.
 fn spawn_timeout_timer(timeout_ms: u64, tx: Sender<Event>) {
     thread::spawn(move || {
@@ -749,13 +1002,287 @@ fn spawn_timeout_timer(timeout_ms: u64, tx: Sender<Event>) {
     });
 }
 
-/// The main supervising loop: consumes events until the child has exited,
-/// drains the output pumps, then writes the EXIT frame.
-/// Runs the event loop until the child exits, drains output, and writes the
-/// EXIT frame. Returns whether the BEAM had already vanished (stdin EOF or
-/// error), which the caller uses to decide whether to linger for late credit.
+/// A separate writer keeps blocked child input outside the tracking loop.
+/// The protocol reader blocks on this bounded queue, applying the same upstream
+/// backpressure as the default write path instead of terminating a slow child.
+struct TrackedInput {
+    closed: Arc<AtomicBool>,
+}
+
+struct TrackedInputSender {
+    sender: Option<SyncSender<Vec<u8>>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl TrackedInput {
+    fn new(writer: Option<Box<dyn Write + Send>>) -> (Self, TrackedInputSender) {
+        let closed = Arc::new(AtomicBool::new(false));
+        let sender = writer.map(|mut writer| {
+            // At most one frame waits behind the in-progress write. The frame
+            // reader itself, not the supervision loop, waits for queue space.
+            let (sender, input) = mpsc::sync_channel::<Vec<u8>>(1);
+            let cancelled = Arc::clone(&closed);
+            thread::spawn(move || {
+                while let Ok(bytes) = input.recv() {
+                    if cancelled.load(Ordering::Acquire) || writer.write_all(&bytes).is_err() {
+                        break;
+                    }
+                }
+            });
+            sender
+        });
+        (
+            Self {
+                closed: Arc::clone(&closed),
+            },
+            TrackedInputSender { sender, closed },
+        )
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+impl TrackedInputSender {
+    fn send(&mut self, bytes: Vec<u8>) {
+        if self.closed.load(Ordering::Acquire) {
+            self.sender = None;
+        }
+        if self
+            .sender
+            .as_ref()
+            .is_some_and(|sender| sender.send(bytes).is_err())
+        {
+            self.sender = None;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn supervise<W: Write>(
+fn supervise_tracked<W: Write + Send + 'static>(
+    rx: &Receiver<Event>,
+    kill_grace: Duration,
+    input: TrackedInput,
+    mut child: Child,
+    out: &Arc<Mutex<W>>,
+    pumps: usize,
+    pump_done: &Receiver<()>,
+    cgroup: Option<&Cgroup>,
+    credit: Option<&Credit>,
+    stderr_credit: Option<&Credit>,
+    strict_output: bool,
+    interrupt_grace: Option<Duration>,
+    mut tracker: Tracker,
+    events: Sender<Event>,
+    peer: Option<&PeerMonitor>,
+) -> bool {
+    // Bound pending observations independently of the live group inventory.
+    // If the consumer falls behind, report truncated history without stopping
+    // a healthy child or blocking discovery and cleanup.
+    let (control, frames) = mpsc::sync_channel::<Frame>(tracking::MAX_GROUPS);
+    let mut history_truncated = false;
+    let (delivered, delivery) = mpsc::channel();
+    let output = Arc::clone(out);
+    thread::spawn(move || {
+        let result = (|| -> io::Result<()> {
+            while let Ok(frame) = frames.recv() {
+                frame::write_frame(&mut *output.lock().unwrap(), frame.tag, &frame.payload)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = events.send(Event::TrackingWriteFailed);
+        }
+        let _ = delivered.send(result);
+    });
+
+    let mut timed_out = false;
+    let mut beam_gone = false;
+    let mut discard_output = false;
+    let mut outcome = None;
+    let mut next_scan = Instant::now();
+    let confirmed = loop {
+        let now = Instant::now();
+        if now >= next_scan {
+            // The protocol reader can be blocked forwarding child stdin.
+            // Port closure is independently visible on the output pipe.
+            if !beam_gone && peer.is_some_and(PeerMonitor::disconnected) {
+                beam_gone = true;
+                discard_output = true;
+                tracker.begin_cleanup(now, interrupt_grace, kill_grace);
+            }
+            tracker.scan();
+            for identity in tracker.take_new_groups() {
+                if !beam_gone {
+                    match serde_json::to_vec(&identity) {
+                        Ok(payload) => match control.try_send(Frame::new(TAG_TRACKED, payload)) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(_)) => history_truncated = true,
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                tracker.fail();
+                                beam_gone = true;
+                            }
+                        },
+                        Err(_) => tracker.fail(),
+                    }
+                }
+            }
+            // Inventory reads can take time; grace periods begin after this
+            // scan, not at its earlier scheduling timestamp.
+            let now = Instant::now();
+            if tracker.uncertain() && !tracker.cleaning() {
+                discard_output = true;
+                tracker.begin_cleanup(now, interrupt_grace, kill_grace);
+            }
+            if tracker.cleaning() {
+                input.close();
+                if discard_output {
+                    if let Some(c) = credit {
+                        c.cancel();
+                    }
+                    if let Some(c) = stderr_credit {
+                        c.cancel();
+                    }
+                }
+                let progress = tracker.advance(now);
+                if progress.done && (outcome.is_some() || tracker.expired(now)) {
+                    break progress.confirmed && outcome.is_some();
+                }
+            }
+            next_scan = Instant::now() + tracking::SAMPLE_INTERVAL;
+        }
+        match rx.recv_timeout(next_scan.saturating_duration_since(Instant::now())) {
+            Ok(Event::Stdin(f)) if f.tag == TAG_CREDIT => {
+                if let (Some(c), Some(n)) = (credit, crate::credit::parse_grant(&f.payload)) {
+                    c.grant(n);
+                }
+            }
+            Ok(Event::Stdin(f)) if f.tag == TAG_STDERR_CREDIT => {
+                if let (Some(c), Some(n)) = (stderr_credit, crate::credit::parse_grant(&f.payload))
+                {
+                    c.grant(n);
+                }
+            }
+            Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
+                discard_output |= outcome.is_none();
+                tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                next_scan = Instant::now();
+            }
+            Ok(Event::Stdin(_)) => {}
+            Ok(Event::StdinClosed | Event::StdinError(_) | Event::TrackingWriteFailed)
+            | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                beam_gone = true;
+                discard_output = true;
+                tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                next_scan = Instant::now();
+            }
+            Ok(Event::TimedOut) => {
+                if outcome.is_none() {
+                    timed_out = true;
+                    discard_output = true;
+                    tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                    next_scan = Instant::now();
+                }
+            }
+            Ok(Event::ChildWaitFailed) => {
+                tracker.fail();
+                next_scan = Instant::now();
+            }
+            Ok(Event::ChildExited(status)) => {
+                outcome = Some(status);
+                tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                next_scan = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    input.close();
+    let final_confirmed = tracker.finish_scan();
+    // The waiter used WNOWAIT, so only this path reaps the root. Keeping it
+    // through the final inventory prevents reuse of its group identifier.
+    if outcome.is_none() {
+        // A late/missing waiter notification must not leave the owned root
+        // unreaped or invent an EXIT with no status. Its unreaped PID cannot
+        // have been reused, so this final direct kill is safe.
+        let _ = child.kill();
+    }
+    let reaped = child.wait();
+    if let Ok(status) = &reaped {
+        outcome = Some(ChildOutcome {
+            status: status.code(),
+            signal: status.signal(),
+        });
+    }
+    let cgroup_confirmed = cgroup.is_none_or(|cg| finish_cgroup(cg, kill_grace));
+    if beam_gone {
+        if let Some(c) = credit {
+            c.cancel();
+        }
+        if let Some(c) = stderr_credit {
+            c.cancel();
+        }
+        return true;
+    }
+    for identity in tracker.take_new_groups() {
+        if let Ok(payload) = serde_json::to_vec(&identity) {
+            if control.try_send(Frame::new(TAG_TRACKED, payload)).is_err() {
+                history_truncated = true;
+            }
+        }
+    }
+    let (output_truncated, disappeared) = if strict_output && !discard_output {
+        let (drained, cancelled, disappeared) =
+            drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit, peer);
+        (!drained || cancelled, disappeared)
+    } else {
+        if let Some(c) = credit {
+            if discard_output {
+                c.cancel();
+            } else {
+                c.uncork();
+            }
+        }
+        if let Some(c) = stderr_credit {
+            if discard_output {
+                c.cancel();
+            } else {
+                c.uncork();
+            }
+        }
+        let drained = drain_pumps(pumps, pump_done);
+        (discard_output || !drained, false)
+    };
+    if disappeared {
+        return true;
+    }
+    let outcome = outcome.unwrap_or(ChildOutcome {
+        status: None,
+        signal: None,
+    });
+    let report = ExitReport {
+        status: outcome.status,
+        signal: outcome.signal,
+        timed_out,
+        confirmed: confirmed && cgroup_confirmed && final_confirmed && reaped.is_ok(),
+        contained: cgroup.is_some(),
+        output_truncated,
+        scope: Some(tracking::scope()),
+        tracked_groups_truncated: Some(history_truncated),
+    };
+    if let Ok(payload) = serde_json::to_vec(&report) {
+        let _ = control.send(Frame::new(TAG_EXIT, payload));
+    }
+    drop(control);
+    // The same FIFO delivers TRACKED before EXIT. Cleanup is already complete,
+    // so waiting for a live consumer here cannot leave descendants running.
+    !matches!(delivery.recv(), Ok(Ok(())))
+}
+
+/// Consume events until the child exits, drain output, and write EXIT. Return
+/// whether the BEAM vanished, so the caller can skip lingering for late credit.
+#[allow(clippy::too_many_arguments)]
+fn supervise<W: Write + Send + 'static>(
     rx: &Receiver<Event>,
     pgid: Pid,
     kill_grace: Duration,
@@ -768,7 +1295,31 @@ fn supervise<W: Write>(
     stderr_credit: Option<&Credit>,
     strict_output: bool,
     interrupt_grace: Option<Duration>,
+    tracker: Option<Tracker>,
+    events: Sender<Event>,
+    tracked_child: Option<Child>,
+    tracked_input: Option<TrackedInput>,
+    peer: Option<&PeerMonitor>,
 ) -> bool {
+    if let Some(tracker) = tracker {
+        return supervise_tracked(
+            rx,
+            kill_grace,
+            tracked_input.expect("tracking input is initialized before its reader"),
+            tracked_child.expect("tracking retains the root until cleanup finishes"),
+            out,
+            pumps,
+            pump_done,
+            cgroup,
+            credit,
+            stderr_credit,
+            strict_output,
+            interrupt_grace,
+            tracker,
+            events,
+            peer,
+        );
+    }
     let mut timed_out = false;
     let mut beam_gone = false;
     let mut group_confirmed = true;
@@ -814,6 +1365,7 @@ fn supervise<W: Write>(
                 // Unknown/unexpected tag mid-session; ignore rather than
                 // tearing down a running child over a protocol wrinkle.
             }
+            Ok(Event::TrackingWriteFailed | Event::ChildWaitFailed) => {}
             Ok(Event::StdinClosed) => {
                 discard_output = true;
                 // The BEAM is gone. Kill the group; keep waiting for the
@@ -912,7 +1464,7 @@ fn supervise<W: Write>(
             (true, false)
         } else {
             let (drained, cancelled, disappeared) =
-                drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit);
+                drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit, peer);
             (!drained || cancelled, disappeared)
         }
     } else {
@@ -930,6 +1482,8 @@ fn supervise<W: Write>(
         confirmed: group_confirmed && cgroup_confirmed,
         contained: cgroup.is_some(),
         output_truncated,
+        scope: None,
+        tracked_groups_truncated: None,
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();
@@ -995,10 +1549,20 @@ fn drain_pumps_strict(
     rx: &Receiver<Event>,
     stdout_credit: Option<&Credit>,
     stderr_credit: Option<&Credit>,
+    peer: Option<&PeerMonitor>,
 ) -> (bool, bool, bool) {
     let mut completed = 0;
 
     while completed < pumps {
+        if peer.is_some_and(PeerMonitor::disconnected) {
+            if let Some(c) = stdout_credit {
+                c.cancel();
+            }
+            if let Some(c) = stderr_credit {
+                c.cancel();
+            }
+            return (false, true, true);
+        }
         while let Ok(event) = rx.try_recv() {
             match event {
                 Event::Stdin(f) if f.tag == TAG_CREDIT => {
@@ -1024,7 +1588,7 @@ fn drain_pumps_strict(
                     }
                     return (drain_pumps(pumps - completed, pump_done), true, false);
                 }
-                Event::StdinClosed | Event::StdinError(_) => {
+                Event::StdinClosed | Event::StdinError(_) | Event::TrackingWriteFailed => {
                     if let Some(c) = stdout_credit {
                         c.cancel();
                     }
@@ -1336,6 +1900,7 @@ mod tests {
                     ))
                 })
             },
+            None,
         )
         .unwrap();
 
@@ -1369,7 +1934,8 @@ mod tests {
                 super::select_features(payload, &supported).unwrap(),
                 super::SelectedFeatures {
                     spawn_identity: true,
-                    structured_spawn_errors: false
+                    structured_spawn_errors: false,
+                    track_descendants: false,
                 }
             );
         }
@@ -1424,7 +1990,7 @@ mod tests {
             bytes: Arc::clone(&bytes),
             flushes: 0,
         };
-        assert!(super::run(Cursor::new(input), writer).is_err());
+        assert!(super::run(Cursor::new(input), writer, None).is_err());
         let mut frames = Cursor::new(bytes.lock().unwrap().clone());
         assert_eq!(
             read_frame(&mut frames).unwrap().unwrap().tag,
@@ -1439,6 +2005,346 @@ mod tests {
             rustix::process::test_kill_process_group(pid),
             Err(Errno::SRCH)
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn failed_tracking_delivery_cleans_an_already_escaped_descendant() {
+        use crate::frame::{write_frame, TAG_HELLO, TAG_SPAWN};
+        use std::io::{self, Write};
+        use std::process::Command;
+
+        // Subreaper state is process-wide. Isolate this real-tree regression
+        // from other unit tests and their concurrently spawned children.
+        const MARKER: &str = "FORCOLA_TEST_TRACKING_ABORT_MARKER";
+        let Ok(marker) = std::env::var(MARKER) else {
+            let directory =
+                std::env::temp_dir().join(format!("forcola-tracking-abort-{}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "supervisor::tests::failed_tracking_delivery_cleans_an_already_escaped_descendant", "--nocapture"])
+                .env(MARKER, directory.join("pids"))
+                .status();
+            let _ = std::fs::remove_dir_all(directory);
+            assert!(result.unwrap().success());
+            return;
+        };
+
+        struct FailTracked {
+            marker: String,
+            flushes: usize,
+            identities: Arc<Mutex<Vec<crate::identity::ProcessIdentity>>>,
+            cleanup_started: Arc<Mutex<Option<Instant>>>,
+        }
+        impl Write for FailTracked {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.flushes != 2 {
+                    return Ok(());
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !std::path::Path::new(&self.marker).exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                if let Ok(pids) = std::fs::read_to_string(&self.marker) {
+                    for pid in pids.split_whitespace().filter_map(|pid| pid.parse().ok()) {
+                        if let Ok(identity) = crate::identity::read(pid) {
+                            self.identities.lock().unwrap().push(identity);
+                        }
+                    }
+                }
+                *self.cleanup_started.lock().unwrap() = Some(Instant::now());
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "TRACKED delivery failed",
+                ))
+            }
+        }
+        let script = "import os,sys,time,signal\ndef handler(sig,frame):\n with open(sys.argv[1]+'.'+str(os.getpid()),'a') as f: f.write(str(sig)+' '+str(time.monotonic())+'\\n')\nsignal.signal(signal.SIGINT,handler)\nsignal.signal(signal.SIGTERM,handler)\npid=os.fork()\nif pid==0:\n os.setsid()\n with open(sys.argv[1]+'.tmp', 'w') as f: f.write(str(os.getppid())+' '+str(os.getpid()))\n os.rename(sys.argv[1]+'.tmp',sys.argv[1])\ntime.sleep(30)\n";
+        let request = serde_json::json!({"argv":["python3", "-c", script, marker], "interrupt_signal":"int", "interrupt_grace_ms":60, "kill_grace_ms":80});
+        let mut input = Vec::new();
+        write_frame(
+            &mut input,
+            TAG_HELLO,
+            br#"{"features":["track_descendants_v1"]}"#,
+        )
+        .unwrap();
+        write_frame(
+            &mut input,
+            TAG_SPAWN,
+            &serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let identities = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_started = Arc::new(Mutex::new(None));
+        let result = super::run(
+            Cursor::new(input),
+            FailTracked {
+                marker: marker.clone(),
+                flushes: 0,
+                identities: Arc::clone(&identities),
+                cleanup_started: Arc::clone(&cleanup_started),
+            },
+            None,
+        );
+        assert!(
+            cleanup_started.lock().unwrap().unwrap().elapsed() >= Duration::from_millis(140),
+            "startup cleanup skipped configured graces"
+        );
+        let identities = identities.lock().unwrap();
+        // Always clean fixtures, including after a failed production assertion.
+        let gone = wait_until(Duration::from_secs(3), Duration::from_millis(10), || {
+            identities.iter().all(|expected| {
+                crate::identity::read_process(expected.pid)
+                    .map(|record| record.exited || !record.identity.same_process(expected))
+                    .unwrap_or(true)
+            })
+        });
+        for expected in identities.iter() {
+            if crate::identity::read_process(expected.pid)
+                .is_ok_and(|record| !record.exited && record.identity.same_process(expected))
+            {
+                unsafe {
+                    libc::kill(expected.pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+        assert!(result.is_err());
+        assert_eq!(
+            identities.len(),
+            2,
+            "fixture did not record root and escaped child"
+        );
+        assert!(gone, "startup output failure left a live descendant");
+        for expected in identities.iter() {
+            let log = std::fs::read_to_string(format!("{marker}.{}", expected.pid)).unwrap();
+            let observations: Vec<(i32, f64)> = log
+                .lines()
+                .map(|line| {
+                    let (signal, timestamp) = line.split_once(' ').unwrap();
+                    (signal.parse().unwrap(), timestamp.parse().unwrap())
+                })
+                .collect();
+            assert_eq!(
+                observations
+                    .iter()
+                    .map(|(signal, _)| *signal)
+                    .collect::<Vec<_>>(),
+                [libc::SIGINT, libc::SIGTERM]
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tracked_waiter_observes_exit_without_reaping_the_root_identity() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let identity = crate::identity::read(child.id()).unwrap();
+        let outcome = super::peek_child_exit(child.id(), false).unwrap().unwrap();
+        assert_eq!(outcome.status, Some(0));
+        assert_eq!(outcome.signal, None);
+        let retained = crate::identity::read_process(child.id()).unwrap();
+        assert_eq!(retained.identity, identity);
+        assert!(retained.exited);
+        assert!(child.wait().unwrap().success());
+        assert!(crate::identity::read(child.id()).is_err());
+    }
+
+    #[test]
+    fn strict_drain_cancels_on_tracking_writer_failure_with_input_still_open() {
+        let (events, incoming) = std::sync::mpsc::channel();
+        let (_pump_sender, pumps) = std::sync::mpsc::channel();
+        let credit = Credit::new();
+        events.send(super::Event::TrackingWriteFailed).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            super::drain_pumps_strict(1, &pumps, &incoming, Some(&credit), None, None),
+            (false, true, true)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Sender remains open throughout; transport loss cannot wait for EOF.
+        drop(events);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn peer_hangup_releases_drain_and_linger_without_stdin_events() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // A parallel unit test can fork between pipe() and fcntl(), inheriting
+        // the read end and postponing EOF until that unrelated child exits.
+        // Isolate pipe creation as well as marking both descriptors CLOEXEC.
+        const MARKER: &str = "FORCOLA_TEST_PEER_HANGUP";
+        if std::env::var_os(MARKER).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::peer_hangup_releases_drain_and_linger_without_stdin_events",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(result.success());
+            return;
+        }
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let peer = super::PeerMonitor::new(writer.as_raw_fd()).unwrap();
+        assert!(!peer.disconnected());
+        let (sender, incoming) = std::sync::mpsc::channel();
+        let closer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(reader);
+        });
+        let started = Instant::now();
+        // Keep sender alive: a reader stuck on child stdin cannot send EOF.
+        super::drain_inbound_until_closed(&incoming, Some(&peer));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(peer.disconnected());
+        let (_pump_sender, pumps) = std::sync::mpsc::channel();
+        let credit = Credit::new();
+        assert_eq!(
+            super::drain_pumps_strict(1, &pumps, &incoming, Some(&credit), None, Some(&peer)),
+            (false, true, true)
+        );
+        drop(sender);
+        closer.join().unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn missing_tracked_waiter_outcomes_are_reaped_and_report_actual_status() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // Native tracking on Linux inventories this shim's children. Isolate
+        // this regression from the other unit tests' subprocesses.
+        const MARKER: &str = "FORCOLA_TEST_MISSING_WAITER";
+        if std::env::var_os(MARKER).is_none() {
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "supervisor::tests::missing_tracked_waiter_outcomes_are_reaped_and_report_actual_status", "--nocapture"])
+                .env(MARKER, "1")
+                .status()
+                .unwrap();
+            assert!(result.success());
+            return;
+        }
+
+        for wait_failed in [false, true] {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                if wait_failed {
+                    "exit 23"
+                } else {
+                    "exec sleep 30"
+                },
+            ]);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+            let child = command.spawn().unwrap();
+            let pid = child.id();
+            let root = crate::identity::read(pid).unwrap();
+            if wait_failed {
+                let outcome = super::peek_child_exit(pid, false).unwrap().unwrap();
+                assert_eq!(outcome.status, Some(23));
+            }
+            let shim = crate::identity::read(std::process::id()).unwrap();
+            let tracker = crate::tracking::Tracker::new(shim, root);
+            let (events, incoming) = std::sync::mpsc::channel();
+            events
+                .send(if wait_failed {
+                    super::Event::ChildWaitFailed
+                } else {
+                    super::Event::TimedOut
+                })
+                .unwrap();
+            // No waiter notification follows. Deadline cleanup must collect
+            // the actual status itself rather than serializing two nulls.
+            let (input, _sender) = super::TrackedInput::new(None);
+            let (_pump_sender, pumps) = std::sync::mpsc::channel();
+            let output = Arc::new(Mutex::new(Vec::new()));
+            assert!(!super::supervise_tracked(
+                &incoming,
+                Duration::ZERO,
+                input,
+                child,
+                &output,
+                0,
+                &pumps,
+                None,
+                None,
+                None,
+                false,
+                None,
+                tracker,
+                events,
+                None,
+            ));
+            let mut frames = Cursor::new(output.lock().unwrap().clone());
+            let mut exit = None;
+            while let Some(frame) = read_frame(&mut frames).unwrap() {
+                if frame.tag == crate::frame::TAG_EXIT {
+                    exit =
+                        Some(serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap());
+                }
+            }
+            let exit = exit.expect("missing EXIT");
+            if wait_failed {
+                assert_eq!(exit["status"], 23);
+                assert!(exit["signal"].is_null());
+                assert_eq!(exit["timed_out"], false);
+            } else {
+                assert_eq!(exit["signal"], libc::SIGKILL);
+                assert!(exit["status"].is_null());
+                assert_eq!(exit["timed_out"], true);
+            }
+            assert_eq!(exit["confirmed"], false);
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            assert!(crate::identity::read(pid).is_err());
+        }
     }
 
     // Decodes concatenated frames back into their joined payload bytes.

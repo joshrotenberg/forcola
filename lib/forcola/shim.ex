@@ -15,7 +15,7 @@ defmodule Forcola.Shim do
   Frames are `{:packet, 4}`-style: a 4-byte big-endian length prefix
   (handled by the Erlang port itself), then a 1-byte tag, then the
   payload. This module owns the tag constants and the JSON payload
-  shapes for SPAWN/EXIT/ERROR/SPAWNED. Each execution mode drives the protocol.
+  shapes for SPAWN/EXIT/ERROR/SPAWNED/TRACKED. Each execution mode drives the protocol.
   """
 
   # Inbound tag: BEAM -> shim.
@@ -32,6 +32,7 @@ defmodule Forcola.Shim do
   @tag_exit 0x13
   @tag_error 0x14
   @tag_spawned 0x16
+  @tag_tracked 0x17
 
   @typedoc "Native start identity, stable for the life of a process."
   @type start_time ::
@@ -41,8 +42,8 @@ defmodule Forcola.Shim do
   @typedoc "The child or process-group leader's native identity."
   @type identity :: %{pid: pos_integer(), pgid: pos_integer(), start_time: start_time()}
 
-  # Port.close is synchronous, but the guard may still be relaying messages.
-  # Healthy cleanup ends immediately at its final marker; this bound is only
+  # Forced port shutdown is asynchronous; the guard may still relay messages.
+  # Healthy cleanup ends at its final marker; this bound is only
   # a backstop if the guard itself is killed or cannot finish.
   @guard_close_timeout_ms 5_000
   @cleanup_margin_ms 5_000
@@ -71,6 +72,8 @@ defmodule Forcola.Shim do
   def tag_error, do: @tag_error
   @doc false
   def tag_spawned, do: @tag_spawned
+  @doc false
+  def tag_tracked, do: @tag_tracked
 
   @doc false
   def negotiate(port, timeout_ms, required_features \\ ["bounded_run_v1"])
@@ -236,6 +239,7 @@ defmodule Forcola.Shim do
     selected =
       for {option, feature} <- [
             spawn_identity: "spawn_identity_v1",
+            track_descendants: "track_descendants_v1",
             structured_spawn_errors: "structured_spawn_errors_v1"
           ],
           Keyword.get(opts, option, false),
@@ -288,8 +292,8 @@ defmodule Forcola.Shim do
   boot) paired with the kernel `:boot_id`. macOS uses `kp_proc.p_starttime`
   as Unix `:seconds` and `:microseconds`. Preserve every field when recording
   an identity; these values guard against PID reuse, and are not evidence
-  that the process is still alive. The same payload shape is reserved for
-  future tracked process-group identities.
+  that the process is still alive. TRACKED uses the same payload for
+  cleanup-group leaders, with `pid == pgid` validated by the tracking decoder.
   """
   @spec decode_identity(binary()) :: {:ok, identity()} | {:error, :invalid_identity}
   def decode_identity(payload) do
@@ -468,7 +472,11 @@ defmodule Forcola.Shim do
   end
 
   defp close_guarded_port(port) do
-    Port.close(port)
+    # A normal Port.close flushes queued protocol input before closing its OS
+    # pipes. A child refusing stdin can prevent that flush indefinitely. Abort
+    # the port queue so the shim can observe peer loss and perform OS cleanup;
+    # the guard traps this port exit and keeps it from killing the caller.
+    :erlang.exit(port, :kill)
   catch
     :error, :badarg -> :ok
   end
@@ -477,8 +485,9 @@ defmodule Forcola.Shim do
   Closes the port and drains its remaining relayed messages.
 
   Call once from the process that opened the port, after consuming its result.
-  The OS port is closed synchronously; draining normally finishes immediately.
-  If the guard itself fails to finish, draining is bounded by five seconds and
+  Queued protocol input is discarded so a blocked child cannot defer OS pipe
+  closure. The shim remains responsible for process cleanup. The guard's exit
+  is awaited; if it fails to finish, draining is bounded by five seconds and
   returns `{:error, :guard_close_timeout}`.
   """
   @spec close(port()) :: :ok | {:error, :guard_close_timeout}
@@ -648,24 +657,18 @@ defmodule Forcola.Shim do
   observed a live process group or cgroup. That maps to
   `{:signal, :unconfirmed}` in every execution mode. The field defaults to true
   when absent for compatibility with older shims.
+
+  The decoder is total. Unreadable JSON, a report with neither a valid
+  `status` nor a valid `signal`, a report carrying both, or a non-boolean flag
+  also decode as `{:signal, :unconfirmed}`: a malformed frame never confirms
+  cleanup. `timed_out` is `true` only when the report says exactly that.
   """
   @spec decode_exit(binary()) ::
           {non_neg_integer() | {:signal, atom() | non_neg_integer()}, boolean()}
   def decode_exit(payload) do
-    decoded = :json.decode(payload)
-    timed_out = Map.get(decoded, "timed_out", false)
-
-    status =
-      if Map.get(decoded, "confirmed", true) do
-        case decoded do
-          %{"status" => status} when is_integer(status) -> status
-          %{"signal" => signal} when is_integer(signal) -> {:signal, signal}
-        end
-      else
-        {:signal, :unconfirmed}
-      end
-
-    {status, timed_out}
+    report = decode_exit_report(payload)
+    status = if report.confirmed, do: report.status, else: {:signal, :unconfirmed}
+    {status, report.timed_out}
   end
 
   @doc """
@@ -673,37 +676,69 @@ defmodule Forcola.Shim do
 
   `true` when Linux cgroup v2 containment was actually active for the run;
   `false` on the default path, on fallback (macOS, no cgroup v2, or no
-  delegated subtree), and whenever the field is absent (older shim). Reports
-  which kill mechanism was used.
+  delegated subtree), whenever the field is absent (older shim), and for an
+  unreadable payload. Reports which kill mechanism was used.
   """
   @spec decode_contained(binary()) :: boolean()
   def decode_contained(payload) do
-    Map.get(:json.decode(payload), "contained", false)
+    decode_exit_report(payload).contained == true
   end
+
+  @exit_flags ["confirmed", "contained", "timed_out", "output_truncated"]
 
   @doc """
   Decodes the native EXIT report without discarding the observed child status
   when cleanup was unconfirmed. `decode_exit/1` retains its legacy status shape.
-  """
-  @spec decode_exit_report(binary()) :: map()
-  def decode_exit_report(payload) do
-    decoded = :json.decode(payload)
 
-    status =
-      cond do
-        is_integer(decoded["status"]) -> decoded["status"]
-        is_integer(decoded["signal"]) -> {:signal, decoded["signal"]}
-        true -> nil
+  Total: an unreadable payload decodes as an invalid report. `:valid` is `true`
+  only when exactly one of a non-negative integer `status` or a positive integer
+  `signal` is present and every flag present is a boolean. `:confirmed` is `true`
+  only for a valid report whose `confirmed` flag is `true` or absent (older
+  shim). `:status` keeps whatever well-formed child observation was present,
+  even in an otherwise invalid report, and is `nil` when there is none.
+  """
+  @spec decode_exit_report(binary()) :: %{
+          valid: boolean(),
+          status: non_neg_integer() | {:signal, pos_integer()} | nil,
+          confirmed: boolean(),
+          timed_out: boolean(),
+          contained: boolean() | :unknown,
+          tracked_groups_truncated: boolean(),
+          output_truncated: boolean()
+        }
+  def decode_exit_report(payload) do
+    decoded =
+      case decode_json(payload) do
+        {:ok, decoded} when is_map(decoded) -> decoded
+        _unreadable -> %{}
       end
 
+    status = raw_exit_status(decoded)
+
+    valid =
+      status != nil and
+        Enum.all?(@exit_flags, &(not Map.has_key?(decoded, &1) or is_boolean(decoded[&1])))
+
     %{
+      valid: valid,
       status: status,
-      confirmed: Map.get(decoded, "confirmed", true),
-      timed_out: Map.get(decoded, "timed_out", false),
-      contained: Map.get(decoded, "contained", false),
-      output_truncated: Map.get(decoded, "output_truncated", false)
+      confirmed: valid and Map.get(decoded, "confirmed", true),
+      timed_out: Map.get(decoded, "timed_out") == true,
+      contained: Forcola.Tracking.contained(decoded["contained"]),
+      tracked_groups_truncated: false,
+      output_truncated: Map.get(decoded, "output_truncated") == true
     }
   end
+
+  defp raw_exit_status(%{"status" => status} = report) when is_integer(status) and status >= 0 do
+    if is_nil(report["signal"]), do: status
+  end
+
+  defp raw_exit_status(%{"signal" => signal} = report) when is_integer(signal) and signal > 0 do
+    if is_nil(report["status"]), do: {:signal, signal}
+  end
+
+  defp raw_exit_status(_report), do: nil
 
   @doc """
   Decodes an ERROR frame, retaining the legacy reason string by default.

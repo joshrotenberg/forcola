@@ -55,15 +55,31 @@ respectively.
 ## BEAM death as stdin EOF
 
 The shim is a port program, a separate OS process, not a NIF. The BEAM holds
-the write end of the shim's stdin pipe. When the BEAM dies, that pipe closes,
-and the shim reads EOF on stdin. The shim treats stdin EOF as the signal to
-kill the group and exit.
+the write end of the shim's stdin pipe and the read end of its stdout pipe.
+When the BEAM dies or closes the port, both protocol pipes close. Observed stdin
+EOF starts cleanup.
 
-This path does not depend on the BEAM running any cleanup code, so it covers
-`kill -9` of the VM, where no `terminate/2` callback or `after` block would
-run. It also covers a `Forcola.Stream`, `Forcola.Daemon`, or `Forcola.Duplex`
-process being killed brutally: the port closes, the shim sees EOF, and the
-group dies.
+With tracking enabled, each native scan also checks the protocol output fd for
+peer hang-up without reading stdin: Linux uses `poll` and macOS uses a kqueue
+write filter with `EV_EOF`. This still starts cleanup when the stdin reader is
+blocked behind a child that refuses input. Strict output drain and post-EXIT
+linger perform the same check, so they do not depend on that reader delivering
+an EOF event. Final guarded-port closure discards queued protocol input instead
+of flushing it before closing the OS pipes. The shim remains responsible for
+OS process kills. This works after `kill -9` of the VM or a brutally killed port
+owner, without a BEAM callback or `after` block.
+
+A Duplex server suspended while sending input cannot yet handle a queued
+`close/1`, `shutdown/1` or owner-down message. Those operations wait until the
+send resumes. Independent hang-up detection covers actual port closure and
+BEAM death; it does not bypass that server's pending input operation.
+
+The untracked path still writes child stdin synchronously. If that write blocks,
+its supervision loop cannot handle KILL, its run timer, or EOF until the write
+completes. Closing the port alone does not unblock that child-input write.
+Use tracking when cleanup must remain responsive to port closure while sending
+to a child that may stop reading. Post-EXIT linger checks hang-up in both paths,
+but the legacy supervision loop has this blocked-input limitation.
 
 ## Confirmation before the call returns
 
@@ -94,7 +110,9 @@ deadline (`timeout_ms + interrupt_grace_ms + kill_grace_ms` plus a margin) in ca
 reports back at all, for example if the shim is wedged or the BEAM-to-shim pipe
 is stuck. If that deadline fires first, the result's status is
 `{:signal, :unconfirmed}`: death was requested but not confirmed. Closing the
-port is the remaining kill lever (the shim treats stdin EOF as BEAM death).
+port is the remaining kill lever with tracking: peer hang-up starts cleanup
+independently of blocked stdin. The untracked blocked-input exception is
+described above.
 
 `{:signal, :unconfirmed}` also appears when the shim exits without sending an
 EXIT or ERROR frame (for example it crashed, or was itself SIGKILLed). A
@@ -113,14 +131,15 @@ to snapshot the process tree during a live run and flag any descendant whose
 `pgid` differs from the CLI's. All of them keep their entire tree in the
 child's process group and die to the group kill.
 
-Group kill misses three classes. An active Linux cgroup can contain the first;
+Default group kill misses three classes. Descendant tracking or an active Linux cgroup can reach the first;
 the other two require the external daemon's or scheduler's own teardown:
 
 ### Deliberate daemonizers
 
 A child that deliberately daemonizes, by double-forking plus `setsid` or via a
-flag like `redis-server --daemonize yes`, leaves the process group and survives
-the kill. It has explicitly asked to outlive its parent.
+flag like `redis-server --daemonize yes`, leaves the original process group and
+survives its kill. Opt-in descendant tracking discovers these new groups and
+cleans them on every kill path; its macOS sampling limit still applies.
 
 Run servers in foreground mode under `Forcola.Daemon`. Foreground operation is
 the same contract every process supervisor (systemd, runit, foreman) imposes:
@@ -146,9 +165,13 @@ It is Linux-only and always degrades gracefully, never erroring. On macOS, on
 non-cgroup-v2 systems, and when the subtree is not delegated, `cgroup: true`
 falls back to the ordinary process-group kill and logs a warning; ordinary
 in-group grandchildren still die exactly as before. The EXIT report carries a
-`contained` flag reporting which mechanism was used. `Forcola.Duplex.Terminal`
-exposes this as `scope: :active_cgroup` or `:process_group`; it describes the
-active mechanism, not proof that any externally owned work was contained. A
+`contained` flag reporting cgroup placement. `Result.evidence.contained`,
+`Duplex.Terminal.contained`, `Stream.Error.contained` and the tracking observer's
+terminal evidence expose `true`, `false` or `:unknown` when no valid placement
+report is available. Scope is `:active_cgroup` or `:process_group` when tracking
+is disabled, and `:tree_contained` or `:tree_sampled` when enabled. `contained`
+remains independent of that tree scope. Scope
+describes the mechanism, not proof that externally owned work was contained. A
 `Logger.debug` line is also emitted when containment was active. That line
 comes from `Forcola.run/2` and `Forcola.Daemon`; `Forcola.Stream` and
 `Forcola.Duplex` report their exit through messages or a raise and do not
@@ -182,9 +205,10 @@ On Linux, the opt-in cgroup v2 layer
 daemonizers by placing the child's whole subtree in a cgroup and writing
 `cgroup.kill`, rather than relying on the process group. It requires a delegated
 cgroup v2 subtree; see ["Deliberate daemonizers"](#deliberate-daemonizers)
-above. On macOS nothing can contain a deliberate daemonizer, which is equally
-true of erlexec and MuonTrap, so `cgroup: true` falls back to the process-group
-kill there. Windows support is tracked separately in
+above. On macOS `track_descendants: true` cleans observed escaped groups, but
+cannot discover a descendant reparented before any sample. Its scope is
+`:tree_sampled`; `cgroup: true` remains unavailable there. Windows support is
+tracked separately in
 [#34](https://github.com/joshrotenberg/forcola/issues/34).
 
 ## Cooperative interrupt and one-shot evidence
@@ -193,9 +217,10 @@ Every execution mode can opt in to `interrupt_signal: :int` together with a posi
 `interrupt_grace_ms` (at most `4_294_967_295`). The native supervisor sends INT
 to its process group, waits that grace, and then runs the existing TERM/KILL
 sequence if the group is still alive. Timeout, explicit KILL, normal leader
-exit cleanup, and stdin EOF all use this single sequence. Defaults retain the
-existing behavior. Closing an owner's port or SIGKILLing a BEAM still reaches
-the native EOF path, with no second BEAM-side process killer. The paired options
+exit cleanup, and observed protocol EOF all use this single sequence. Defaults
+retain the existing behavior, including the untracked blocked-input exception
+above. Tracking detects port hang-up independently of its stdin reader, with no
+second BEAM-side process killer. The paired options
 require the same `bounded_run_v1` capability in Run, Duplex, Stream and Daemon.
 Elixir cleanup waits include both graces, and Daemon's generated child spec
 allows time for cleanup confirmation and guard close. An overriding supervisor
@@ -203,14 +228,32 @@ shutdown timeout can cut that confirmation wait short; the native EOF path
 still performs cleanup.
 
 A cooperative parent can use INT to stop a child that changed process groups.
-An uncooperative escaped child cannot be positively contained by this mechanism
-on macOS. No descendant walking is performed. This is only the cooperative
-portion of issue #93, not complete containment of escaped descendants.
+With `track_descendants: true`, the same sequence also reaches tracked escaped
+groups directly. Linux uses a child subreaper and continuously reaps adopted
+zombies; macOS samples through libproc on a 50 ms polling interval and on cleanup.
+Inventory work adds to that interval. macOS cannot
+confirm anything about a descendant reparented before it was first sampled.
+
+Tracking emits a root-first TRACKED identity for each observed group and
+retains process identities separately so a later group change can be detected.
+The root is observed with `waitid(..., WNOWAIT)` and reaped after cleanup, keeping
+its original group identity valid for signals to unsampled same-group members.
+On macOS, `proc_listpids` inventories that pinned group after the root exits.
+Dead groups are pruned from the native live set. Retained Elixir history can be
+truncated without stopping the command or changing native cleanup confirmation.
+History completeness and live-set cleanup are independent facts.
+Persistent inventory failures or live capacity exhaustion still stop a tracked
+command, as detailed in the tracking guide.
+Before each signal, the current leader must match its recorded start time and
+group. If it does not, the numeric group is never signalled; independently
+verified retained members are signalled individually. Identity verification
+and POSIX signalling are not atomic. The [tracking guide](getting_started.html#track-descendant-groups)
+details observation APIs, bounds and failure evidence.
 
 One-shot results now retain raw child exit/signal alongside cleanup evidence.
 Only explicit valid confirmation can produce `cleanup: :confirmed`; scope is
-`:process_group` or `:active_cgroup` only when reported by the shim. Missing or
-malformed EXIT is unknown, and guard close has its own result. A confirmed
+`:process_group` or `:active_cgroup` by default, and `:tree_contained` on Linux
+or `:tree_sampled` on macOS with tracking. Missing or malformed EXIT is unknown, and guard close has its own result. A confirmed
 process group can coexist with an escaped survivor, so evidence must never be
 promoted to whole-tree safety by an adapter. The terminal bounded reason
 remains authoritative even if stdout already contains apparently successful
