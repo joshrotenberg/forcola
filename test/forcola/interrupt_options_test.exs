@@ -374,10 +374,14 @@ defmodule Forcola.InterruptOptionsTest do
                 :stream_idle ->
                   ready_ref = make_ref()
 
+                  # Isolate cleanup waiting by allowing the fixture to install its
+                  # signal handlers before the idle timer cancels the process.
                   error =
                     assert_raise Forcola.Stream.Error, fn ->
                       child.argv
-                      |> Forcola.Stream.lines(opts ++ [timeout_ms: 10_000, idle_timeout_ms: 100])
+                      |> Forcola.Stream.lines(
+                        opts ++ [timeout_ms: 10_000, idle_timeout_ms: 1_000]
+                      )
                       |> Stream.each(fn line ->
                         assert line == "ready"
                         send(self(), {ready_ref, System.monotonic_time()})
