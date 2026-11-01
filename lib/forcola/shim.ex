@@ -648,24 +648,18 @@ defmodule Forcola.Shim do
   observed a live process group or cgroup. That maps to
   `{:signal, :unconfirmed}` in every execution mode. The field defaults to true
   when absent for compatibility with older shims.
+
+  The decoder is total. Unreadable JSON, a report with neither a valid
+  `status` nor a valid `signal`, a report carrying both, or a non-boolean flag
+  also decode as `{:signal, :unconfirmed}`: a malformed frame never confirms
+  cleanup. `timed_out` is `true` only when the report says exactly that.
   """
   @spec decode_exit(binary()) ::
           {non_neg_integer() | {:signal, atom() | non_neg_integer()}, boolean()}
   def decode_exit(payload) do
-    decoded = :json.decode(payload)
-    timed_out = Map.get(decoded, "timed_out", false)
-
-    status =
-      if Map.get(decoded, "confirmed", true) do
-        case decoded do
-          %{"status" => status} when is_integer(status) -> status
-          %{"signal" => signal} when is_integer(signal) -> {:signal, signal}
-        end
-      else
-        {:signal, :unconfirmed}
-      end
-
-    {status, timed_out}
+    report = decode_exit_report(payload)
+    status = if report.confirmed, do: report.status, else: {:signal, :unconfirmed}
+    {status, report.timed_out}
   end
 
   @doc """
@@ -673,37 +667,67 @@ defmodule Forcola.Shim do
 
   `true` when Linux cgroup v2 containment was actually active for the run;
   `false` on the default path, on fallback (macOS, no cgroup v2, or no
-  delegated subtree), and whenever the field is absent (older shim). Reports
-  which kill mechanism was used.
+  delegated subtree), whenever the field is absent (older shim), and for an
+  unreadable payload. Reports which kill mechanism was used.
   """
   @spec decode_contained(binary()) :: boolean()
   def decode_contained(payload) do
-    Map.get(:json.decode(payload), "contained", false)
+    decode_exit_report(payload).contained
   end
+
+  @exit_flags ["confirmed", "contained", "timed_out", "output_truncated"]
 
   @doc """
   Decodes the native EXIT report without discarding the observed child status
   when cleanup was unconfirmed. `decode_exit/1` retains its legacy status shape.
-  """
-  @spec decode_exit_report(binary()) :: map()
-  def decode_exit_report(payload) do
-    decoded = :json.decode(payload)
 
-    status =
-      cond do
-        is_integer(decoded["status"]) -> decoded["status"]
-        is_integer(decoded["signal"]) -> {:signal, decoded["signal"]}
-        true -> nil
+  Total: an unreadable payload decodes as an invalid report. `:valid` is `true`
+  only when exactly one of a non-negative integer `status` or a positive integer
+  `signal` is present and every flag present is a boolean. `:confirmed` is `true`
+  only for a valid report whose `confirmed` flag is `true` or absent (older
+  shim). `:status` keeps whatever well-formed child observation was present,
+  even in an otherwise invalid report, and is `nil` when there is none.
+  """
+  @spec decode_exit_report(binary()) :: %{
+          valid: boolean(),
+          status: non_neg_integer() | {:signal, pos_integer()} | nil,
+          confirmed: boolean(),
+          timed_out: boolean(),
+          contained: boolean(),
+          output_truncated: boolean()
+        }
+  def decode_exit_report(payload) do
+    decoded =
+      case decode_json(payload) do
+        {:ok, decoded} when is_map(decoded) -> decoded
+        _unreadable -> %{}
       end
 
+    status = raw_exit_status(decoded)
+
+    valid =
+      status != nil and
+        Enum.all?(@exit_flags, &(not Map.has_key?(decoded, &1) or is_boolean(decoded[&1])))
+
     %{
+      valid: valid,
       status: status,
-      confirmed: Map.get(decoded, "confirmed", true),
-      timed_out: Map.get(decoded, "timed_out", false),
-      contained: Map.get(decoded, "contained", false),
-      output_truncated: Map.get(decoded, "output_truncated", false)
+      confirmed: valid and Map.get(decoded, "confirmed", true),
+      timed_out: Map.get(decoded, "timed_out") == true,
+      contained: Map.get(decoded, "contained") == true,
+      output_truncated: Map.get(decoded, "output_truncated") == true
     }
   end
+
+  defp raw_exit_status(%{"status" => status} = report) when is_integer(status) and status >= 0 do
+    if is_nil(report["signal"]), do: status
+  end
+
+  defp raw_exit_status(%{"signal" => signal} = report) when is_integer(signal) and signal > 0 do
+    if is_nil(report["status"]), do: {:signal, signal}
+  end
+
+  defp raw_exit_status(_report), do: nil
 
   @doc """
   Decodes an ERROR frame, retaining the legacy reason string by default.

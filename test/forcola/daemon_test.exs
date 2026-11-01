@@ -346,4 +346,34 @@ defmodule Forcola.DaemonTest do
         poll(fun, deadline)
     end
   end
+
+  describe "malformed EXIT" do
+    test "stops unconfirmed from the frame, without crashing or stalling", %{tmp_dir: tmp_dir} do
+      Process.flag(:trap_exit, true)
+      shim_path = terminal_fixture(tmp_dir)
+      started = System.monotonic_time(:millisecond)
+
+      {:ok, daemon} =
+        Forcola.Daemon.start_link(
+          argv: ["malformed_exit"],
+          shim_path: shim_path,
+          kill_grace_ms: 100,
+          output: {:send, self()}
+        )
+
+      assert_receive {Forcola.Daemon, ^daemon, {:stdout, "ready\n"}}, 5_000
+      assert_receive {:EXIT, ^daemon, {:exit_signal, :unconfirmed}}, 5_000
+
+      # Stopped from the frame itself, not from the KILL-and-wait backstop.
+      assert System.monotonic_time(:millisecond) - started < 3_000
+    end
+  end
+
+  defp terminal_fixture(tmp_dir) do
+    source = Path.expand("../fixtures/duplex_terminal_shim.py", __DIR__)
+    destination = Path.join(tmp_dir, "duplex_terminal_shim.py")
+    File.cp!(source, destination)
+    File.chmod!(destination, 0o755)
+    destination
+  end
 end

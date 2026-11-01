@@ -1015,13 +1015,25 @@ defmodule Forcola.Duplex do
   defp exit_terminal(payload, cause) do
     report = Shim.decode_exit_report(payload)
 
-    %Terminal{
-      status: report.status,
-      confirmation: if(report.confirmed, do: :confirmed, else: :unconfirmed),
-      cause: if(report.timed_out, do: :timeout, else: cause),
-      scope: if(report.contained, do: :active_cgroup, else: :process_group),
-      output: if(report.output_truncated, do: :truncated, else: :complete)
-    }
+    if report.valid do
+      %Terminal{
+        status: report.status,
+        confirmation: if(report.confirmed, do: :confirmed, else: :unconfirmed),
+        cause: if(report.timed_out, do: :timeout, else: cause),
+        scope: if(report.contained, do: :active_cgroup, else: :process_group),
+        output: if(report.output_truncated, do: :truncated, else: :complete)
+      }
+    else
+      # A malformed report cannot confirm cleanup, name the mechanism, or
+      # vouch for output completeness. Keep any well-formed child status.
+      %Terminal{
+        status: report.status,
+        confirmation: :unconfirmed,
+        cause: cause,
+        scope: :unknown,
+        output: :unknown
+      }
+    end
   end
 
   defp shutdown_terminal({:exit, payload}, cause), do: exit_terminal(payload, cause)

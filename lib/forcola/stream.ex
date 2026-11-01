@@ -792,13 +792,10 @@ defmodule Forcola.Stream do
     end
   end
 
+  # decode_exit/1 is total: a malformed confirmation decodes as unconfirmed.
   defp decode_terminal_exit(payload) do
     {status, timed_out} = Shim.decode_exit(payload)
     {:exit, status, timed_out}
-  rescue
-    _invalid_payload -> :malformed_exit
-  catch
-    _kind, _reason -> :malformed_exit
   end
 
   defp warn_unconfirmed_cleanup({:exit, {:signal, :unconfirmed}, _timed_out}) do
@@ -807,10 +804,6 @@ defmodule Forcola.Stream do
 
   defp warn_unconfirmed_cleanup(:timeout) do
     Logger.warning("forcola: stream cleanup timed out before shim confirmation")
-  end
-
-  defp warn_unconfirmed_cleanup(:malformed_exit) do
-    Logger.warning("forcola: stream cleanup received a malformed EXIT confirmation")
   end
 
   defp warn_unconfirmed_cleanup(:shim_exited) do

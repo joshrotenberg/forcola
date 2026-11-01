@@ -25,6 +25,12 @@ if len(packet) != length or packet[0] != 1:
 mode = json.loads(packet[1:])["argv"][0]
 frame(0x11, b"ready\n")
 
+if mode == "malformed_exit":
+    # A terminal report with neither status nor signal. No mode may confirm
+    # cleanup from it, and none may crash on it.
+    frame(0x13, b'{"confirmed":true,"contained":false}')
+    raise SystemExit(0)
+
 while True:
     header = sys.stdin.buffer.read(4)
     if len(header) != 4:

@@ -597,6 +597,36 @@ defmodule Forcola.DuplexTest do
     end
   end
 
+  describe "malformed EXIT" do
+    @tag :tmp_dir
+    test "ends the session unconfirmed from the frame, without a cleanup stall", %{
+      tmp_dir: tmp_dir
+    } do
+      shim_path = terminal_fixture(tmp_dir)
+      started = System.monotonic_time(:millisecond)
+
+      {:ok, session} =
+        Forcola.Duplex.open(["malformed_exit"], shim_path: shim_path, kill_grace_ms: 100)
+
+      assert_receive {:forcola_line, ^session, "ready"}, 5_000
+      assert_receive {:forcola_exit, ^session, {:signal, :unconfirmed}}, 5_000
+
+      assert {:ok,
+              %Forcola.Duplex.Terminal{
+                status: nil,
+                confirmation: :unconfirmed,
+                cause: :child_exit,
+                scope: :unknown,
+                output: :unknown
+              }} = Forcola.Duplex.await_terminal(session, 5_000)
+
+      # Settled from the frame itself, not from the KILL-and-wait backstop
+      # (kill grace plus the five-second cleanup margin).
+      assert System.monotonic_time(:millisecond) - started < 3_000
+      assert :ok = Forcola.Duplex.forget_terminal(session)
+    end
+  end
+
   defp terminal_fixture(tmp_dir) do
     source = Path.expand("../fixtures/duplex_terminal_shim.py", __DIR__)
     destination = Path.join(tmp_dir, "duplex_terminal_shim.py")

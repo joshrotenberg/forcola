@@ -51,5 +51,47 @@ defmodule ForcolaTest do
 
       assert {{:signal, :unconfirmed}, true} = Forcola.Shim.decode_exit(payload)
     end
+
+    test "decode_exit/1 never confirms a malformed report" do
+      for payload <- [
+            "{bad json",
+            "[]",
+            "",
+            ~s({"confirmed":true}),
+            ~s({"status":-1,"confirmed":true}),
+            ~s({"signal":0}),
+            ~s({"status":"0"}),
+            ~s({"status":0,"signal":15}),
+            ~s({"status":0,"confirmed":"yes"}),
+            ~s({"status":0,"contained":"no"})
+          ] do
+        assert {{:signal, :unconfirmed}, false} = Forcola.Shim.decode_exit(payload)
+      end
+
+      assert {{:signal, :unconfirmed}, true} = Forcola.Shim.decode_exit(~s({"timed_out":true}))
+      assert {{:signal, :unconfirmed}, false} = Forcola.Shim.decode_exit(~s({"timed_out":"yes"}))
+    end
+
+    test "decode_exit_report/1 and decode_contained/1 are total" do
+      assert %{valid: false, status: nil, confirmed: false, contained: true} =
+               Forcola.Shim.decode_exit_report(~s({"confirmed":true,"contained":true}))
+
+      assert %{valid: false, status: nil, confirmed: false, timed_out: false} =
+               Forcola.Shim.decode_exit_report("{bad json")
+
+      # A well-formed child observation survives an otherwise invalid report.
+      assert %{valid: false, status: 3, confirmed: false} =
+               Forcola.Shim.decode_exit_report(~s({"status":3,"confirmed":"yes"}))
+
+      assert %{valid: true, status: {:signal, 9}, confirmed: false, output_truncated: true} =
+               Forcola.Shim.decode_exit_report(
+                 ~s({"signal":9,"confirmed":false,"output_truncated":true})
+               )
+
+      assert %{valid: true, status: 0, confirmed: true} =
+               Forcola.Shim.decode_exit_report(~s({"status":0}))
+
+      refute Forcola.Shim.decode_contained("{bad json")
+    end
   end
 end
