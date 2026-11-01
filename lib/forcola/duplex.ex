@@ -171,6 +171,8 @@ defmodule Forcola.Duplex do
       `false`. Requires `spawn_identity_v1` negotiation before SPAWN, with
       a five-second handshake bound. An incompatible shim returns an error
       without starting the child. `spawned/1` reads the latest observation.
+      The owner receives the identity message; `:spawn_observer` is not
+      supported and raises `ArgumentError` when supplied.
     * `:user`, `:group` - run the child as a different user/group, as in
       `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
       privileged shim; failures fail closed and arrive as
@@ -600,6 +602,7 @@ defmodule Forcola.Duplex do
   ## Option validation
 
   defp validate_opts!(argv, opts) do
+    Shim.reject_spawn_observer!(opts, __MODULE__)
     Shim.validate_spawn_identity!(opts)
     Shim.reject_run_options!(opts, __MODULE__, [:max_output_bytes])
     validate_timeout_opt!(opts)

@@ -30,14 +30,18 @@ defmodule Forcola.Daemon do
     * `:name` - optional GenServer registration name.
     * `:cd`, `:env`, `:merge_stderr` - as in `Forcola.run/2`.
     * `:shim_path` - trusted absolute shim path, as in `Forcola.run/2`.
-    * `:spawn_identity` - request the child's native identity, default
-      `false`. The process calling `start_link/1` receives
-      `{:forcola_spawned, daemon_pid, identity}` before output is routed,
-      where identity is `%{pid: integer, pgid: integer, start_time: map}`.
-      See `Forcola.Result` for the platform-specific start-time fields.
-      This also applies during readiness polling. Requires
+    * `:spawn_identity` - request the child's native identity for `spawned/1`,
+      default `false`. This sends no notification by itself. Requires
       `spawn_identity_v1` negotiation with a five-second handshake bound;
       an incompatible shim fails before starting the child.
+    * `:spawn_observer` - optional `{local_pid, reference}` receiving
+      `{reference, {:spawned, identity}}` before output is routed, including
+      during readiness polling. Only the explicit observer receives this
+      notification; the starting process or supervisor is not implicitly
+      notified. The identity is `%{pid: integer, pgid: integer, start_time: map}`;
+      see `Forcola.Result` for the platform-specific start-time fields.
+      A non-nil observer enables identity even with `spawn_identity: false`.
+      Notifications are unacknowledged, and a dead observer is harmless.
     * `:user`, `:group` - run the child as a different user/group, as in
       `Forcola.run/2`. POSIX-only, a one-way drop, and requires a
       privileged shim; failures fail closed and surface as the daemon's
@@ -132,30 +136,34 @@ defmodule Forcola.Daemon do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     validate_opts!(opts)
+    opts = if opts[:spawn_observer], do: Keyword.put(opts, :spawn_identity, true), else: opts
     {name, opts} = Keyword.pop(opts, :name)
     gen_opts = if name, do: [name: name], else: []
-    GenServer.start_link(__MODULE__, {self(), opts}, gen_opts)
+    GenServer.start_link(__MODULE__, opts, gen_opts)
   end
 
   @doc """
-  Returns the live daemon's recorded child identity without waiting.
+  Queries the live daemon's recorded child identity.
 
   Returns `{:error, :pending}` before an enabled daemon receives the frame,
   `{:error, :not_requested}` when disabled, and `{:error, :closed}` after
-  the daemon exits. The caller of `start_link/1` can retain its
-  `{:forcola_spawned, daemon_pid, identity}` notification beyond that point.
-  An observed identity is not proof that the process remains alive.
+  the daemon exits. The query also returns `{:error, :pending}` if the daemon
+  cannot respond within five seconds, for example while an output callback
+  is blocked. A query timeout does not mean that the daemon has closed.
+  An explicit `:spawn_observer` can retain its notification after the daemon
+  exits. An observed identity is not proof that the process remains alive.
   """
   @spec spawned(GenServer.server()) ::
           {:ok, Shim.identity()} | {:error, :pending | :not_requested | :closed}
   def spawned(daemon) do
     GenServer.call(daemon, :spawned)
   catch
+    :exit, {:timeout, _call} -> {:error, :pending}
     :exit, _ -> {:error, :closed}
   end
 
   @impl true
-  def init({owner, opts}) do
+  def init(opts) do
     # Trap exits so terminate/2 runs on supervisor shutdown and on owner
     # (parent) crash; both must kill the process group.
     Process.flag(:trap_exit, true)
@@ -170,7 +178,7 @@ defmodule Forcola.Daemon do
 
         state = %{
           port: port,
-          owner: owner,
+          spawn_observer: opts[:spawn_observer],
           identity_enabled: Shim.identity_requested?(opts),
           identity: nil,
           output: Keyword.get(opts, :output, :logger),
@@ -248,6 +256,7 @@ defmodule Forcola.Daemon do
 
   defp validate_opts!(opts) do
     Shim.validate_spawn_identity!(opts)
+    Shim.validate_spawn_observer!(opts)
     Shim.reject_run_options!(opts, __MODULE__)
 
     if Keyword.has_key?(opts, :timeout_ms) do
@@ -374,7 +383,11 @@ defmodule Forcola.Daemon do
   defp record_identity(%{identity_enabled: true, identity: nil} = state, payload) do
     case Shim.decode_identity(payload) do
       {:ok, identity} ->
-        send(state.owner, {:forcola_spawned, self(), identity})
+        if state.spawn_observer do
+          {pid, ref} = state.spawn_observer
+          send(pid, {ref, {:spawned, identity}})
+        end
+
         %{state | identity: identity}
 
       {:error, _reason} ->

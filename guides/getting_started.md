@@ -542,8 +542,7 @@ Identity reporting is opt-in and requires a shim advertising
 `spawn_identity_v1`. With `spawn_identity: true`, `Forcola.run/2` populates
 `result.pid`, `result.pgid`, and `result.start_time`, including on partial
 results after timeout. These fields are `nil` when identity is not requested.
-Duplex and Daemon notify the process that opened them before delivering any
-child output:
+Duplex notifies the process that opened it before delivering any child output:
 
 ```elixir
 {:ok, session} =
@@ -576,13 +575,38 @@ The identity is observation, not a liveness or cleanup guarantee.
 waiting, `{:error, :not_requested}` for a live session with reporting disabled,
 or `{:error, :closed}` when unavailable after shutdown. Duplex retains its
 identity alongside terminal evidence after natural exit until `close/1`,
-`forget_terminal/1`, or owner exit releases the record. Daemon queries require a live daemon;
-its owner should retain the notification for later use. When started by a
-supervisor, the supervisor is the Daemon owner.
+`forget_terminal/1`, or owner exit releases the record. Daemon queries require
+a live daemon. A query that times out while a named daemon is still polling
+readiness also returns `{:error, :pending}`.
+
+Daemon sends identity notifications only to an explicit
+`spawn_observer: {local_pid, reference}`. The observer enables identity reporting
+and receives `{reference, {:spawned, identity}}` before child output is routed,
+including during readiness polling. Configure a process that can retain the
+identity, rather than sending notifications to the supervisor:
+
+```elixir
+run_ref = make_ref()
+
+child =
+  {Forcola.Daemon,
+   argv: ["redis-server", "--port", "6399"],
+   spawn_observer: {recovery_pid, run_ref}}
+
+Supervisor.start_link([child], strategy: :one_for_one)
+```
+
+Here `recovery_pid` is the application's recovery process. It receives
+`{run_ref, {:spawned, identity}}` on each start or restart. With
+`spawn_identity: true` alone, Daemon records identity for `spawned/1` polling
+and sends no notification to its starter or supervisor.
 
 For a line stream, supply `spawn_observer: {local_pid, reference}`. This
 enables identity reporting and sends `{reference, {:spawned, identity}}`
 before the first yielded line, including when backpressure is enabled.
+Stream rejects `spawn_identity: true` without a non-nil observer because
+there would be no way to retrieve the identity. Run and Duplex reject
+`:spawn_observer`; their identity interfaces are the result and owner message.
 Observer delivery is unacknowledged; the observer must persist the value
 itself. Streams close stdin immediately and do not wait for that persistence.
 
@@ -606,6 +630,11 @@ or make checking identity and sending a signal atomic.
 
 Without either identity option, existing wire behavior is unchanged. A shim
 without the capability rejects the request before the child executes.
+Capability advertisement includes a cached probe of the shim's own native
+identity, so inaccessible process metadata disables the feature before SPAWN.
+The probe does not guarantee later access to a child after a privilege change
+or a change in permissions. If child identity capture then fails, the shim
+kills and reaps the child, which may already have executed.
 `SPAWNED` uses tag `0x16` and the shared identity payload; `0x17` is reserved
 for the future `TRACKED` frame from descendant tracking work. Tracking is
 not enabled by selecting spawn identity.

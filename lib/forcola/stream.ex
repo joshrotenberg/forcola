@@ -197,9 +197,10 @@ defmodule Forcola.Stream do
   The identity is `%{pid: integer, pgid: integer, start_time: map}`; see
   `Forcola.Result` for the exact Linux and macOS start-time fields.
   The observer enables `spawn_identity_v1` negotiation even if
-  `spawn_identity: false` is supplied. `spawn_identity: true` also enables
-  negotiation, but observation requires the observer. The whole-run timeout
-  includes this capability exchange; incompatible shims fail before SPAWN.
+  `spawn_identity: false` is supplied. Setting `spawn_identity: true` without
+  a non-nil observer raises `ArgumentError` before opening a shim, because
+  a stream has no other identity result or query API. The whole-run timeout
+  includes the capability exchange; incompatible shims fail before SPAWN.
   The default performs no identity negotiation or notification. Messages are
   unacknowledged, and a dead observer does not affect execution.
 
@@ -238,6 +239,7 @@ defmodule Forcola.Stream do
   def lines([_binary | _] = argv, opts) do
     Shim.validate_spawn_identity!(opts)
     Shim.validate_spawn_observer!(opts)
+    validate_identity_observer!(opts)
     opts = if opts[:spawn_observer], do: Keyword.put(opts, :spawn_identity, true), else: opts
     Shim.reject_run_options!(opts, __MODULE__, [:idle_timeout_ms])
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
@@ -263,6 +265,11 @@ defmodule Forcola.Stream do
       &next/1,
       &cleanup/1
     )
+  end
+
+  defp validate_identity_observer!(opts) do
+    if Shim.identity_requested?(opts) and is_nil(opts[:spawn_observer]),
+      do: raise(ArgumentError, "Forcola.Stream :spawn_identity requires :spawn_observer")
   end
 
   defp validate_identity_timeout!(opts, timeout_ms) do

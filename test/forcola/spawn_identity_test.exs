@@ -121,6 +121,7 @@ defmodule Forcola.SpawnIdentityTest do
     tmp_dir: dir
   } do
     for ready? <- [false, true] do
+      ref = make_ref()
       marker = Path.join(dir, "ready-#{ready?}")
       opts = if ready?, do: [ready: fn -> File.exists?(marker) end, ready_poll_ms: 10], else: []
 
@@ -130,14 +131,14 @@ defmodule Forcola.SpawnIdentityTest do
             [
               argv: ["/bin/sh", "-c", "printf ready; touch \"$READY\"; exec sleep 60"],
               env: [{"READY", marker}],
-              spawn_identity: true,
+              spawn_observer: {self(), ref},
               output: {:send, self()},
               kill_grace_ms: 100
             ]
         )
 
       try do
-        identity = first_spawned(daemon)
+        identity = first_observed(ref)
         assert_identity(identity)
         assert Daemon.spawned(daemon) == {:ok, identity}
         assert_receive {Daemon, ^daemon, {:stdout, "ready"}}, 5_000
@@ -171,6 +172,138 @@ defmodule Forcola.SpawnIdentityTest do
     end
   end
 
+  test "Daemon observers receive identities across supervised restarts without supervisor messages" do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        for observer? <- [false, true] do
+          ref = make_ref()
+          observer_opts = if observer?, do: [spawn_observer: {self(), ref}], else: []
+
+          {:ok, supervisor} =
+            Supervisor.start_link(
+              [
+                {Daemon,
+                 observer_opts ++
+                   [argv: ["/bin/sleep", "60"], spawn_identity: true, kill_grace_ms: 100]}
+              ],
+              strategy: :one_for_one
+            )
+
+          try do
+            [{Daemon, daemon, :worker, _}] = Supervisor.which_children(supervisor)
+            identity = await_daemon_identity(daemon)
+            assert_identity(identity)
+            if observer?, do: assert_receive({^ref, {:spawned, ^identity}}, 5_000)
+
+            assert :ok = Supervisor.terminate_child(supervisor, Daemon)
+            assert {:ok, restarted} = Supervisor.restart_child(supervisor, Daemon)
+            replacement = await_daemon_identity(restarted)
+            assert_identity(replacement)
+            assert replacement.pid != identity.pid
+            if observer?, do: assert_receive({^ref, {:spawned, ^replacement}}, 5_000)
+          after
+            Supervisor.stop(supervisor)
+          end
+        end
+      end)
+
+    refute log =~ "unexpected message"
+  end
+
+  test "Daemon identity polling does not implicitly notify its starter" do
+    {:ok, daemon} =
+      Daemon.start_link(argv: ["/bin/sleep", "60"], spawn_identity: true, kill_grace_ms: 100)
+
+    try do
+      assert_identity(await_daemon_identity(daemon))
+      refute_receive {:forcola_spawned, ^daemon, _}, 0
+    after
+      GenServer.stop(daemon)
+    end
+  end
+
+  test "Daemon polling reports pending while a named daemon is still initializing" do
+    owner = self()
+    name = __MODULE__.InitializingDaemon
+
+    starter =
+      Task.async(fn ->
+        {:ok, daemon} =
+          Daemon.start_link(
+            argv: ["/bin/sleep", "60"],
+            name: name,
+            spawn_identity: true,
+            kill_grace_ms: 100,
+            ready_timeout_ms: 15_000,
+            ready: fn ->
+              send(owner, {:initializing, self()})
+
+              receive do
+                :release_ready -> true
+              end
+            end
+          )
+
+        send(owner, {:daemon_started, daemon})
+
+        receive do
+          :stop -> GenServer.stop(daemon)
+        end
+      end)
+
+    assert_receive {:initializing, daemon}, 5_000
+
+    try do
+      assert Daemon.spawned(name) == {:error, :pending}
+      assert Process.alive?(daemon)
+      send(daemon, :release_ready)
+      assert_receive {:daemon_started, ^daemon}, 5_000
+      assert_identity(await_daemon_identity(daemon))
+    after
+      send(daemon, :release_ready)
+      send(starter.pid, :stop)
+      Task.shutdown(starter, 5_000)
+    end
+
+    assert Daemon.spawned(name) == {:error, :closed}
+  end
+
+  test "strict runs preserve empty HELLO and select only additional features", %{tmp_dir: dir} do
+    shim = fake_shim(dir, "identity")
+
+    assert {:ok, %Result{pid: nil}} =
+             Forcola.run(["unused"], timeout_ms: 5_000, max_output_bytes: 1024, shim_path: shim)
+
+    assert File.read!(Path.join(dir, "hello_received")) == ""
+
+    assert {:ok, %Result{pid: 123}} =
+             Forcola.run(["unused"],
+               timeout_ms: 5_000,
+               max_output_bytes: 1024,
+               spawn_identity: true,
+               shim_path: shim
+             )
+
+    assert %{"features" => ["spawn_identity_v1"]} ==
+             dir |> Path.join("hello_received") |> File.read!() |> :json.decode()
+  end
+
+  test "strict identity runs still require bounded_run_v1 in the capability response", %{
+    tmp_dir: dir
+  } do
+    shim = fake_shim(dir, "identity_only")
+
+    assert {:error, {:spawn, :incompatible_shim}} =
+             Forcola.run(["unused"],
+               timeout_ms: 5_000,
+               max_output_bytes: 1024,
+               spawn_identity: true,
+               shim_path: shim
+             )
+
+    refute File.exists?(Path.join(dir, "spawn_received"))
+  end
+
   test "spawn failure emits no identity in every mode" do
     missing = "/forcola-missing-identity-test"
 
@@ -197,9 +330,9 @@ defmodule Forcola.SpawnIdentityTest do
     previous = Process.flag(:trap_exit, true)
 
     try do
-      {:ok, daemon} = Daemon.start_link(argv: [missing], spawn_identity: true)
+      {:ok, daemon} = Daemon.start_link(argv: [missing], spawn_observer: {self(), ref})
       assert_receive {:EXIT, ^daemon, _reason}, 5_000
-      refute_receive {:forcola_spawned, ^daemon, _}, 0
+      refute_receive {^ref, {:spawned, _}}, 0
     after
       Process.flag(:trap_exit, previous)
     end
@@ -233,10 +366,11 @@ defmodule Forcola.SpawnIdentityTest do
     assert :ok = Duplex.close(session)
     assert_receive {:forcola_spawned, ^session, %{pid: 123, pgid: 123}}, 5_000
 
-    {:ok, daemon} = Daemon.start_link([argv: ["unused"]] ++ opts)
+    ref = make_ref()
+    {:ok, daemon} = Daemon.start_link([argv: ["unused"], spawn_observer: {self(), ref}] ++ opts)
     assert Daemon.spawned(daemon) == {:error, :pending}
     assert :ok = GenServer.stop(daemon)
-    assert_receive {:forcola_spawned, ^daemon, %{pid: 123, pgid: 123}}, 5_000
+    assert_receive {^ref, {:spawned, %{pid: 123, pgid: 123}}}, 5_000
   end
 
   test "old shims and missing identity capabilities fail before SPAWN in every mode", %{
@@ -253,7 +387,7 @@ defmodule Forcola.SpawnIdentityTest do
 
       assert_raise Forcola.Stream.Error, fn ->
         ["unused"]
-        |> Forcola.Stream.lines([timeout_ms: 5_000] ++ opts)
+        |> Forcola.Stream.lines([timeout_ms: 5_000, spawn_observer: {self(), make_ref()}] ++ opts)
         |> Enum.to_list()
       end
 
@@ -324,6 +458,45 @@ defmodule Forcola.SpawnIdentityTest do
     end
   end
 
+  test "Stream identity requires an observer before opening a shim" do
+    for observer_opts <- [[], [spawn_observer: nil]] do
+      assert_raise ArgumentError, ~r/spawn_observer/, fn ->
+        Forcola.Stream.lines(
+          ["unused"],
+          observer_opts ++ [timeout_ms: 5_000, spawn_identity: true, shim_path: "/missing-shim"]
+        )
+      end
+    end
+  end
+
+  test "Run and Duplex reject unused spawn_observer options before opening a shim" do
+    for observer <- [nil, false, {self(), make_ref()}] do
+      opts = [spawn_observer: observer, shim_path: "/missing-shim"]
+
+      assert_raise ArgumentError, ~r/spawn_observer/, fn ->
+        Forcola.run(["unused"], [timeout_ms: 5_000] ++ opts)
+      end
+
+      assert_raise ArgumentError, ~r/spawn_observer/, fn -> Duplex.open(["unused"], opts) end
+    end
+  end
+
+  test "Daemon and Stream validate observer recipients before opening a shim" do
+    remote = :erlang.binary_to_term(<<131, 103, 100, 0, 6, "remote", 0, 0, 0, 1, 0, 0, 0, 0, 0>>)
+
+    for observer <- [false, {}, {self(), :invalid}, {:invalid, make_ref()}, {remote, make_ref()}] do
+      opts = [spawn_observer: observer, shim_path: "/missing-shim"]
+
+      assert_raise ArgumentError, ~r/spawn_observer/, fn ->
+        Daemon.start_link([argv: ["unused"]] ++ opts)
+      end
+
+      assert_raise ArgumentError, ~r/spawn_observer/, fn ->
+        Forcola.Stream.lines(["unused"], [timeout_ms: 5_000] ++ opts)
+      end
+    end
+  end
+
   defp first_spawned(session) do
     receive do
       message ->
@@ -331,6 +504,33 @@ defmodule Forcola.SpawnIdentityTest do
         identity
     after
       5_000 -> flunk("missing spawn identity")
+    end
+  end
+
+  defp first_observed(ref) do
+    receive do
+      message ->
+        assert {^ref, {:spawned, identity}} = message
+        identity
+    after
+      5_000 -> flunk("missing observed spawn identity")
+    end
+  end
+
+  defp await_daemon_identity(daemon, attempts \\ 500)
+  defp await_daemon_identity(_daemon, 0), do: flunk("daemon identity never arrived")
+
+  defp await_daemon_identity(daemon, attempts) do
+    case Daemon.spawned(daemon) do
+      {:ok, identity} ->
+        identity
+
+      {:error, :pending} ->
+        Process.sleep(10)
+        await_daemon_identity(daemon, attempts - 1)
+
+      result ->
+        flunk("unexpected daemon identity result: #{inspect(result)}")
     end
   end
 

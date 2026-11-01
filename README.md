@@ -183,10 +183,13 @@ options, and return/message shapes for each mode.
 ## Process groups and cleanup
 
 Pass `spawn_identity: true` to record the child's OS identity. One-shot
-results include `pid`, `pgid`, and `start_time`; Duplex and Daemon send
-`{:forcola_spawned, session, identity}` to their owner and expose `spawned/1`.
-Stream accepts `spawn_observer: {pid, reference}`, which enables identity
-reporting and sends `{reference, {:spawned, identity}}` before the first line.
+results include `pid`, `pgid`, and `start_time`; Duplex sends
+`{:forcola_spawned, session, identity}` to its owner. Duplex and Daemon expose
+`spawned/1` for polling. Daemon and Stream accept
+`spawn_observer: {pid, reference}`, which enables identity reporting and sends
+`{reference, {:spawned, identity}}` to that recipient before output delivery.
+Stream requires an observer when identity is enabled. Daemon sends no
+identity notifications unless an observer is supplied.
 The [identity example](https://hexdocs.pm/forcola/getting_started.html#record-process-identity)
 shows how to record a Duplex child's identity before sending input.
 

@@ -100,6 +100,8 @@ defmodule Forcola do
       Identity alone keeps the legacy output and spawn-error behavior.
       Without the option, identity fields are `nil` and no identity frame
       is requested. An identity does not prove that the process remains alive.
+      `:spawn_observer` is not supported by `run/2` and raises `ArgumentError`
+      when supplied; read identity from the result instead.
     * `:output_observer` - optional `{local_pid, reference}` receiving
       `{reference, {:stdout, bytes}}` and `{reference, {:stderr, bytes}}`
       as raw output frames arrive. Notifications are sent by the collector

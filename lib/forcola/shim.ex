@@ -72,7 +72,16 @@ defmodule Forcola.Shim do
   @doc false
   def negotiate(port, timeout_ms, required_features \\ ["bounded_run_v1"])
       when is_integer(timeout_ms) and timeout_ms >= 0 do
-    send_frame(port, 0x07, :json.encode(%{"features" => required_features}))
+    selected_features = Enum.reject(required_features, &(&1 == "bounded_run_v1"))
+
+    # bounded_run_v1 originally used an empty HELLO. It is a capability
+    # requirement, not a request to enable additional outbound frames.
+    payload =
+      if selected_features == [],
+        do: "",
+        else: :json.encode(%{"features" => selected_features})
+
+    send_frame(port, 0x07, payload)
 
     receive do
       {^port, {:data, <<0x15, payload::binary>>}} ->
@@ -126,6 +135,12 @@ defmodule Forcola.Shim do
       {pid, ref} when is_pid(pid) and node(pid) == node() and is_reference(ref) -> :ok
       _ -> raise ArgumentError, "spawn_observer must be {local_pid, reference} or nil"
     end
+  end
+
+  @doc false
+  def reject_spawn_observer!(opts, mode) do
+    if Keyword.has_key?(opts, :spawn_observer),
+      do: raise(ArgumentError, "#{mode} does not support :spawn_observer")
   end
 
   @doc false

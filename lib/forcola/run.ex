@@ -380,6 +380,7 @@ defmodule Forcola.Run do
   defp put_guard_close(outcome, _close), do: outcome
 
   defp validate!(opts) do
+    Shim.reject_spawn_observer!(opts, "Forcola.run/2")
     Shim.validate_spawn_identity!(opts)
     validate_observer!(opts[:output_observer])
 
