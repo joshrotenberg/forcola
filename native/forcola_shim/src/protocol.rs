@@ -178,6 +178,13 @@ pub struct ExitReport {
     /// Some child output was discarded because the drain deadline expired or
     /// the BEAM cancelled a strict output drain.
     pub output_truncated: bool,
+    /// Present only for negotiated lifetime descendant tracking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<&'static str>,
+    /// Observations were dropped from the bounded tracking delivery queue.
+    /// Present only with tracking; truncation prevents cleanup confirmation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_groups_truncated: Option<bool>,
 }
 
 /// Payload of an outbound ERROR frame.
@@ -336,6 +343,8 @@ mod tests {
             confirmed: true,
             contained: false,
             output_truncated: false,
+            scope: None,
+            tracked_groups_truncated: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"status\":0"));
@@ -353,6 +362,8 @@ mod tests {
             confirmed: false,
             contained: false,
             output_truncated: false,
+            scope: None,
+            tracked_groups_truncated: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"signal\":9"));

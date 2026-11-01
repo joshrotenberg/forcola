@@ -1,4 +1,4 @@
-//! Native process identity shared by SPAWNED and future TRACKED reports.
+//! Native process identity shared by SPAWNED and TRACKED reports.
 //!
 //! Read before reaping a child: even a child that exits immediately retains
 //! its kernel identity until wait(2), and its pid cannot be reused meanwhile.
@@ -6,7 +6,7 @@
 use serde::Serialize;
 use std::io;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub pgid: u32,
@@ -16,7 +16,7 @@ pub struct ProcessIdentity {
 /// Compare the complete tagged value when checking for pid reuse. Linux ticks
 /// are relative to boot, so a boot id is part of the identity. macOS exposes
 /// the native timeval without reducing its precision to ps's whole seconds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StartTime {
     #[cfg(target_os = "linux")]
@@ -25,25 +25,47 @@ pub enum StartTime {
     Macos { seconds: u64, microseconds: u64 },
 }
 
-#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct ProcessRecord {
+    pub identity: ProcessIdentity,
+    pub ppid: u32,
+    pub exited: bool,
+}
+
+impl ProcessIdentity {
+    /// A process may change groups while retaining the same native identity.
+    pub fn same_process(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.start_time == other.start_time
+    }
+}
+
 pub fn read(pid: u32) -> io::Result<ProcessIdentity> {
+    read_process(pid).map(|record| record.identity)
+}
+
+#[cfg(target_os = "linux")]
+pub fn read_process(pid: u32) -> io::Result<ProcessRecord> {
     let stat = std::fs::read(format!("/proc/{pid}/stat"))?;
-    let (pgid, ticks) = parse_stat(&stat)?;
+    let (ppid, pgid, ticks, exited) = parse_stat(&stat)?;
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
         .trim()
         .to_owned();
     if boot_id.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "empty boot id"));
     }
-    Ok(ProcessIdentity {
-        pid,
-        pgid,
-        start_time: StartTime::Linux { boot_id, ticks },
+    Ok(ProcessRecord {
+        identity: ProcessIdentity {
+            pid,
+            pgid,
+            start_time: StartTime::Linux { boot_id, ticks },
+        },
+        ppid,
+        exited,
     })
 }
 
 #[cfg(target_os = "linux")]
-fn parse_stat(stat: &[u8]) -> io::Result<(u32, u64)> {
+fn parse_stat(stat: &[u8]) -> io::Result<(u32, u32, u64, bool)> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid process stat");
     // comm (field 2) can contain arbitrary bytes, spaces and parentheses,
     // including ')'. Only the suffix containing numeric fields must be UTF-8.
@@ -53,26 +75,36 @@ fn parse_stat(stat: &[u8]) -> io::Result<(u32, u64)> {
         .ok_or_else(invalid)?;
     let fields = std::str::from_utf8(&stat[end + 1..]).map_err(|_| invalid())?;
     let mut fields = fields.split_whitespace();
-    // The suffix starts at field 3 (state); pgrp is field 5.
-    let pgid = fields
-        .nth(2)
+    // The suffix starts at field 3 (state), followed by ppid and pgrp.
+    let state = fields.next().ok_or_else(invalid)?;
+    let ppid = fields
+        .next()
         .ok_or_else(invalid)?
         .parse::<u32>()
         .map_err(|_| invalid())?;
+    let pgid_field = fields.next().ok_or_else(invalid)?;
+    // do_task_stat leaves pgrp at -1 if release_task cleared sighand before
+    // its locked read. The state was captured earlier and can still say S/Z.
+    // A zero pgrp also cannot identify a signalable process group.
+    let pgid = if pgid_field == "-1" {
+        0
+    } else {
+        pgid_field.parse::<u32>().map_err(|_| invalid())?
+    };
     // starttime is field 22, seventeen fields after pgrp.
     let ticks = fields
         .nth(16)
         .ok_or_else(invalid)?
         .parse::<u64>()
         .map_err(|_| invalid())?;
-    if pgid == 0 {
-        return Err(invalid());
+    if pgid == 0 || matches!(state, "X" | "x") {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
     }
-    Ok((pgid, ticks))
+    Ok((ppid, pgid, ticks, state == "Z"))
 }
 
 #[cfg(target_os = "macos")]
-pub fn read(pid: u32) -> io::Result<ProcessIdentity> {
+pub fn read_process(pid: u32) -> io::Result<ProcessRecord> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: proc_pidinfo writes at most size bytes to this correctly sized,
@@ -105,20 +137,24 @@ pub fn read(pid: u32) -> io::Result<ProcessIdentity> {
             "invalid process info",
         ));
     }
-    Ok(ProcessIdentity {
-        pid,
-        pgid: info.pbi_pgid,
-        // These are p_start.tv_sec/usec, the same kernel timeval exported as
-        // kp_proc.p_starttime by sysctl. libproc supplies a typed, stable ABI.
-        start_time: StartTime::Macos {
-            seconds: info.pbi_start_tvsec,
-            microseconds: info.pbi_start_tvusec,
+    Ok(ProcessRecord {
+        identity: ProcessIdentity {
+            pid,
+            pgid: info.pbi_pgid,
+            // These are p_start.tv_sec/usec, the same kernel timeval exported as
+            // kp_proc.p_starttime by sysctl. libproc supplies a typed, stable ABI.
+            start_time: StartTime::Macos {
+                seconds: info.pbi_start_tvsec,
+                microseconds: info.pbi_start_tvusec,
+            },
         },
+        ppid: info.pbi_ppid,
+        exited: info.pbi_status == 5, // SZOMB in sys/proc.h
     })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn read(_pid: u32) -> io::Result<ProcessIdentity> {
+pub fn read_process(_pid: u32) -> io::Result<ProcessRecord> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "process identity is unavailable",
@@ -194,7 +230,7 @@ mod tests {
     #[test]
     fn stat_parser_handles_spaces_and_parentheses_in_comm() {
         let stat = b"123 (a tricky ) name\xff) S 1 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 98765 0";
-        assert_eq!(super::parse_stat(stat).unwrap(), (123, 98765));
+        assert_eq!(super::parse_stat(stat).unwrap(), (1, 123, 98765, false));
         for bad in [
             "",
             "123 (name) S 1 0",
@@ -204,5 +240,55 @@ mod tests {
             assert!(super::parse_stat(bad.as_bytes()).is_err());
         }
         assert!(super::parse_stat(b"123 (name) S 1 123 \xff").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_stat(state: &str, pgid: &str, ticks: &str) -> String {
+        format!("123 (name) {state} 1 {pgid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {ticks} 0")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn released_process_stats_are_gone_instead_of_corrupt() {
+        for state in ["S", "Z", "X", "x"] {
+            for pgid in ["0", "-1"] {
+                let stat = process_stat(state, pgid, "98765");
+                let error = super::parse_stat(stat.as_bytes()).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::ESRCH), "{stat}");
+            }
+        }
+        for state in ["X", "x"] {
+            let stat = process_stat(state, "123", "98765");
+            assert_eq!(
+                super::parse_stat(stat.as_bytes())
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ESRCH),
+                "{stat}"
+            );
+        }
+        // An unreaped zombie still pins the leader identity for WNOWAIT cleanup.
+        assert_eq!(
+            super::parse_stat(process_stat("Z", "123", "98765").as_bytes()).unwrap(),
+            (1, 123, 98765, true)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_process_stats_remain_invalid_data() {
+        for stat in [
+            process_stat("S", "invalid", "98765"),
+            process_stat("S", "-2", "98765"),
+            process_stat("S", "0", "invalid"),
+            process_stat("X", "123", "invalid"),
+            "123 (name) X 1 123".to_owned(),
+        ] {
+            assert_eq!(
+                super::parse_stat(stat.as_bytes()).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData,
+                "{stat}"
+            );
+        }
     }
 }

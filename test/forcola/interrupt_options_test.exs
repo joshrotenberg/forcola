@@ -335,46 +335,71 @@ defmodule Forcola.InterruptOptionsTest do
           Task.async(fn ->
             opts = options(interrupt_grace_ms: 5_300)
 
-            case mode do
-              :duplex ->
-                {:ok, session} = Duplex.open(child.argv, opts)
+            cancellation_started =
+              case mode do
+                :duplex ->
+                  {:ok, session} = Duplex.open(child.argv, opts)
 
-                try do
-                  await_ready(child)
+                  try do
+                    await_ready(child)
+                    started = System.monotonic_time()
 
-                  assert {:ok, %{status: {:signal, 9}, confirmation: :confirmed}} =
-                           Duplex.shutdown(session)
-                after
-                  Duplex.close(session)
-                end
+                    assert {:ok, %{status: {:signal, 9}, confirmation: :confirmed}} =
+                             Duplex.shutdown(session)
 
-              :daemon ->
-                opts =
-                  opts ++ [argv: child.argv, ready: fn -> ready?(child) end, ready_poll_ms: 10]
-
-                {:ok, supervisor} =
-                  Supervisor.start_link([{Daemon, opts}], strategy: :one_for_one)
-
-                Supervisor.stop(supervisor, :normal, :infinity)
-
-              :stream ->
-                assert length(
-                         child.argv
-                         |> Forcola.Stream.lines(opts ++ [timeout_ms: 10_000])
-                         |> Enum.take(1)
-                       ) == 1
-
-              :stream_idle ->
-                error =
-                  assert_raise Forcola.Stream.Error, fn ->
-                    child.argv
-                    |> Forcola.Stream.lines(opts ++ [timeout_ms: 10_000, idle_timeout_ms: 100])
-                    |> Enum.to_list()
+                    started
+                  after
+                    Duplex.close(session)
                   end
 
-                assert error.status == {:signal, 9}
-            end
+                :daemon ->
+                  opts =
+                    opts ++ [argv: child.argv, ready: fn -> ready?(child) end, ready_poll_ms: 10]
 
+                  {:ok, supervisor} =
+                    Supervisor.start_link([{Daemon, opts}], strategy: :one_for_one)
+
+                  started = System.monotonic_time()
+                  Supervisor.stop(supervisor, :normal, :infinity)
+                  started
+
+                :stream ->
+                  child.argv
+                  |> Forcola.Stream.lines(opts ++ [timeout_ms: 10_000])
+                  |> Enum.reduce_while(nil, fn line, nil ->
+                    assert line == "ready"
+                    {:halt, System.monotonic_time()}
+                  end)
+
+                :stream_idle ->
+                  ready_ref = make_ref()
+
+                  # Isolate cleanup waiting by allowing the fixture to install its
+                  # signal handlers before the idle timer cancels the process.
+                  error =
+                    assert_raise Forcola.Stream.Error, fn ->
+                      child.argv
+                      |> Forcola.Stream.lines(
+                        opts ++ [timeout_ms: 10_000, idle_timeout_ms: 1_000]
+                      )
+                      |> Stream.each(fn line ->
+                        assert line == "ready"
+                        send(self(), {ready_ref, System.monotonic_time()})
+                      end)
+                      |> Enum.to_list()
+                    end
+
+                  assert error.idle_timed_out
+                  assert error.status == {:signal, 9}
+                  assert_receive {^ready_ref, started}
+                  started
+              end
+
+            # Measure the caller's wait, not Python's signal-handler scheduling.
+            # The idle case also includes the silent interval before cancellation.
+            elapsed = System.monotonic_time() - cancellation_started
+            minimum = System.convert_time_unit(5_300 + @kill_grace, :millisecond, :native)
+            assert elapsed >= minimum
             assert_escalated(child, 5_300)
           end)
 
@@ -436,10 +461,8 @@ defmodule Forcola.InterruptOptionsTest do
     pid = await_ready(child)
     assert eventually(fn -> not alive?(pid) end), "child survived the kill sequence"
     assert ["INT " <> int_at, "TERM " <> term_at] = signal_lines(child)
-    int_at = String.to_integer(int_at)
-    term_at = String.to_integer(term_at)
-    # Millisecond timestamps permit one millisecond of rounding at each end.
-    assert term_at - int_at >= grace - 2
+    # Allow handler scheduling latency while still catching a skipped grace.
+    assert String.to_integer(term_at) - String.to_integer(int_at) >= grace - 100
   end
 
   defp signal_lines(child),

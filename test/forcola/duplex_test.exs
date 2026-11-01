@@ -297,7 +297,8 @@ defmodule Forcola.DuplexTest do
                 status: 7,
                 confirmation: :confirmed,
                 cause: :explicit_close,
-                scope: :active_cgroup
+                scope: :active_cgroup,
+                contained: true
               }} = Forcola.Duplex.shutdown(session)
 
       Forcola.Duplex.forget_terminal(session)

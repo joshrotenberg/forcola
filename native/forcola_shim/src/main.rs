@@ -16,7 +16,9 @@
 //! - a normally exiting leader triggers the same cleanup for any descendants
 //!   that remain in its process group
 //! - EOF on the shim's stdin means the BEAM died; the shim kills the group
-//!   and exits
+//!   and exits. Tracked mode independently detects a closed protocol output
+//!   peer even when child input blocks the reader. The untracked synchronous
+//!   input path can delay EOF handling while its child write is blocked.
 //!
 //! Wire protocol (BEAM <-> shim), legacy framing with optional v1 handshake:
 //!
@@ -78,8 +80,10 @@
 //!                Linux ticks are /proc/<pid>/stat field 22 since boot;
 //!                macOS uses the native process-start timeval. Compare every
 //!                field when checking identity, including the Linux boot id.
-//!   0x17         reserved for future TRACKED frames with the same identity
-//!                payload and a separate capability selection.
+//!   0x17 TRACKED Same identity payload, selected by track_descendants_v1.
+//!                The root group is first, before output; newly discovered
+//!                descendant group leaders follow. Tracking adds EXIT scope
+//!                tree_contained (Linux subreaper) or tree_sampled (macOS).
 
 mod cgroup;
 mod credit;
@@ -89,15 +93,18 @@ mod privdrop;
 mod protocol;
 mod spawn_error;
 mod supervisor;
+mod tracking;
 
 use std::io;
+use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
-    match supervisor::run(stdin, stdout) {
+    let protocol_fd = stdout.as_raw_fd();
+    match supervisor::run(stdin, stdout, Some(protocol_fd)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("forcola_shim: fatal: {err}");

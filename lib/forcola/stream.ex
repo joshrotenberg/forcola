@@ -82,7 +82,7 @@ defmodule Forcola.Stream do
   consumes.
   """
 
-  alias Forcola.Shim
+  alias Forcola.{Shim, Tracking}
 
   require Logger
 
@@ -107,6 +107,17 @@ defmodule Forcola.Stream do
         when bounded output exceeded its configured limit
       * `:output_truncated` - whether output was deliberately discarded or
         the shim reported an incomplete drain
+      * `:tracked_groups` - observed cleanup-group identities, root first,
+        including observations consumed during cancellation; defaults to `[]`
+      * `:tracked_groups_truncated` - whether observations are missing,
+        malformed, or dropped by a history/notification bound. Execution and
+        native cleanup confirmation are independent of this history fact.
+      * `:contained` - the native cgroup-placement flag, or `:unknown` if
+        unavailable, independently of the tree cleanup scope
+      * `:scope` / `:confirmation` - the reported cleanup mechanism and its
+        confirmation. Tracking uses explicit `:tree_contained` or
+        `:tree_sampled`; missing or unknown scope is `:unknown` and cannot
+        confirm cleanup. See `Forcola.Result` for scope limitations.
     """
 
     defexception [
@@ -116,7 +127,12 @@ defmodule Forcola.Stream do
       stderr: "",
       timed_out: false,
       idle_timed_out: false,
-      output_truncated: false
+      output_truncated: false,
+      tracked_groups: [],
+      tracked_groups_truncated: false,
+      contained: :unknown,
+      scope: :unknown,
+      confirmation: :unknown
     ]
 
     @type t :: %__MODULE__{
@@ -126,7 +142,13 @@ defmodule Forcola.Stream do
             stderr: binary(),
             timed_out: boolean(),
             idle_timed_out: boolean(),
-            output_truncated: boolean()
+            output_truncated: boolean(),
+            tracked_groups: [Forcola.Shim.identity()],
+            tracked_groups_truncated: boolean(),
+            contained: boolean() | :unknown,
+            scope: :process_group | :active_cgroup | :tree_contained | :tree_sampled | :unknown,
+            confirmation:
+              :confirmed | :unconfirmed | :unknown | :not_started | :timeout | :transport_lost
           }
 
     @impl true
@@ -219,6 +241,30 @@ defmodule Forcola.Stream do
   before SPAWN. This option works independently of identity observation
   and keeps the existing stream output and exception envelopes.
 
+  `:track_descendants` (default `false`) selects `track_descendants_v1` for
+  lifetime tracking and cleanup of descendant process groups. It requires no
+  observer and preserves the line-only stream. Linux reports `:tree_contained`
+  through subreaper adoption; macOS reports `:tree_sampled`. A descendant
+  reparented before its first macOS sample is outside the sampled guarantee.
+  Histories contain the root group first and at most 4,096 group identities.
+  Missing, malformed or overflowing observations mark history truncated without
+  changing native cleanup confirmation. Unknown scope or malformed EXIT cannot
+  confirm cleanup. Tracking composes with the other capabilities and counts
+  negotiation toward the whole-run timeout.
+
+  Optional `:track_observer` accepts `{local_pid, reference}` and enables
+  tracking even with `track_descendants: false`. It receives
+  `{reference, {:tracked, identity}}` for each newly observed group and one
+  `{reference, {:tracking_exit, evidence}}`
+  when enumeration can report its completion, cancellation, or failure.
+  The observer is the terminal evidence surface for successful or halted
+  streams; exceptions also retain `:tracked_groups`, `:scope`, `:contained`,
+  `:tracked_groups_truncated`, and `:confirmation`. See `Forcola.run/2` for
+  confirmation values and `Forcola.Result` for identity fields. A consumer paused between pulls delays
+  observer messages until frames are consumed; native tracking and cleanup
+  continue. Tracking frames do not reset output idle deadlines or use output
+  credit. Brutal consumer or VM death can prevent a final observer message.
+
   `:spawn_observer` accepts `{local_pid, reference}` and sends
   `{reference, {:spawned, identity}}` before the first output line is yielded.
   The identity is `%{pid: integer, pgid: integer, start_time: map}`; see
@@ -264,6 +310,7 @@ defmodule Forcola.Stream do
   """
   @spec lines([String.t(), ...], keyword()) :: Enumerable.t()
   def lines([_binary | _] = argv, opts) do
+    opts = Tracking.validate_opts!(opts)
     Shim.validate_spawn_identity!(opts)
     Shim.validate_structured_spawn_errors!(opts)
     Shim.validate_execution_options!(opts)
@@ -400,6 +447,7 @@ defmodule Forcola.Stream do
           identity_enabled: Shim.identity_requested?(opts),
           structured_spawn_errors: Keyword.get(opts, :structured_spawn_errors, false),
           identity: nil,
+          tracking: Tracking.new(opts),
           spawn_observer: opts[:spawn_observer],
           buffer: "",
           stderr: [],
@@ -420,10 +468,12 @@ defmodule Forcola.Stream do
         }
 
       {:error, :not_found} ->
-        raise Error, reason: :shim_not_found
+        Tracking.startup_failed(opts)
+        raise Error, reason: :shim_not_found, confirmation: :not_started
 
       {:error, reason} ->
-        raise Error, reason: reason
+        Tracking.startup_failed(opts)
+        raise Error, reason: reason, confirmation: :not_started
     end
   end
 
@@ -432,8 +482,9 @@ defmodule Forcola.Stream do
       remaining = timeout_ms - (System.monotonic_time(:millisecond) - started_at)
 
       if remaining <= 0 do
+        Tracking.startup_failed(opts)
         Shim.close(port)
-        raise Error, reason: :handshake_timeout
+        raise Error, reason: :handshake_timeout, confirmation: :not_started
       end
 
       remaining
@@ -496,13 +547,20 @@ defmodule Forcola.Stream do
 
       {^port, {:exit_status, _status}} ->
         # The shim exited without sending EXIT/ERROR (e.g. it crashed).
-        error = %Error{status: {:signal, :unconfirmed}, stderr: stderr(state)}
+        state = finish_tracking(state, :unknown, :transport_lost)
+
+        error =
+          tracking_error(state, status: {:signal, :unconfirmed}, confirmation: :transport_lost)
+
         {[], %{state | exit: {:error, error}}}
     after
       min(max(wait, 0), 4_294_967_295) ->
-        if wait > 4_294_967_295,
-          do: receive_next(state),
-          else: {[], %{state | exit: {:error, timeout_error(state)}}}
+        if wait > 4_294_967_295 do
+          receive_next(state)
+        else
+          {error, state} = timeout_error(state)
+          {[], %{state | exit: {:error, error}}}
+        end
     end
   end
 
@@ -557,28 +615,88 @@ defmodule Forcola.Stream do
   # (stdin EOF) in cleanup/1 is the remaining kill lever.
   defp timeout_error(%{idle_deadline: idle_deadline, deadline: deadline} = state)
        when not is_nil(idle_deadline) and idle_deadline <= deadline do
-    status =
-      case kill_and_confirm(state) do
-        {:exit, status, _timed_out} -> status
-        _unconfirmed -> {:signal, :unconfirmed}
-      end
-
-    %Error{status: status, idle_timed_out: true, stderr: stderr(state)}
+    {result, state} = kill_and_confirm(state)
+    {evidence, state} = cleanup_evidence(result, state)
+    error = tracking_error(state, Map.to_list(evidence) ++ [idle_timed_out: true])
+    {error, state}
   end
 
   defp timeout_error(state) do
-    %Error{status: {:signal, :unconfirmed}, timed_out: true, stderr: stderr(state)}
+    state = finish_tracking(state, :unknown, :timeout)
+
+    error =
+      tracking_error(state,
+        status: {:signal, :unconfirmed},
+        timed_out: true,
+        confirmation: :timeout
+      )
+
+    {error, state}
   end
 
-  # KILL the group and block until the shim confirms death, mirroring the
-  # early-halt path in cleanup/1. cleanup/1 will still close and flush the
-  # port afterward; the exit is already set, so it takes the non-handshake
-  # clause and does not KILL again.
+  # Preserve identities discovered during cancellation alongside its report.
   defp kill_and_confirm(%{port: port, cleanup_timeout_ms: cleanup_timeout_ms} = state) do
     Shim.send_frame(port, Shim.tag_kill())
     await_exit(state, cleanup_timeout_ms)
   catch
-    :error, :badarg -> :shim_exited
+    :error, :badarg -> {:shim_exited, state}
+  end
+
+  defp finish_tracking(state, scope, confirmation, contained \\ :unknown, truncated \\ false),
+    do: %{
+      state
+      | tracking: Tracking.finish(state.tracking, scope, confirmation, contained, truncated)
+    }
+
+  defp tracking_error(state, fields) do
+    struct!(
+      Error,
+      [
+        stderr: stderr(state),
+        tracked_groups: Tracking.groups(state.tracking),
+        tracked_groups_truncated: state.tracking.truncated
+      ] ++ fields
+    )
+  end
+
+  defp cleanup_evidence({:exit, report}, state) do
+    confirmation = Tracking.confirmation(report)
+
+    evidence = %{
+      status: Tracking.status(report),
+      scope: report.scope,
+      confirmation: confirmation,
+      contained: report.contained,
+      tracked_groups_truncated: report.tracked_groups_truncated
+    }
+
+    {evidence,
+     finish_tracking(
+       state,
+       report.scope,
+       confirmation,
+       report.contained,
+       report.tracked_groups_truncated
+     )}
+  end
+
+  defp cleanup_evidence(result, state) do
+    confirmation =
+      case result do
+        :timeout -> :timeout
+        :error -> :not_started
+        :shim_exited -> :transport_lost
+        _ -> :unconfirmed
+      end
+
+    evidence = %{
+      status: {:signal, :unconfirmed},
+      scope: :unknown,
+      confirmation: confirmation,
+      contained: :unknown
+    }
+
+    {evidence, finish_tracking(state, :unknown, confirmation)}
   end
 
   defp handle_frame(tag, payload, state) do
@@ -595,20 +713,34 @@ defmodule Forcola.Stream do
       tag == Shim.tag_spawned() ->
         {[], record_identity(state, payload)}
 
+      tag == Shim.tag_tracked() ->
+        # Control frames do not finish a demand cycle or reset its idle clock.
+        receive_next(record_tracked(state, payload))
+
       tag == Shim.tag_exit() ->
         handle_exit(payload, state)
 
       tag == Shim.tag_error() ->
-        error = %Error{
-          reason: Shim.decode_error(payload, state.structured_spawn_errors),
-          stderr: stderr(state)
-        }
+        state = finish_tracking(state, :unknown, :not_started)
+
+        error =
+          tracking_error(state,
+            reason: Shim.decode_error(payload, state.structured_spawn_errors),
+            confirmation: :not_started
+          )
 
         {[], %{state | exit: {:error, error}}}
 
       true ->
         {[], state}
     end
+  end
+
+  defp record_tracked(state, payload) do
+    {tracking, identity} = Tracking.record(state.tracking, payload)
+    state = %{state | tracking: tracking}
+    Tracking.notify_record(tracking, identity)
+    state
   end
 
   defp record_identity(%{identity_enabled: true, identity: nil} = state, payload) do
@@ -679,38 +811,42 @@ defmodule Forcola.Stream do
   defp line_source(_state), do: :stdout
 
   defp stop_for_limit(state, limit) do
-    status =
-      case kill_and_confirm(state) do
-        {:exit, status, _timed_out} -> status
-        _unconfirmed -> {:signal, :unconfirmed}
-      end
-
-    error = %Error{
-      status: status,
-      limit: limit,
-      stderr: stderr(state),
-      output_truncated: true
-    }
-
+    {result, state} = kill_and_confirm(state)
+    {evidence, state} = cleanup_evidence(result, state)
+    error = tracking_error(state, Map.to_list(evidence) ++ [limit: limit, output_truncated: true])
     %{state | buffer: "", exit: {:error, error}}
   end
 
   defp handle_exit(payload, state) do
-    {status, timed_out} = Shim.decode_exit(payload)
-    report = Shim.decode_exit_report(payload)
+    report = Tracking.report(state.tracking, payload)
+    status = Tracking.status(report)
+    confirmation = Tracking.confirmation(report)
+
+    state =
+      finish_tracking(
+        state,
+        report.scope,
+        confirmation,
+        report.contained,
+        report.tracked_groups_truncated
+      )
+
     final = if state.buffer == "", do: [], else: [state.buffer]
 
     outcome =
-      if status == 0 and not timed_out and not report.output_truncated do
+      if status == 0 and not report.timed_out and not report.output_truncated do
         :ok
       else
         {:error,
-         %Error{
+         tracking_error(state,
            status: status,
-           timed_out: timed_out,
-           stderr: stderr(state),
-           output_truncated: report.output_truncated
-         }}
+           timed_out: report.timed_out,
+           output_truncated: report.output_truncated,
+           scope: report.scope,
+           contained: report.contained,
+           tracked_groups_truncated: report.tracked_groups_truncated,
+           confirmation: confirmation
+         )}
       end
 
     {final, %{state | buffer: "", exit: outcome}}
@@ -744,19 +880,10 @@ defmodule Forcola.Stream do
   # Early halt: the child may still be running. Kill the group and wait
   # for the shim's EXIT frame (the shim confirms group death before
   # sending it), so the halt does not return until the group is dead.
-  defp cleanup(%{port: port, exit: nil, cleanup_timeout_ms: cleanup_timeout_ms} = state) do
-    confirmation =
-      try do
-        Shim.send_frame(port, Shim.tag_kill())
-        await_exit(state, cleanup_timeout_ms)
-      catch
-        # The port raced us shut (shim already gone); its death killed the
-        # group by the shim's stdin-EOF rule, so there is nothing to wait on.
-        :error, :badarg -> :ok
-      end
-
-    warn_unconfirmed_cleanup(confirmation)
-
+  defp cleanup(%{port: port, exit: nil} = state) do
+    {result, state} = kill_and_confirm(state)
+    cleanup_evidence(result, state)
+    warn_unconfirmed_cleanup(result)
     close_port(port)
   end
 
@@ -773,35 +900,35 @@ defmodule Forcola.Stream do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if remaining <= 0 do
-      :timeout
+      {:timeout, state}
     else
       receive do
         {^port, {:data, <<tag, payload::binary>>}} ->
           cond do
-            tag == Shim.tag_exit() -> decode_terminal_exit(payload)
-            tag == Shim.tag_error() -> :error
+            tag == Shim.tag_exit() -> {decode_terminal_exit(state, payload), state}
+            tag == Shim.tag_error() -> {:error, state}
             tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
+            tag == Shim.tag_tracked() -> do_await_exit(record_tracked(state, payload), deadline)
             true -> do_await_exit(state, deadline)
           end
 
         {^port, {:exit_status, _status}} ->
-          :shim_exited
+          {:shim_exited, state}
       after
         min(remaining, 4_294_967_295) -> do_await_exit(state, deadline)
       end
     end
   end
 
-  defp decode_terminal_exit(payload) do
-    {status, timed_out} = Shim.decode_exit(payload)
-    {:exit, status, timed_out}
+  defp decode_terminal_exit(state, payload) do
+    {:exit, Tracking.report(state.tracking, payload)}
   rescue
     _invalid_payload -> :malformed_exit
   catch
     _kind, _reason -> :malformed_exit
   end
 
-  defp warn_unconfirmed_cleanup({:exit, {:signal, :unconfirmed}, _timed_out}) do
+  defp warn_unconfirmed_cleanup({:exit, %{confirmed: false}}) do
     Logger.warning("forcola: stream cleanup could not confirm process-group death")
   end
 

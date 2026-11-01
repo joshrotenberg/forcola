@@ -56,6 +56,24 @@ defmodule Forcola.Daemon do
       polling. The struct retains the original string in `:message`.
       Requires `structured_spawn_errors_v1` with a five-second negotiation
       bound; incompatible shims fail before SPAWN.
+    * `:track_descendants` - opt in to lifetime descendant-group tracking
+      and cleanup, default `false`. Requires `track_descendants_v1` before
+      SPAWN; `tracked/2` returns the live daemon's history, root group first.
+      Histories are bounded at 4,096 group identities. Linux reports
+      `:tree_contained` through subreaper adoption; macOS reports
+      `:tree_sampled`. A descendant reparented before its first macOS sample
+      is outside that guarantee. Incomplete observations mark history truncated,
+      independently of native cleanup confirmation. Unknown scope or malformed
+      EXIT cannot confirm cleanup.
+    * `:track_observer` - optional `{local_pid, reference}` receiving
+      `{reference, {:tracked, identity}}` and one terminal
+      `{reference, {:tracking_exit, evidence}}`
+      on startup failure, exit, readiness failure, or shutdown when the daemon
+      survives to report it. A non-nil observer enables tracking even with
+      `track_descendants: false`. Only this explicit observer is notified;
+      the supervisor receives no implicit tracking messages. See
+      `Forcola.run/2` for confirmation values and `Forcola.Result` for the
+      identity shape. Tracking works independently of `:spawn_identity`.
     * `:spawn_identity` - request the child's native identity for `spawned/1`,
       default `false`. This sends no notification by itself. Requires
       `spawn_identity_v1` negotiation with a five-second handshake bound;
@@ -134,7 +152,7 @@ defmodule Forcola.Daemon do
 
   require Logger
 
-  alias Forcola.Shim
+  alias Forcola.{Shim, Tracking}
 
   @default_kill_grace_ms 5_000
   @default_ready_timeout_ms 5_000
@@ -188,6 +206,7 @@ defmodule Forcola.Daemon do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
+    opts = Tracking.validate_opts!(opts)
     validate_opts!(opts)
     opts = if opts[:spawn_observer], do: Keyword.put(opts, :spawn_identity, true), else: opts
     {name, opts} = Keyword.pop(opts, :name)
@@ -217,6 +236,24 @@ defmodule Forcola.Daemon do
     :exit, _ -> {:error, :closed}
   end
 
+  @doc """
+  Returns the live daemon's cleanup-group history in first-observed order.
+
+  Enabled tracking starts with `{:ok, []}` and records the root group before
+  descendants. Entries are observations, not proof of current liveness.
+  Disabled daemons return `{:error, :not_requested}`; a query timeout returns
+  `{:error, :pending}`, and an exited daemon returns `{:error, :closed}`.
+  Use `:track_observer` to retain observations after the daemon exits.
+  """
+  @spec tracked(GenServer.server(), timeout()) ::
+          {:ok, [Shim.identity()]} | {:error, :not_requested | :pending | :closed}
+  def tracked(daemon, timeout \\ 5_000) do
+    GenServer.call(daemon, :tracked, timeout)
+  catch
+    :exit, {:timeout, _call} -> {:error, :pending}
+    :exit, _ -> {:error, :closed}
+  end
+
   @impl true
   def init(opts) do
     # Trap exits so terminate/2 runs on supervisor shutdown and on owner
@@ -237,6 +274,7 @@ defmodule Forcola.Daemon do
           identity_enabled: Shim.identity_requested?(opts),
           structured_spawn_errors: Keyword.get(opts, :structured_spawn_errors, false),
           identity: nil,
+          tracking: Tracking.new(opts),
           output: Keyword.get(opts, :output, :logger),
           log_level: Keyword.get(opts, :log_output, :info),
           log_prefix: Keyword.get(opts, :log_prefix, ""),
@@ -255,9 +293,11 @@ defmodule Forcola.Daemon do
         end
 
       {:error, :not_found} ->
+        Tracking.startup_failed(opts)
         {:stop, {:spawn, :shim_not_found}}
 
       {:error, reason} ->
+        Tracking.startup_failed(opts)
         {:stop, {:spawn, reason}}
     end
   end
@@ -270,6 +310,12 @@ defmodule Forcola.Daemon do
     do: {:reply, {:error, :pending}, state}
 
   def handle_call(:spawned, _from, state), do: {:reply, {:ok, state.identity}, state}
+
+  def handle_call(:tracked, _from, %{tracking: %{enabled: false}} = state),
+    do: {:reply, {:error, :not_requested}, state}
+
+  def handle_call(:tracked, _from, state),
+    do: {:reply, {:ok, Tracking.groups(state.tracking)}, state}
 
   @impl true
   def handle_info({port, {:data, <<tag, payload::binary>>}}, %{port: port} = state) do
@@ -285,6 +331,7 @@ defmodule Forcola.Daemon do
     # The shim exited without sending EXIT/ERROR (e.g. it crashed). Its
     # death killed the group by the shim's own on-drop rule, but that
     # cannot be confirmed from here.
+    state = finish_tracking(state, :unknown, :transport_lost)
     {:stop, {:shim_exited, status}, %{state | exit: {:shim_exited, status}}}
   end
 
@@ -438,16 +485,37 @@ defmodule Forcola.Daemon do
       tag == Shim.tag_spawned() ->
         record_identity(state, payload)
 
+      tag == Shim.tag_tracked() ->
+        record_tracked(state, payload)
+
       tag == Shim.tag_exit() ->
         handle_exit(state, payload)
 
       tag == Shim.tag_error() ->
-        %{state | exit: {:spawn_error, Shim.decode_error(payload, state.structured_spawn_errors)}}
+        state
+        |> finish_tracking(:unknown, :not_started)
+        |> Map.put(
+          :exit,
+          {:spawn_error, Shim.decode_error(payload, state.structured_spawn_errors)}
+        )
 
       true ->
         state
     end
   end
+
+  defp record_tracked(state, payload) do
+    {tracking, identity} = Tracking.record(state.tracking, payload)
+    state = %{state | tracking: tracking}
+    Tracking.notify_record(tracking, identity)
+    state
+  end
+
+  defp finish_tracking(state, scope, confirmation, contained \\ :unknown, truncated \\ false),
+    do: %{
+      state
+      | tracking: Tracking.finish(state.tracking, scope, confirmation, contained, truncated)
+    }
 
   defp record_identity(%{identity_enabled: true, identity: nil} = state, payload) do
     case Shim.decode_identity(payload) do
@@ -467,11 +535,20 @@ defmodule Forcola.Daemon do
   defp record_identity(state, _payload), do: state
 
   defp handle_exit(state, payload) do
-    if Shim.decode_contained(payload) do
+    report = Tracking.report(state.tracking, payload)
+
+    if report.contained == true do
       Logger.debug("forcola: daemon ran under Linux cgroup v2 containment")
     end
 
-    %{state | exit: {:exit, Shim.decode_exit(payload)}}
+    state
+    |> finish_tracking(
+      report.scope,
+      Tracking.confirmation(report),
+      report.contained,
+      report.tracked_groups_truncated
+    )
+    |> Map.put(:exit, {:exit, {Tracking.status(report), report.timed_out}})
   end
 
   defp stop_reason({:exit, {0, _timed_out}}), do: :normal
@@ -523,25 +600,43 @@ defmodule Forcola.Daemon do
   # The child may still be running: kill the group and wait for the
   # shim's EXIT frame (the shim confirms group death before sending it).
   defp shutdown(%{port: port, exit: nil, cleanup_timeout_ms: cleanup_timeout_ms} = state) do
-    confirmation =
+    {confirmation, state} =
       try do
         Shim.send_frame(port, Shim.tag_kill())
         await_exit(state, cleanup_timeout_ms)
       catch
         # The port raced us shut (shim already gone); its death killed the
         # group by the shim's stdin-EOF rule, so there is nothing to wait on.
-        :error, :badarg -> :ok
+        :error, :badarg -> {:transport_lost, state}
       end
 
+    finish_cleanup_tracking(state, confirmation)
     warn_unconfirmed_cleanup(confirmation)
 
     close_port(port)
   end
 
   # The shim already accounted for the child; nothing left to kill.
-  defp shutdown(%{port: port}) do
+  defp shutdown(%{port: port} = state) do
+    confirmation =
+      if match?({:spawn_error, _}, state.exit), do: :not_started, else: :transport_lost
+
+    finish_tracking(state, :unknown, confirmation)
     close_port(port)
   end
+
+  defp finish_cleanup_tracking(state, {:exit, report}),
+    do:
+      finish_tracking(
+        state,
+        report.scope,
+        Tracking.confirmation(report),
+        report.contained,
+        report.tracked_groups_truncated
+      )
+
+  defp finish_cleanup_tracking(state, confirmation),
+    do: finish_tracking(state, :unknown, confirmation)
 
   defp await_exit(state, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
@@ -552,31 +647,28 @@ defmodule Forcola.Daemon do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if remaining <= 0 do
-      :timeout
+      {:timeout, state}
     else
       receive do
         {^port, {:data, <<tag, payload::binary>>}} ->
           cond do
-            tag == Shim.tag_exit() -> exit_confirmation(payload)
-            tag == Shim.tag_error() -> :ok
+            tag == Shim.tag_exit() -> {{:exit, Tracking.report(state.tracking, payload)}, state}
+            tag == Shim.tag_error() -> {:not_started, state}
             tag == Shim.tag_spawned() -> do_await_exit(record_identity(state, payload), deadline)
+            tag == Shim.tag_tracked() -> do_await_exit(record_tracked(state, payload), deadline)
             true -> do_await_exit(state, deadline)
           end
 
         {^port, {:exit_status, _status}} ->
-          :ok
+          {:transport_lost, state}
       after
         min(remaining, 4_294_967_295) -> do_await_exit(state, deadline)
       end
     end
   end
 
-  defp exit_confirmation(payload) do
-    case Shim.decode_exit(payload) do
-      {{:signal, :unconfirmed}, _timed_out} -> :unconfirmed
-      _confirmed -> :ok
-    end
-  end
+  defp warn_unconfirmed_cleanup({:exit, report}),
+    do: warn_unconfirmed_cleanup(Tracking.confirmation(report))
 
   defp warn_unconfirmed_cleanup(:unconfirmed) do
     Logger.warning("forcola: daemon cleanup could not confirm process-group death")
