@@ -39,28 +39,6 @@ defmodule Forcola.BoundedRunTest do
     shim = fake_shim(dir, "legacy")
     argv = ["/bin/true"]
 
-    for option <- [
-          [env_mode: :replace],
-          [env_mode: :inherit],
-          [env_mode: nil],
-          [interrupt_signal: :int, interrupt_grace_ms: 10],
-          [interrupt_signal: nil],
-          [interrupt_grace_ms: nil]
-        ],
-        call <- [
-          fn -> Forcola.Stream.lines(argv, option ++ [timeout_ms: 1_000, shim_path: shim]) end,
-          fn -> Forcola.Duplex.open(argv, option ++ [shim_path: shim]) end,
-          fn ->
-            Forcola.Duplex.open(
-              argv,
-              option ++ [delivery: :pull, max_output_bytes: 100, shim_path: shim]
-            )
-          end,
-          fn -> Forcola.Daemon.start_link(option ++ [argv: argv, shim_path: shim]) end
-        ] do
-      assert_raise ArgumentError, ~r/use Forcola.run\/2/, call
-    end
-
     for call <- [
           fn ->
             Forcola.Stream.lines(argv,

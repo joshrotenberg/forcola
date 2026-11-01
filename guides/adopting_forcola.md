@@ -279,15 +279,27 @@ is at most `4_294_967_295`. Invalid options raise before opening a shim. The
 trusted `shim_path:` override remains available. Explicit new options
 require protocol 1 / `bounded_run_v1` capability support
 before SPAWN; incompatible shims cannot silently execute with ignored options.
-Stream, Duplex, and Daemon reject `env_mode` and the interrupt pair before
-opening a shim. Stream and Daemon also reject `max_output_bytes`; Duplex
+Duplex, Stream and Daemon accept the same `env_mode` and interrupt pair,
+with the same `bounded_run_v1` requirement and validation. Stream and Daemon
+reject `max_output_bytes`; Duplex
 keeps its existing support with `delivery: :pull`. Duplex and Daemon reject
 `idle_timeout_ms`; Stream keeps its existing idle-timeout support. These
 existing mode options keep their own validation and semantics.
-With any new option, explicit `env:` must be a list of binary string pairs
-with nonempty names, no `=` in names, and no NUL in names or values. Without
-new options, legacy `env: nil`, maps, and atom keys retain their existing
-encoding and native spawn-error behavior.
+With strict Run options or explicit environment/interrupt options, `env:` must
+be a list of binary names and binary, `nil`, or `false` values. Names must be
+nonempty without `=` or NUL; binary values must contain no NUL. Every mode
+accepts `nil` and `false` values as removals and rejects other non-binary values
+before opening the shim. Removals independently require `env_unset_v1` before
+SPAWN; they keep Run's legacy collector when no strict option is present.
+Plain `env: nil`, maps and atom keys retain their existing encoding.
+
+The interrupt pair applies to every kill path, including Duplex close/shutdown,
+Stream halt and consumer exceptions, owner/BEAM death, Stream timeouts and
+limits, Duplex limits, and Daemon readiness timeout or supervisor shutdown.
+All cleanup waits include both graces. Daemon's generated child spec includes
+the confirmation and guard-close bounds plus a scheduling margin. A caller
+that overrides its `shutdown` value must allow sufficient time to receive
+confirmation. Duplex `recv/2` timeout and `send_eof/1` do not cancel a child.
 
 Handle `{:error, {reason, partial_result}}` for `:timeout`, `:idle_timeout`,
 `:max_output_bytes`, and `:observer_overflow`. With new options, a reported

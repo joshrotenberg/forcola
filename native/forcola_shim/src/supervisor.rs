@@ -286,7 +286,11 @@ fn supported_features_with_probe<F>(
 where
     F: FnOnce() -> io::Result<()>,
 {
-    let mut features = vec!["bounded_run_v1", "structured_spawn_errors_v1"];
+    let mut features = vec![
+        "bounded_run_v1",
+        "env_unset_v1",
+        "structured_spawn_errors_v1",
+    ];
     // Probe the running shim when HELLO is handled, including an empty HELLO,
     // rather than assuming that a supported OS makes its process metadata
     // readable. This catches unavailable procfs or denied libproc access
@@ -393,8 +397,11 @@ fn spawn_child(
     if request.env_mode == EnvMode::Replace {
         cmd.env_clear();
     }
-    if !request.env.is_empty() {
-        cmd.envs(&request.env);
+    for (name, value) in &request.env {
+        match value {
+            Some(value) => cmd.env(name, value),
+            None => cmd.env_remove(name),
+        };
     }
 
     // Resolve user/group names to numeric ids in the PARENT, before fork, and
@@ -1275,6 +1282,7 @@ mod tests {
             assert_eq!(calls.get(), 1);
             assert_eq!(first, again);
             assert!(first.contains(&"bounded_run_v1"));
+            assert!(first.contains(&"env_unset_v1"));
             assert_eq!(first.contains(&"spawn_identity_v1"), available);
         }
     }
@@ -1341,11 +1349,12 @@ mod tests {
 
     #[test]
     fn selected_features_require_explicit_supported_selection() {
-        let supported = ["bounded_run_v1", "spawn_identity_v1"];
+        let supported = ["bounded_run_v1", "env_unset_v1", "spawn_identity_v1"];
         for payload in [
             b"".as_slice(),
             br#"{"features":[]}"#,
             br#"{"features":["bounded_run_v1"]}"#,
+            br#"{"features":["env_unset_v1","bounded_run_v1"]}"#,
         ] {
             assert_eq!(
                 super::select_features(payload, &supported).unwrap(),

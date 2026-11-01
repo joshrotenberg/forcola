@@ -11,7 +11,8 @@
 //!   terminal (`TIOCSCTTY` after `setsid`), and all of its output comes back
 //!   as STDOUT frames since a pty merges stderr onto the one terminal.
 //! - a timeout (or an explicit kill frame) triggers SIGTERM to the whole
-//!   group (`kill(-pgid, SIGTERM)`), escalating to SIGKILL after the grace
+//!   group (`kill(-pgid, SIGTERM)`), escalating to SIGKILL after the grace.
+//!   An optional SIGINT and its own grace precede this sequence.
 //! - a normally exiting leader triggers the same cleanup for any descendants
 //!   that remain in its process group
 //! - EOF on the shim's stdin means the BEAM died; the shim kills the group
@@ -28,6 +29,8 @@
 //!                               user, group, cgroup, window_bytes,
 //!                               stderr_window_bytes, strict_output, env_mode,
 //!                               interrupt_signal, interrupt_grace_ms}
+//!                env values are strings to set or null to remove a variable.
+//!                env_mode replace clears inheritance before applying env.
 //!   0x02 STDIN   payload: bytes for the child's stdin (duplex mode)
 //!   0x03 EOF     close the child's stdin
 //!   0x04 KILL    kill the group now
@@ -46,6 +49,8 @@
 //! shim -> BEAM:
 //!   0x15 HELLO   JSON {protocol: 1, features: ["bounded_run_v1", ...]}
 //!                Confirms strict credit drain, env replacement and INT grace.
+//!                env_unset_v1 additionally confirms null-valued env entries.
+//!                These are capability requirements, with no extra frames.
 //!                An old shim rejects HELLO rather than ignoring SPAWN keys.
 //!                spawn_identity_v1 is advertised only after a native
 //!                self-identity probe succeeds when HELLO is handled, including

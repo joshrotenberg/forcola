@@ -90,7 +90,7 @@ which to carry that status. They return after their bounded backstop and emit a
 warning when confirmation is missing, malformed, or explicitly unconfirmed.
 
 The Elixir side also arms a backstop
-deadline (`timeout_ms + kill_grace_ms` plus a margin) in case the shim never
+deadline (`timeout_ms + interrupt_grace_ms + kill_grace_ms` plus a margin) in case the shim never
 reports back at all, for example if the shim is wedged or the BEAM-to-shim pipe
 is stuck. If that deadline fires first, the result's status is
 `{:signal, :unconfirmed}`: death was requested but not confirmed. Closing the
@@ -189,13 +189,18 @@ kill there. Windows support is tracked separately in
 
 ## Cooperative interrupt and one-shot evidence
 
-`Forcola.run/2` can opt in to `interrupt_signal: :int` together with a positive
+Every execution mode can opt in to `interrupt_signal: :int` together with a positive
 `interrupt_grace_ms` (at most `4_294_967_295`). The native supervisor sends INT
 to its process group, waits that grace, and then runs the existing TERM/KILL
 sequence if the group is still alive. Timeout, explicit KILL, normal leader
 exit cleanup, and stdin EOF all use this single sequence. Defaults retain the
 existing behavior. Closing an owner's port or SIGKILLing a BEAM still reaches
-the native EOF path, with no second BEAM-side process killer.
+the native EOF path, with no second BEAM-side process killer. The paired options
+require the same `bounded_run_v1` capability in Run, Duplex, Stream and Daemon.
+Elixir cleanup waits include both graces, and Daemon's generated child spec
+allows time for cleanup confirmation and guard close. An overriding supervisor
+shutdown timeout can cut that confirmation wait short; the native EOF path
+still performs cleanup.
 
 A cooperative parent can use INT to stop a child that changed process groups.
 An uncooperative escaped child cannot be positively contained by this mechanism

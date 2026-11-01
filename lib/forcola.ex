@@ -79,12 +79,15 @@ defmodule Forcola do
       needed. This also applies on KILL requests and owner/BEAM EOF, including
       a SIGKILLed VM. It lets a cooperative parent stop children in separate
       groups; it cannot contain an uncooperative escaped descendant.
-    * `:env` - environment entries. Legacy calls accept `nil`, maps, and
-      lists of pairs, including atom names as supported by JSON encoding;
-      native spawn errors retain their ordinary spawn-reason tuple. With
-      any new strict option, explicit `:env` must be a list of `{name, value}`
-      binary strings. Names must be nonempty and contain no `=` or NUL;
-      values must contain no NUL.
+    * `:env` - environment entries. Values must be binary strings, `nil`, or
+      `false`; both `nil` and `false` remove the variable from the child.
+      Other values raise `ArgumentError` before opening the shim. Legacy
+      calls accept `env: nil`, maps, and lists of pairs, including atom names
+      as supported by JSON encoding. With any strict option, explicit `:env`
+      must be a list of `{name, value}` pairs. Names must be nonempty binary
+      strings without `=` or NUL; binary values must contain no NUL.
+      Unsets require `env_unset_v1` negotiation before SPAWN. Unsets alone
+      keep legacy output collection and error envelopes.
     * `:env_mode` - `:inherit` (default) or `:replace`. Replacement clears the
       inherited environment before applying `:env`, including when it is empty.
       Supply an absolute executable path when clearing PATH.
@@ -153,20 +156,26 @@ defmodule Forcola do
 
   New options (`:idle_timeout_ms`, `:max_output_bytes`, `:env_mode`, or the
   interrupt pair) require a versioned capability exchange before SPAWN.
-  `:spawn_identity` and `:structured_spawn_errors` select independent
-  capabilities through the same exchange, without enabling strict collection.
+  Environment unsets require `env_unset_v1`; `:spawn_identity` and
+  `:structured_spawn_errors` select independent extensions through the same
+  exchange, without enabling strict collection. Explicit `:env_mode` and
+  interrupt options require `bounded_run_v1` in all four execution modes.
+  The two requirement-only capabilities are checked in the response and leave
+  the HELLO payload empty unless an outbound extension is selected.
   `cgroup: :required` alone keeps legacy collection and error shapes without
   negotiation; its existing string encoding enforces required containment.
   An older shim rejecting HELLO or a valid incompatible capability reply returns
   `{:error, {:spawn, :incompatible_shim}}` without executing the child.
   Invalid new options raise `ArgumentError` before opening the shim.
-  Stream, Duplex, and Daemon reject `:env_mode` and the interrupt options
-  before opening a shim. Stream and Daemon also reject `:max_output_bytes`;
+  Stream, Duplex, and Daemon accept `:env_mode`, environment unsets, and the
+  interrupt pair with the same validation and negotiation. Explicit shared
+  options enable the strict environment list/name checks in those modes.
+  Stream and Daemon reject `:max_output_bytes`;
   Duplex retains its existing support with `delivery: :pull`. Duplex and
   Daemon reject `:idle_timeout_ms`; Stream retains its existing idle-timeout
   support. These existing mode options keep their own validation and semantics.
 
-  With new strict options, `:timeout_ms` must be an integer in
+  With negotiated options, `:timeout_ms` must be an integer in
   `0..4_294_967_295`. Its deadline starts before opening the shim and includes
   capability negotiation; only the remaining budget is sent in SPAWN. Idle
   timing starts after negotiation. A stalled handshake returns

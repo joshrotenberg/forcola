@@ -45,6 +45,9 @@ defmodule Forcola.Shim do
   # Healthy cleanup ends immediately at its final marker; this bound is only
   # a backstop if the guard itself is killed or cannot finish.
   @guard_close_timeout_ms 5_000
+  @cleanup_margin_ms 5_000
+  @supervisor_margin_ms 1_000
+  @execution_options [:env_mode, :interrupt_signal, :interrupt_grace_ms]
 
   @doc false
   def tag_spawn, do: @tag_spawn
@@ -72,10 +75,11 @@ defmodule Forcola.Shim do
   @doc false
   def negotiate(port, timeout_ms, required_features \\ ["bounded_run_v1"])
       when is_integer(timeout_ms) and timeout_ms >= 0 do
-    selected_features = Enum.reject(required_features, &(&1 == "bounded_run_v1"))
+    selected_features =
+      Enum.reject(required_features, &(&1 in ["bounded_run_v1", "env_unset_v1"]))
 
-    # bounded_run_v1 originally used an empty HELLO. It is a capability
-    # requirement, not a request to enable additional outbound frames.
+    # bounded_run_v1 and env_unset_v1 only require advertised support.
+    # With no outbound extension selected, keep the original empty HELLO.
     payload =
       if selected_features == [],
         do: "",
@@ -123,6 +127,81 @@ defmodule Forcola.Shim do
   end
 
   @doc false
+  def execution_options?(opts), do: Enum.any?(@execution_options, &Keyword.has_key?(opts, &1))
+
+  @doc false
+  def validate_execution_options!(opts, strict_env \\ false) do
+    if Keyword.get(opts, :env_mode, :inherit) not in [:inherit, :replace],
+      do: raise(ArgumentError, "env_mode must be :inherit or :replace")
+
+    validate_env!(opts, strict_env or execution_options?(opts))
+    validate_interrupt!(opts)
+  end
+
+  defp validate_env!(opts, strict) do
+    env = Keyword.get(opts, :env)
+
+    if strict and Keyword.has_key?(opts, :env) do
+      unless is_list(env) and Enum.all?(env, &valid_strict_env?/1),
+        do:
+          raise(
+            ArgumentError,
+            "env must be a list of {name, value} entries; names must be nonempty strings without = or NUL; values must be strings without NUL, nil, or false"
+          )
+    else
+      unless valid_legacy_env?(env),
+        do:
+          raise(
+            ArgumentError,
+            "env must be nil, a map, or a list of pairs with string, nil, or false values"
+          )
+    end
+  end
+
+  defp valid_legacy_env?(nil), do: true
+  defp valid_legacy_env?(env) when is_map(env), do: valid_legacy_env?(Map.to_list(env))
+  defp valid_legacy_env?(env) when is_list(env), do: Enum.all?(env, &valid_env_value?/1)
+  defp valid_legacy_env?(_env), do: false
+
+  defp valid_env_value?({_name, value}), do: is_binary(value) or value in [nil, false]
+  defp valid_env_value?(_entry), do: false
+
+  defp valid_strict_env?({name, value}) when is_binary(name) do
+    name != "" and not String.contains?(name, ["=", <<0>>]) and
+      (value in [nil, false] or (is_binary(value) and not String.contains?(value, <<0>>)))
+  end
+
+  defp valid_strict_env?(_entry), do: false
+
+  defp validate_interrupt!(opts) do
+    case {opts[:interrupt_signal], opts[:interrupt_grace_ms]} do
+      {nil, nil} ->
+        if Keyword.has_key?(opts, :interrupt_signal) or
+             Keyword.has_key?(opts, :interrupt_grace_ms),
+           do: raise(ArgumentError, "interrupt_signal :int requires interrupt_grace_ms")
+
+      {:int, grace} when is_integer(grace) and grace > 0 and grace <= 4_294_967_295 ->
+        :ok
+
+      _ ->
+        raise ArgumentError,
+              "interrupt_signal must be :int with positive interrupt_grace_ms <= 4294967295"
+    end
+  end
+
+  @doc false
+  def cleanup_timeout(opts) do
+    Keyword.get(opts, :kill_grace_ms, 5_000) +
+      Keyword.get(opts, :interrupt_grace_ms, 0) + @cleanup_margin_ms
+  end
+
+  @doc false
+  def shutdown_timeout(opts) do
+    budget = cleanup_timeout(opts) + @guard_close_timeout_ms + @supervisor_margin_ms
+    if budget > 4_294_967_295, do: :infinity, else: budget
+  end
+
+  @doc false
   def validate_spawn_identity!(opts) do
     unless Keyword.get(opts, :spawn_identity, false) in [true, false],
       do: raise(ArgumentError, "spawn_identity must be a boolean")
@@ -162,8 +241,13 @@ defmodule Forcola.Shim do
           Keyword.get(opts, option, false),
           do: feature
 
-    required ++ selected
+    required = if execution_options?(opts), do: ["bounded_run_v1" | required], else: required
+    required = if env_unsets?(opts[:env]), do: ["env_unset_v1" | required], else: required
+    Enum.uniq(required ++ selected)
   end
+
+  defp env_unsets?(nil), do: false
+  defp env_unsets?(env), do: Enum.any?(env, fn {_name, value} -> value in [nil, false] end)
 
   @doc false
   def negotiated?(opts), do: features(opts) != []
@@ -236,13 +320,7 @@ defmodule Forcola.Shim do
 
   @doc false
   def reject_run_options!(opts, mode, supported \\ []) do
-    for key <- [
-          :idle_timeout_ms,
-          :max_output_bytes,
-          :env_mode,
-          :interrupt_signal,
-          :interrupt_grace_ms
-        ],
+    for key <- [:idle_timeout_ms, :max_output_bytes],
         key not in supported,
         Keyword.has_key?(opts, key) do
       raise ArgumentError, "#{mode} does not support :#{key}; use Forcola.run/2"
@@ -470,12 +548,12 @@ defmodule Forcola.Shim do
   @doc """
   Encodes a SPAWN frame payload from `Forcola.run/2` options.
 
-  One-shot strict runs negotiate protocol 1 / `bounded_run_v1` before SPAWN.
-  `:env_mode` encodes inheritance or replacement; the paired
+  Explicit `:env_mode` and interrupt options require `bounded_run_v1` in
+  every mode. `:env_mode` encodes inheritance or replacement; the paired
   `:interrupt_signal`/`:interrupt_grace_ms` requests cooperative INT before
-  TERM/KILL, including on owner EOF. Only `Forcola.run/2` validates these new
-  public options and requires the capability exchange. Stream, Duplex, and
-  Daemon reject these one-shot options before opening a shim.
+  TERM/KILL, including on owner EOF. Environment values of `nil` or `false`
+  encode as JSON `null` and require `env_unset_v1` before SPAWN. Each public
+  execution mode validates these options before opening a shim.
 
   Shared by all four modes. Besides `:cd`/`:env`/`:merge_stderr`/`:timeout_ms`/
   `:kill_grace_ms` and the pty options, it threads `:user` and `:group` (each a
@@ -555,7 +633,10 @@ defmodule Forcola.Shim do
   defp encode_atom(value), do: Atom.to_string(value)
 
   defp encode_env(nil), do: nil
-  defp encode_env(env), do: Map.new(env)
+
+  defp encode_env(env) do
+    Map.new(env, fn {name, value} -> {name, if(value in [nil, false], do: :null, else: value)} end)
+  end
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
