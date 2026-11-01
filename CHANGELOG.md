@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/joshrotenberg/forcola/compare/v0.7.0...v0.8.0) (2026-11-01)
+
+
+### Features
+
+* **shim:** expose negotiated child process identity ([#105](https://github.com/joshrotenberg/forcola/issues/105)) ([48da0c6](https://github.com/joshrotenberg/forcola/commit/48da0c60aad23e8e1c727c0950bfbfb5d03d83b7))
+
+
+### Bug Fixes
+
+* distinguish spawn failures by stage ([#107](https://github.com/joshrotenberg/forcola/issues/107)) ([b05a9e3](https://github.com/joshrotenberg/forcola/commit/b05a9e3ae3c26b67a1ea8ec812c34d4b0c526b1f))
+
 ## [0.7.0](https://github.com/joshrotenberg/forcola/compare/v0.6.0...v0.7.0) (2026-10-23)
 
 
