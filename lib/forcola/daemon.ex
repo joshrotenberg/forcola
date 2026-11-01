@@ -454,23 +454,33 @@ defmodule Forcola.Daemon do
 
       true ->
         # Absorb port frames while waiting so output keeps routing and an
-        # early child exit is noticed.
-        state = absorb_frames(state, poll_ms)
+        # early child exit is noticed. The window is bounded by time, not by
+        # an empty mailbox: a child that floods output cannot keep the ready
+        # check or the deadline from running once per poll interval.
+        state = absorb_frames(state, System.monotonic_time(:millisecond) + poll_ms)
         poll_ready(state, fun, deadline, poll_ms)
     end
   end
 
-  defp absorb_frames(%{port: port} = state, wait_ms) do
-    receive do
-      {^port, {:data, <<tag, payload::binary>>}} ->
-        state
-        |> handle_frame(tag, payload)
-        |> absorb_frames(0)
+  defp absorb_frames(%{exit: exit} = state, _until) when not is_nil(exit), do: state
 
-      {^port, {:exit_status, status}} ->
-        %{state | exit: {:shim_exited, status}}
-    after
-      wait_ms -> state
+  defp absorb_frames(%{port: port} = state, until) do
+    remaining = until - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      state
+    else
+      receive do
+        {^port, {:data, <<tag, payload::binary>>}} ->
+          state
+          |> handle_frame(tag, payload)
+          |> absorb_frames(until)
+
+        {^port, {:exit_status, status}} ->
+          %{state | exit: {:shim_exited, status}}
+      after
+        remaining -> state
+      end
     end
   end
 

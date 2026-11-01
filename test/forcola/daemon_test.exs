@@ -347,6 +347,53 @@ defmodule Forcola.DaemonTest do
     end
   end
 
+  describe "readiness under an output flood" do
+    # Without the time bound the old absorb loop only returned to the ready
+    # check when the mailbox was empty. A consumer slower than the producer
+    # keeps it non-empty for the whole run, so start_link never returned; the
+    # tag bounds that failure mode.
+    @tag timeout: 15_000
+    test "the ready check and its deadline keep their cadence while the child floods stdout" do
+      Process.flag(:trap_exit, true)
+      test_pid = self()
+      started = System.monotonic_time(:millisecond)
+
+      result =
+        Forcola.Daemon.start_link(
+          argv: ["yes"],
+          ready: fn ->
+            send(test_pid, :ready_called)
+            false
+          end,
+          ready_poll_ms: 50,
+          ready_timeout_ms: 500,
+          # Slower than `yes` fills 8 KiB frames, so frames are always queued.
+          output: fn _stream, _chunk -> Process.sleep(2) end,
+          kill_grace_ms: 200
+        )
+
+      elapsed = System.monotonic_time(:millisecond) - started
+      assert {:error, :ready_timeout} = result
+
+      # Ten polls fit the window; the old loop managed one check before
+      # the queue pinned it.
+      assert count_messages(:ready_called) >= 5
+
+      # The deadline fired on time although frames never stopped arriving;
+      # the bound includes the TERM/KILL cleanup of the flooding child and
+      # draining the frames it left queued.
+      assert elapsed < 500 + 200 + 2_500
+    end
+  end
+
+  defp count_messages(message, count \\ 0) do
+    receive do
+      ^message -> count_messages(message, count + 1)
+    after
+      0 -> count
+    end
+  end
+
   describe "malformed EXIT" do
     test "stops unconfirmed from the frame, without crashing or stalling", %{tmp_dir: tmp_dir} do
       Process.flag(:trap_exit, true)
