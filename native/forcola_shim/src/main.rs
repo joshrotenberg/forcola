@@ -87,11 +87,16 @@
 //!                The root group is first, before output; newly discovered
 //!                descendant group leaders follow. Tracking adds EXIT scope
 //!                tree_contained (Linux subreaper) or tree_sampled (macOS).
+//!
+//! Lock mode: `forcola_shim lock <path>` skips the protocol entirely and
+//! holds a whole-file POSIX fcntl write lock on `<path>` until stdin closes.
+//! Its line-based output and exit statuses are documented in lock.rs.
 
 mod cgroup;
 mod credit;
 mod frame;
 mod identity;
+mod lock;
 mod privdrop;
 mod protocol;
 mod spawn_error;
@@ -103,6 +108,13 @@ use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // `forcola_shim lock <path>` holds a whole-file fcntl write lock; see
+    // lock.rs. With no arguments the shim speaks the framed protocol above.
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "lock") {
+        return lock::run(&args[1..]);
+    }
+
     let stdin = io::stdin();
     let stdout = io::stdout();
 

@@ -83,7 +83,7 @@ pub struct SpawnErrorReport<'a> {
 
 /// Stable names avoid interpreting platform-specific errno numbers in Elixir.
 /// Unknown errno values retain their numeric value plus a static io kind.
-fn error_reason(error: &io::Error) -> &'static str {
+pub(crate) fn error_reason(error: &io::Error) -> &'static str {
     match error.raw_os_error() {
         Some(libc::ENOENT) => "enoent",
         Some(libc::ENOTDIR) => "enotdir",
