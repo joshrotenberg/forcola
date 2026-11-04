@@ -110,6 +110,7 @@ pub(crate) fn error_reason(error: &io::Error) -> &'static str {
         Some(libc::EEXIST) => "eexist",
         Some(libc::ENOSYS) => "enosys",
         Some(libc::ENOTSUP) => "enotsup",
+        Some(libc::ENOLCK) => "enolck",
         _ => match error.kind() {
             io::ErrorKind::NotFound => "not_found",
             io::ErrorKind::PermissionDenied => "permission_denied",
