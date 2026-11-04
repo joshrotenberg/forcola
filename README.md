@@ -205,6 +205,24 @@ capability negotiation; callers that leave it disabled keep string errors.
 See the [spawn error guide](https://hexdocs.pm/forcola/getting_started.html#distinguish-spawn-failures)
 for each mode's error shape.
 
+## Recorded process groups
+
+A run with `track_descendants: true` reports the process groups it tracked,
+and `spawn_identity: true` reports the root's identity. Persist those
+identities, and a later BEAM can check or stop the groups without the session
+that started them:
+
+```elixir
+{:ok, [:present]} = Forcola.Tracking.check([identity])
+
+{:ok, %{groups: [:gone], confirmation: :confirmed}} =
+  Forcola.Tracking.stop([identity], interrupt_signal: :int, interrupt_grace_ms: 500)
+```
+
+Every signal is preceded by a fresh identity check, and a group whose leader
+pid now belongs to another process is reported `:gone` and never signalled.
+`Forcola.Tracking` documents the guarantees and the remaining races.
+
 ## File locks
 
 `Forcola.Lock` holds a whole-file POSIX `fcntl` write lock, which the BEAM

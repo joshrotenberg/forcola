@@ -90,6 +90,7 @@ defmodule Forcola.MixProject do
       groups_for_modules: [
         "Execution modes": [Forcola, Forcola.Stream, Forcola.Daemon, Forcola.Duplex],
         Locks: [Forcola.Lock],
+        "Recorded groups": [Forcola.Tracking],
         "Data structures": [Forcola.Result, Forcola.SpawnError, Forcola.Stream.Error],
         Internals: [Forcola.Shim, Forcola.Precompiled]
       ]
