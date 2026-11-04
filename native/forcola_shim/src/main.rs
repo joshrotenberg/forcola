@@ -91,10 +91,15 @@
 //! Lock mode: `forcola_shim lock <path>` skips the protocol entirely and
 //! holds a whole-file POSIX fcntl write lock on `<path>` until stdin closes.
 //! Its line-based output and exit statuses are documented in lock.rs.
+//!
+//! Groups mode: `forcola_shim groups` reads one JSON request line naming
+//! recorded group identities, checks or stops them without a live session,
+//! and writes one JSON result line. The request and result are in groups.rs.
 
 mod cgroup;
 mod credit;
 mod frame;
+mod groups;
 mod identity;
 mod lock;
 mod privdrop;
@@ -113,6 +118,11 @@ fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "lock") {
         return lock::run(&args[1..]);
+    }
+    // `forcola_shim groups` checks or stops recorded process groups; see
+    // groups.rs. It reads one JSON request line and writes one result line.
+    if args.first().is_some_and(|arg| arg == "groups") {
+        return groups::run(&args[1..]);
     }
 
     let stdin = io::stdin();

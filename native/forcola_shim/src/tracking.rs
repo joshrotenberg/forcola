@@ -31,6 +31,12 @@ pub fn available() -> bool {
         && platform::children(std::process::id()).is_ok()
 }
 
+/// Every process in group `pgid`, including zombies (macOS libproc).
+#[cfg(target_os = "macos")]
+pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
+    platform::group_members(pgid)
+}
+
 pub fn prepare() -> io::Result<ProcessIdentity> {
     platform::prepare()?;
     identity::read(std::process::id())
