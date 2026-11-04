@@ -177,7 +177,8 @@ defmodule Forcola.Shim do
 
   defp valid_strict_env?(_entry), do: false
 
-  defp validate_interrupt!(opts) do
+  @doc false
+  def validate_interrupt!(opts) do
     case {opts[:interrupt_signal], opts[:interrupt_grace_ms]} do
       {nil, nil} ->
         if Keyword.has_key?(opts, :interrupt_signal) or
