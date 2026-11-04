@@ -100,13 +100,15 @@ defmodule Forcola.InterruptOptionsTest do
     tmp_dir: dir
   } do
     for kind <- [:whole_run, :idle, :ready] do
-      child = child(dir)
+      # The idle clock starts at spawn, so the idle case keeps output flowing
+      # until the fixture has installed its handlers.
+      child = child(dir, "stubborn", heartbeat: kind == :idle)
 
       case kind do
         :whole_run ->
           error =
             assert_raise Forcola.Stream.Error, fn ->
-              child.argv |> Forcola.Stream.lines(options(timeout_ms: 500)) |> Enum.to_list()
+              child.argv |> Forcola.Stream.lines(options(timeout_ms: 1_500)) |> Enum.to_list()
             end
 
           assert error.timed_out
@@ -129,7 +131,7 @@ defmodule Forcola.InterruptOptionsTest do
                      options(
                        argv: child.argv,
                        ready: fn -> false end,
-                       ready_timeout_ms: 500,
+                       ready_timeout_ms: 1_500,
                        ready_poll_ms: 10
                      )
                    )
@@ -329,7 +331,7 @@ defmodule Forcola.InterruptOptionsTest do
     # Run independent children concurrently so a real long grace costs one wait.
     tasks =
       for mode <- [:duplex, :daemon, :stream, :stream_idle] do
-        child = child(dir)
+        child = child(dir, "stubborn", heartbeat: mode == :stream_idle)
 
         task =
           Task.async(fn ->
@@ -375,16 +377,21 @@ defmodule Forcola.InterruptOptionsTest do
                   ready_ref = make_ref()
 
                   # Isolate cleanup waiting by allowing the fixture to install its
-                  # signal handlers before the idle timer cancels the process.
+                  # signal handlers before the idle timer cancels the process. The
+                  # heartbeat keeps the idle clock from expiring during startup.
                   error =
                     assert_raise Forcola.Stream.Error, fn ->
                       child.argv
                       |> Forcola.Stream.lines(
                         opts ++ [timeout_ms: 10_000, idle_timeout_ms: 1_000]
                       )
-                      |> Stream.each(fn line ->
-                        assert line == "ready"
-                        send(self(), {ready_ref, System.monotonic_time()})
+                      |> Stream.each(fn
+                        "starting" ->
+                          :ok
+
+                        line ->
+                          assert line == "ready"
+                          send(self(), {ready_ref, System.monotonic_time()})
                       end)
                       |> Enum.to_list()
                     end
@@ -416,10 +423,27 @@ defmodule Forcola.InterruptOptionsTest do
         extra
       )
 
-  defp child(parent, mode \\ "stubborn") do
+  # Prints "starting" every 20 ms until the fixture has written its pid file,
+  # which it does only after installing its signal handlers. Output resets the
+  # Stream idle clock, so an idle timeout cannot fire during interpreter
+  # startup and deliver INT before the handlers exist.
+  @heartbeat ~S"""
+  dir=$1; shift
+  (while [ ! -s "$dir/pid" ]; do echo starting; sleep 0.02; done) &
+  exec "$@"
+  """
+
+  defp child(parent, mode \\ "stubborn", opts \\ []) do
     dir = Path.join(parent, Integer.to_string(System.unique_integer([:positive])))
     File.mkdir_p!(dir)
-    child = %{dir: dir, argv: [System.find_executable("python3"), @fixture, mode, dir]}
+    fixture = [System.find_executable("python3"), @fixture, mode, dir]
+
+    argv =
+      if Keyword.get(opts, :heartbeat, false),
+        do: ["/bin/sh", "-c", @heartbeat, "sh", dir | fixture],
+        else: fixture
+
+    child = %{dir: dir, argv: argv}
 
     on_exit(fn -> cleanup_child(dir) end)
 
