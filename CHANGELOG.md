@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/joshrotenberg/forcola/compare/v0.10.0...v0.11.0) (2026-11-04)
+
+
+### Features
+
+* check and stop recorded process groups from any BEAM ([#131](https://github.com/joshrotenberg/forcola/issues/131)) ([758e5ed](https://github.com/joshrotenberg/forcola/commit/758e5edc2c7ae8967efdb93633f04069d11d75e5)), closes [#124](https://github.com/joshrotenberg/forcola/issues/124)
+
 ## [0.10.0](https://github.com/joshrotenberg/forcola/compare/v0.9.0...v0.10.0) (2026-11-04)
 
 
