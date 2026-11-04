@@ -114,9 +114,14 @@ defmodule Forcola.TrackingTest do
         start(
           mode,
           child.argv,
+          # The fixture records each signal from a Python handler, so a TERM
+          # line exists only if the handler runs before KILL. A one-second
+          # kill grace leaves room for that on a loaded runner; the test
+          # measures the interrupt grace, not the kill grace.
           opts(ref,
             interrupt_signal: :int,
             interrupt_grace_ms: 150,
+            kill_grace_ms: 1_000,
             timeout_ms: if(mode == :run, do: 1_500, else: 20_000)
           )
         )
