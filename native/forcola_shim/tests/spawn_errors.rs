@@ -3,8 +3,9 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,12 +26,35 @@ struct Shim {
 
 impl Shim {
     fn new(features: Option<&[&str]>) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_forcola_shim"))
+        Self::start(features, None)
+    }
+
+    /// Starts a shim whose only descriptors above stderr are its pipes and,
+    /// when given, `keep`. Parallel tests on macOS create pipes with `pipe`
+    /// followed by a separate `FD_CLOEXEC` call, so a concurrent spawn can
+    /// inherit another test's pipe pair. Closing everything else in the
+    /// forked child makes the shim's starting descriptor set deterministic.
+    fn start(features: Option<&[&str]>, keep: Option<RawFd>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_forcola_shim"));
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::inherit());
+        if let Some(keep) = keep {
+            let limit = descriptor_limit();
+            // SAFETY: the hook only calls close(2), which is async-signal-safe.
+            unsafe {
+                command.pre_exec(move || {
+                    for fd in 3..limit {
+                        if fd != keep {
+                            libc::close(fd);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command.spawn().unwrap();
         let mut shim = Self {
             stdin: child.stdin.take(),
             stdout: child.stdout.take().unwrap(),
@@ -281,8 +305,28 @@ fn failure_before_child_hook_is_spawn_not_exec_and_does_not_block() {
     assert!(report["spawn_error"]["path"].is_null());
 }
 
+/// Upper bound for the descriptor sweep, read before forking.
+fn descriptor_limit() -> RawFd {
+    // SAFETY: getrlimit writes into the provided struct.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        limit.rlim_cur
+    } else {
+        1024
+    };
+    soft.min(65_536) as RawFd
+}
+
 fn successful(request: Value, features: Option<&[&str]>) -> (Vec<u8>, Vec<u8>) {
-    let mut shim = Shim::new(features);
+    successful_keeping(request, features, None)
+}
+
+fn successful_keeping(
+    request: Value,
+    features: Option<&[&str]>,
+    keep: Option<RawFd>,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut shim = Shim::start(features, keep);
     shim.spawn(request);
     let mut tags = Vec::new();
     let mut output = Vec::new();
@@ -342,8 +386,11 @@ fn attribution_pipe_descriptors_are_not_inherited_by_the_executable() {
     rustix::io::fcntl_setfd(&inherited, rustix::io::FdFlags::empty()).unwrap();
     let limit = (inherited.as_raw_fd() + 1).max(512).to_string();
     let request = json!({"argv":["python3","-c","import os,sys\nopened=[]\nfor fd in range(3,int(sys.argv[1])):\n try: os.fstat(fd); opened.append(fd)\n except OSError: pass\nprint(opened)",limit]});
-    let (legacy, _) = successful(request.clone(), None);
-    let (output, tags) = successful(request, Some(&["structured_spawn_errors_v1"]));
+    // Both shims start from the same descriptor set, so the children can
+    // differ only by what the structured path adds.
+    let keep = Some(inherited.as_raw_fd());
+    let (legacy, _) = successful_keeping(request.clone(), None, keep);
+    let (output, tags) = successful_keeping(request, Some(&["structured_spawn_errors_v1"]), keep);
     let legacy: Vec<i32> = serde_json::from_slice(&legacy).unwrap();
     let observed: Vec<i32> = serde_json::from_slice(&output).unwrap();
     assert!(legacy.contains(&inherited.as_raw_fd()));
