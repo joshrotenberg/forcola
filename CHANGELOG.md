@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/joshrotenberg/forcola/compare/v0.9.0...v0.10.0) (2026-11-04)
+
+
+### Features
+
+* add whole-file fcntl lock mode to the shim and Forcola.Lock ([#128](https://github.com/joshrotenberg/forcola/issues/128)) ([4ce0138](https://github.com/joshrotenberg/forcola/commit/4ce0138b26a662495693c4f989db63c963ad1cd6))
+
 ## [0.9.0](https://github.com/joshrotenberg/forcola/compare/v0.8.0...v0.9.0) (2026-11-01)
 
 
