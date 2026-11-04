@@ -64,6 +64,7 @@ defmodule Forcola.SpawnError do
     :enodev,
     :enoent,
     :enoexec,
+    :enolck,
     :enomem,
     :enospc,
     :enosys,
@@ -93,6 +94,11 @@ defmodule Forcola.SpawnError do
   @reasons Map.new(@known_reasons, &{Atom.to_string(&1), &1})
 
   @doc false
+  # Maps a shim errno or I/O-kind name to its atom; unknown names stay strings.
+  @spec reason(String.t()) :: atom() | String.t()
+  def reason(name) when is_binary(name), do: Map.get(@reasons, name, name)
+
+  @doc false
   @spec from_report(term(), String.t()) :: t() | :invalid_error
   def from_report(
         %{"stage" => stage, "reason" => reason, "errno" => errno, "path" => path},
@@ -103,7 +109,7 @@ defmodule Forcola.SpawnError do
              (path in [nil, :null] or is_binary(path)) and is_binary(message) do
     %__MODULE__{
       stage: Map.fetch!(@stages, stage),
-      reason: Map.get(@reasons, reason, reason),
+      reason: reason(reason),
       errno: null_to_nil(errno),
       path: null_to_nil(path),
       message: message

@@ -205,6 +205,22 @@ capability negotiation; callers that leave it disabled keep string errors.
 See the [spawn error guide](https://hexdocs.pm/forcola/getting_started.html#distinguish-spawn-failures)
 for each mode's error shape.
 
+## File locks
+
+`Forcola.Lock` holds a whole-file POSIX `fcntl` write lock, which the BEAM
+cannot take itself. The shim takes the lock without waiting and holds it until
+`Forcola.Lock.release/1` or until the process that acquired it exits.
+Programs that lock the same file with `fcntl` or `lockf` see the conflict.
+
+```elixir
+{:ok, lock} = Forcola.Lock.acquire("/run/user/1000/app/layer.lock")
+{:error, {:held, os_pid}} = Forcola.Lock.acquire("/run/user/1000/app/layer.lock")
+:ok = Forcola.Lock.release(lock)
+```
+
+The lock file is created if missing and is never truncated, removed, or
+replaced.
+
 ## Process groups and cleanup
 
 Pass `spawn_identity: true` to record the child's OS identity. One-shot
