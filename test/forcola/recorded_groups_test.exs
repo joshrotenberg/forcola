@@ -24,8 +24,7 @@ defmodule Forcola.RecordedGroupsTest do
   test "a leaderless group stays present until its last member is stopped" do
     # The leader exits once its stdin closes with the dead shim; the member
     # keeps the group alive without a leader.
-    {identity, session} = leak(~S(sleep 60 & echo $!; read _))
-    member = receive_line(session) |> String.to_integer()
+    {identity, member} = leak_with_member(~S(sleep 60 & echo $!; read _))
 
     assert eventually(fn -> not alive?(identity.pid) end)
     assert alive?(member)
@@ -38,8 +37,7 @@ defmodule Forcola.RecordedGroupsTest do
   end
 
   test "stop sends INT, then TERM, then KILL to a group that ignores both" do
-    {identity, session} = leak(~S(trap '' INT TERM; sleep 60 & echo $!; wait))
-    member = receive_line(session) |> String.to_integer()
+    {identity, member} = leak_with_member(~S(trap '' INT TERM; sleep 60 & echo $!; wait))
 
     started = System.monotonic_time(:millisecond)
 
@@ -108,6 +106,22 @@ defmodule Forcola.RecordedGroupsTest do
   defp leak(script) do
     {:ok, session} = Duplex.open(["/bin/sh", "-c", script], spawn_identity: true)
     identity = receive_identity(session)
+    kill_shim(session, identity)
+    {identity, session}
+  end
+
+  # Like leak/1 for a script whose first output line is the pid of a
+  # background member. The line is received before the shim is killed: a
+  # line the shim has not yet forwarded when it dies is lost with it.
+  defp leak_with_member(script) do
+    {:ok, session} = Duplex.open(["/bin/sh", "-c", script], spawn_identity: true)
+    identity = receive_identity(session)
+    member = receive_line(session) |> String.to_integer()
+    kill_shim(session, identity)
+    {identity, member}
+  end
+
+  defp kill_shim(session, identity) do
     shim = os_ppid(identity.pid)
     {_, 0} = System.cmd("kill", ["-KILL", shim])
     assert_receive {:forcola_exit, ^session, :shim_exited}, 10_000
@@ -115,8 +129,6 @@ defmodule Forcola.RecordedGroupsTest do
     on_exit(fn ->
       System.cmd("kill", ["-KILL", "--", "-#{identity.pgid}"], stderr_to_stdout: true)
     end)
-
-    {identity, session}
   end
 
   defp receive_identity(session) do
