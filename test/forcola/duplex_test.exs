@@ -258,6 +258,90 @@ defmodule Forcola.DuplexTest do
       assert eventually(fn -> not alive?(parent) and not alive?(grandchild) end),
              "group survived owner death"
     end
+
+    test "a tracked child that stops reading stdin reports busy without wedging the session" do
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sleep", "60"],
+          track_descendants: true,
+          kill_grace_ms: 100,
+          spawn_identity: true
+        )
+
+      pid =
+        receive do
+          {:forcola_spawned, ^session, %{pid: pid}} -> Integer.to_string(pid)
+        after
+          5_000 -> flunk("no spawn identity")
+        end
+
+      # With tracking the shim applies backpressure: the child's pipe, the
+      # shim's one-frame queue and its stdin pipe fill, then the port goes
+      # busy. A plain port command would suspend the session process here.
+      line = String.duplicate("x", 8191)
+      results = for _ <- 1..32, do: Forcola.Duplex.send_line(session, line, 50)
+      {accepted, refused} = Enum.split_while(results, &(&1 == :ok))
+      assert accepted != []
+      assert refused != [] and Enum.all?(refused, &(&1 == {:error, :busy}))
+
+      # The session still answers. An EOF queues behind the refused input and
+      # expires the same way, which leaves stdin open for later sends.
+      assert {:error, :busy} = Forcola.Duplex.send_eof(session, 50)
+      assert {:error, :busy} = Forcola.Duplex.send_line(session, line, 50)
+
+      # Once the child is gone the shim drains its input and the same
+      # session reports the exit.
+      {_, 0} = System.cmd("kill", ["-KILL", pid])
+
+      assert {:ok,
+              %Forcola.Duplex.Terminal{
+                status: {:signal, 9},
+                confirmation: :confirmed,
+                cause: :child_exit
+              }} = Forcola.Duplex.await_terminal(session, 10_000)
+
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "owner death kills a tracked child that stopped reading stdin" do
+      test_pid = self()
+
+      owner =
+        spawn(fn ->
+          {:ok, session} =
+            Forcola.Duplex.open(["/bin/sleep", "60"],
+              track_descendants: true,
+              kill_grace_ms: 100,
+              spawn_identity: true,
+              terminal_recipient: test_pid
+            )
+
+          pid =
+            receive do
+              {:forcola_spawned, ^session, %{pid: pid}} -> Integer.to_string(pid)
+            end
+
+          line = String.duplicate("x", 8191)
+          results = for _ <- 1..32, do: Forcola.Duplex.send_line(session, line, 50)
+          send(test_pid, {:wedged, session, pid, results})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:wedged, session, pid, results}, 15_000
+      assert {:error, :busy} in results
+      Process.exit(owner, :kill)
+
+      # The session handles the owner's DOWN although the port is busy. Its
+      # KILL frame cannot pass the input the child never reads, so cleanup
+      # waits out the budget (kill grace plus the backstop), reports
+      # :timeout, and aborts the port; the shim's hang-up detection then
+      # kills the group.
+      assert_receive {:forcola_terminal, ^session,
+                      %Forcola.Duplex.Terminal{cause: :owner_death, confirmation: :timeout}},
+                     15_000
+
+      assert eventually(fn -> not alive?(pid) end, 10_000),
+             "tracked child survived owner death behind unread stdin"
+    end
   end
 
   describe "child exit" do

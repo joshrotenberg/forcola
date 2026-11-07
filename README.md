@@ -175,11 +175,16 @@ BEAM <--stdin/stdout pipes--> forcola_shim <--forks--> child (own process group)
   `{:error, {:timeout, partial_result}}` with output captured so far, and
   the group is confirmed dead before the call returns (or the result is
   explicitly marked `{:signal, :unconfirmed}`).
-- If the BEAM dies, even by `kill -9`, protocol EOF triggers cleanup. Tracking
-  also detects pipe hang-up while child stdin is blocked. The untracked path
-  writes child stdin synchronously, so a child refusing input can delay EOF,
-  KILL and timer handling until that write completes. See the
-  [process groups guide](https://hexdocs.pm/forcola/process_groups.html#beam-death-as-stdin-eof).
+- If the BEAM dies, even by `kill -9`, protocol EOF triggers cleanup. A child
+  that stops reading its stdin cannot delay this: the untracked path buffers
+  unread input in the shim without bound, and tracking applies backpressure
+  while detecting pipe hang-up independently of its blocked reader. With
+  tracking, a KILL frame queued behind unread input waits; `Forcola.Duplex`
+  bounds that wait by its cleanup budget and then aborts the port so hang-up
+  cleanup runs. See the
+  [process groups guide](https://hexdocs.pm/forcola/process_groups.html#beam-death-as-stdin-eof);
+  [#111](https://github.com/joshrotenberg/forcola/issues/111) describes the
+  synchronous write the untracked path had before 0.9.0.
 - Shim binaries ship precompiled per target via GitHub Releases with SHA256
   verification. Consumers need no Rust, C, or C++ toolchain.
 

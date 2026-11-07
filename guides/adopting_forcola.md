@@ -230,10 +230,10 @@ Per-mode notes:
   [process groups guide](process_groups.html)).
 - `Forcola.Duplex`: no `:timeout_ms` (passing one raises `ArgumentError`);
   the session is bounded by its owner process and `close/1` or `shutdown/1`.
-  Lines go in with `send_line/2`. By default output arrives as owner messages;
+  Lines go in with `send_line/3`. By default output arrives as owner messages;
   `delivery: :pull` instead uses `recv/2` and bounds stdout and stderr delivery.
   `shutdown/1` and `await_terminal/2` retain child status and cleanup evidence
-  separately. `send_eof/1` closes stdin for CLIs that exit when input ends.
+  separately. `send_eof/2` closes stdin for CLIs that exit when input ends.
 
 One caveat for docker-shaped wrappers: the docker CLI is a control channel
 for a daemon. Forcola kills the client reliably, but that never stops the
@@ -299,7 +299,7 @@ limits, Duplex limits, and Daemon readiness timeout or supervisor shutdown.
 All cleanup waits include both graces. Daemon's generated child spec includes
 the confirmation and guard-close bounds plus a scheduling margin. A caller
 that overrides its `shutdown` value must allow sufficient time to receive
-confirmation. Duplex `recv/2` timeout and `send_eof/1` do not cancel a child.
+confirmation. Duplex `recv/2` timeout and `send_eof/2` do not cancel a child.
 
 Handle `{:error, {reason, partial_result}}` for `:timeout`, `:idle_timeout`,
 `:max_output_bytes`, and `:observer_overflow`. With new options, a reported

@@ -426,12 +426,16 @@ Options:
 
 API:
 
-- `send_line/2`: writes a line to the child's stdin (a newline is appended).
-  Returns `{:error, :closed}` once the session is over or stdin was closed
-  with `send_eof/1`.
-- `send_eof/1`: closes the child's stdin without killing the group, for CLIs
+- `send_line/3`: writes a line to the child's stdin (a newline is appended)
+  and returns once the shim has accepted it. Under `track_descendants: true` a
+  child that stopped reading makes the line wait, in order, up to the optional
+  timeout (default 5000 ms); on expiry it is not sent and `{:error, :busy}` is
+  returned. Returns `{:error, :closed}` once the session is over or stdin was
+  closed with `send_eof/2`.
+- `send_eof/2`: closes the child's stdin without killing the group, for CLIs
   that exit when input ends. The child's own exit then arrives as a
-  `:forcola_exit` message.
+  `:forcola_exit` message. The EOF queues behind unsent lines under the same
+  bound; `{:error, :busy}` means stdin is still open.
 - `close/1`: kills the child's process group, waits for its bounded report,
   and returns `:ok` for compatibility. It releases retained terminal evidence.
 - `shutdown/1`: closes the session and returns `{:ok, terminal}` with the
@@ -534,7 +538,7 @@ end
 A terminal carries one stream, so a pty merges the child's stdout and stderr:
 all output arrives as `{:forcola_line, ...}` and no `:forcola_stderr` messages
 are produced. Passing `merge_stderr: false` with `pty: true` raises
-`ArgumentError`. Group-kill, `send_eof/1`, and owner-death cleanup work the
+`ArgumentError`. Group-kill, `send_eof/2`, and owner-death cleanup work the
 same as in pipe mode. There is no dynamic resize yet; `:pty_rows`/`:pty_cols`
 set the initial size only.
 
@@ -635,7 +639,7 @@ end
 
 `RecoveryStore` stands for the application's durable store. The notification
 does not pause the executable: the child may already be running or may have
-exited. Waiting before `send_line/2` only gates input controlled by the caller.
+exited. Waiting before `send_line/3` only gates input controlled by the caller.
 The identity is observation, not a liveness or cleanup guarantee.
 
 `spawned/1` returns `{:ok, identity}` once observed, `{:error, :pending}` while
@@ -791,7 +795,9 @@ and are reparented before a sample remain outside the guarantee.
 
 Normal child exit, child SIGKILL, timeout, idle/output bounds, stream halt,
 Duplex close, Daemon shutdown/readiness failure, owner death and BEAM EOF all
-use tracking cleanup. Every verified target receives the configured interrupt
+use tracking cleanup. For a Duplex session whose child has stopped reading
+stdin, close and owner death reach it only after the cleanup budget and port
+abort described below. Every verified target receives the configured interrupt
 and TERM/KILL sequence concurrently, within a shared deadline rather than one
 grace per group. A newly found target can shorten the available grace; the
 report is unconfirmed if the full sequence could not be completed. Before
@@ -816,15 +822,20 @@ queued protocol input so Erlang does not keep the OS pipes open to flush it;
 the shim still performs the process kills. Strict output drain and post-EXIT
 linger check hang-up without waiting for the reader's EOF event.
 
-Backpressure can also suspend a Duplex server that is sending input. Its
-`close/1`, `shutdown/1` and owner-down handling wait behind that send until the
-server resumes. Hang-up cleanup starts when the port actually closes or the
-BEAM dies, not while a shutdown request is still queued in that server.
+Backpressure reaches the Duplex owner as waiting `send_line/3` and
+`send_eof/2` calls, which return `{:error, :busy}` when their bound elapses.
+The session itself never suspends on the port: output, `close/1`, `shutdown/1`
+and owner death are handled while input waits. Closing such a session, or
+losing its owner, cannot deliver KILL past the unread input; the session waits
+out its cleanup budget, reports `confirmation: :timeout`, and aborts the port,
+after which the shim's hang-up detection kills the group.
 
-Untracked execution writes child stdin synchronously. A child refusing input can
-block its supervision loop, delaying KILL, timer and EOF handling until the write
-completes. The independent hang-up check covers post-EXIT linger in both paths;
-it does not remove that legacy supervision limitation.
+Untracked execution queues child stdin in the shim without bound, so its
+supervision loop never waits on a child that refuses input: KILL, timer and
+EOF handling are not delayed, and the owner controls how much it sends. The
+synchronous write described in
+[#111](https://github.com/joshrotenberg/forcola/issues/111) was removed in
+0.9.0.
 
 A single transient metadata or child-inventory read error is retried at the next
 scan. Three consecutive incomplete scans start bounded cleanup. Invalid metadata,
@@ -895,10 +906,11 @@ These two options must be supplied together; the grace is a positive integer
 at most `4_294_967_295`. All modes use the existing INT, TERM, KILL sequence.
 Duplex close/shutdown, Stream halt or consumer failure, owner death, and BEAM
 death through observed protocol EOF all use it. Tracking additionally detects
-hang-up independently when stdin is blocked; untracked execution has the
-blocked-input exception described in the tracking section. Stream whole-run and idle timeouts,
+hang-up independently when stdin is blocked; a tracked Duplex child that has
+stopped reading delays close and owner death by the cleanup budget described
+in the tracking section. Stream whole-run and idle timeouts,
 Stream/Duplex output limits, and Daemon readiness timeout also use it. Duplex
-`recv/2` timeout only stops waiting, and `send_eof/1` only closes child stdin.
+`recv/2` timeout only stops waiting, and `send_eof/2` only closes child stdin.
 
 Each cleanup wait includes interrupt grace, kill grace and a five-second
 confirmation backstop; closing the guard has its own five-second bound.

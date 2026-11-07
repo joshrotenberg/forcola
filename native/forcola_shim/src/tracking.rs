@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 pub const MAX_GROUPS: usize = 4096;
 pub const MAX_PROCESSES: usize = 65_536;
-const CONFIRM_GRACE: Duration = Duration::from_millis(500);
+pub const CONFIRM_GRACE: Duration = Duration::from_millis(500);
 // One failed inventory can be a transient procfs/libproc race. Three
 // consecutive incomplete scans mean discovery can no longer be trusted.
 const MAX_INCOMPLETE_SCANS: u8 = 3;
