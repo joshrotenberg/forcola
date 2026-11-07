@@ -954,7 +954,10 @@ defmodule Forcola.Duplex do
     terminal = exit_terminal(report, :child_exit, state.tracking)
     state = finish_tracking(state, terminal) |> flush_buffers()
     notify_exit(state, status)
-    %{state | exit: status, terminal: terminal} |> reply_pull_waiter()
+
+    %{state | exit: status, terminal: terminal}
+    |> fail_pending({:error, :closed})
+    |> reply_pull_waiter()
   end
 
   defp spawn_failed(state, payload) do
@@ -972,6 +975,7 @@ defmodule Forcola.Duplex do
     state
     |> finish_tracking(terminal)
     |> Map.merge(%{exit: {:spawn_error, reason}, terminal: with_groups(terminal, state.tracking)})
+    |> fail_pending({:error, :closed})
     |> reply_pull_waiter()
   end
 
