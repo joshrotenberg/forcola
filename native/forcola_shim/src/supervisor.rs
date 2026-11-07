@@ -23,7 +23,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -65,6 +65,27 @@ struct PeerMonitor {
     queue: OwnedFd,
     #[cfg(not(target_os = "macos"))]
     fd: RawFd,
+    /// Set once a probe has failed, so the error is logged a single time
+    /// rather than on every 50 ms scan.
+    probe_failed: AtomicBool,
+}
+
+/// Register the peer monitor, or run without one. Registration fails when the
+/// protocol output is a descriptor the platform cannot watch (macOS kqueue
+/// rejects a character device such as /dev/null). Under an Erlang port the
+/// output is always a pipe, so this is a fallback for unusual invocations:
+/// hang-up detection then relies on stdin EOF, which every path handles, and
+/// the run proceeds instead of failing before HELLO in every mode.
+fn peer_monitor(fd: RawFd) -> Option<PeerMonitor> {
+    match PeerMonitor::new(fd) {
+        Ok(monitor) => Some(monitor),
+        Err(error) => {
+            eprintln!(
+                "forcola_shim: peer hang-up monitor unavailable, relying on stdin EOF: {error}"
+            );
+            None
+        }
+    }
 }
 
 impl PeerMonitor {
@@ -93,15 +114,44 @@ impl PeerMonitor {
             {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self { queue })
+            Ok(Self {
+                queue,
+                probe_failed: AtomicBool::new(false),
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Ok(Self { fd })
+            Ok(Self {
+                fd,
+                probe_failed: AtomicBool::new(false),
+            })
         }
     }
 
+    /// Whether the BEAM has closed its read end. A probe error is not
+    /// evidence of hang-up: the next scan retries, and stdin EOF still
+    /// reports BEAM death. Treating errors as hang-up would start cleanup
+    /// of a healthy run over a transient `poll` or `kevent` failure.
     fn disconnected(&self) -> bool {
+        self.evaluate(self.probe())
+    }
+
+    fn evaluate(&self, probe: io::Result<bool>) -> bool {
+        match probe {
+            Ok(hung_up) => hung_up,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => false,
+            Err(error) => {
+                if !self.probe_failed.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "forcola_shim: peer hang-up probe failed, relying on stdin EOF: {error}"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn probe(&self) -> io::Result<bool> {
         #[cfg(target_os = "macos")]
         {
             let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
@@ -120,10 +170,10 @@ impl PeerMonitor {
                 )
             };
             if result < 0 {
-                return io::Error::last_os_error().kind() != io::ErrorKind::Interrupted;
+                return Err(io::Error::last_os_error());
             }
-            result > 0
-                && unsafe { event.assume_init() }.flags & (libc::EV_EOF | libc::EV_ERROR) != 0
+            Ok(result > 0
+                && unsafe { event.assume_init() }.flags & (libc::EV_EOF | libc::EV_ERROR) != 0)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -134,9 +184,9 @@ impl PeerMonitor {
             };
             let result = unsafe { libc::poll(&mut event, 1, 0) };
             if result < 0 {
-                return io::Error::last_os_error().kind() != io::ErrorKind::Interrupted;
+                return Err(io::Error::last_os_error());
             }
-            result > 0 && event.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+            Ok(result > 0 && event.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0)
         }
     }
 }
@@ -162,7 +212,7 @@ where
     W: Write + Send + 'static,
     F: FnOnce() -> Vec<&'static str>,
 {
-    let peer = protocol_fd.map(PeerMonitor::new).transpose()?;
+    let peer = protocol_fd.and_then(peer_monitor);
     let out = Arc::new(Mutex::new(stdout));
 
     // SPAWN is mandatory, with an optional capability request before it.
@@ -1239,8 +1289,8 @@ fn supervise_tracked<W: Write + Send + 'static>(
         // have been reused, so this final direct kill is safe.
         let _ = child.kill();
     }
-    let reaped = child.wait();
-    if let Ok(status) = &reaped {
+    let reaped = reap_root(&mut child, tracking::CONFIRM_GRACE);
+    if let Ok(Some(status)) = &reaped {
         outcome = Some(ChildOutcome {
             status: status.code(),
             signal: status.signal(),
@@ -1296,7 +1346,10 @@ fn supervise_tracked<W: Write + Send + 'static>(
         status: outcome.status,
         signal: outcome.signal,
         timed_out,
-        confirmed: confirmed && cgroup_confirmed && final_confirmed && reaped.is_ok(),
+        confirmed: confirmed
+            && cgroup_confirmed
+            && final_confirmed
+            && matches!(reaped, Ok(Some(_))),
         contained: cgroup.is_some(),
         output_truncated,
         scope: Some(tracking::scope()),
@@ -1687,6 +1740,20 @@ fn kill_group(
     }
 
     confirmed
+}
+
+/// Reap the tracked root after cleanup, bounded by `grace`. The waiter
+/// observed the exit with WNOWAIT, so in the normal case the first poll
+/// reaps immediately. A root that the final SIGKILL cannot remove in time
+/// (uninterruptible sleep) returns `Ok(None)`: the EXIT report then carries
+/// no status and is unconfirmed, instead of never being written.
+fn reap_root(child: &mut Child, grace: Duration) -> io::Result<Option<ExitStatus>> {
+    let mut reaped = Ok(None);
+    wait_until(grace, tracking::SAMPLE_INTERVAL, || {
+        reaped = child.try_wait();
+        !matches!(reaped, Ok(None))
+    });
+    reaped
 }
 
 /// Polls `done` until it succeeds or a monotonic deadline expires. The
@@ -2485,5 +2552,113 @@ mod tests {
     #[test]
     fn wait_until_reports_deadline_expiry() {
         assert!(!wait_until(Duration::ZERO, Duration::ZERO, || false));
+    }
+
+    /// A pipe whose both ends are owned by the test, for peer monitor tests
+    /// that do not depend on EOF timing.
+    fn test_pipe() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    #[test]
+    fn peer_monitor_registration_failure_falls_back_to_no_monitor() {
+        use std::os::fd::AsRawFd;
+        // macOS kqueue rejects EVFILT_WRITE on a character device with
+        // EINVAL; poll on Linux accepts any descriptor. Either way the run
+        // must proceed rather than fail before HELLO.
+        let null = std::fs::File::options()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let monitor = super::peer_monitor(null.as_raw_fd());
+        if cfg!(target_os = "macos") {
+            assert!(monitor.is_none());
+        } else {
+            assert!(monitor.is_some_and(|monitor| !monitor.disconnected()));
+        }
+        let (_reader, writer) = test_pipe();
+        let monitor = super::peer_monitor(writer.as_raw_fd()).expect("a pipe is watchable");
+        assert!(!monitor.disconnected());
+    }
+
+    #[test]
+    fn peer_probe_errors_are_not_hangups() {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering;
+        let (_reader, writer) = test_pipe();
+        let monitor = super::PeerMonitor::new(writer.as_raw_fd()).unwrap();
+        assert!(!monitor.evaluate(Err(std::io::Error::from_raw_os_error(libc::EINTR))));
+        assert!(!monitor.probe_failed.load(Ordering::Relaxed));
+        assert!(!monitor.evaluate(Err(std::io::Error::from_raw_os_error(libc::ENOMEM))));
+        assert!(monitor.probe_failed.load(Ordering::Relaxed));
+        assert!(!monitor.evaluate(Err(std::io::Error::from_raw_os_error(libc::EBADF))));
+        assert!(!monitor.evaluate(Ok(false)));
+        assert!(monitor.evaluate(Ok(true)));
+        // A probe error leaves later real observations intact.
+        assert!(!monitor.disconnected());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn peer_probe_on_a_closed_kqueue_is_not_a_hangup() {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering;
+        let (_reader, writer) = test_pipe();
+        let monitor = super::PeerMonitor::new(writer.as_raw_fd()).unwrap();
+        assert!(!monitor.disconnected());
+        // Close the queue underneath the monitor so kevent fails with EBADF.
+        // Forget the monitor afterwards: its OwnedFd must not close whatever
+        // descriptor reuses that number.
+        assert_eq!(unsafe { libc::close(monitor.queue.as_raw_fd()) }, 0);
+        assert!(!monitor.disconnected());
+        assert!(monitor.probe_failed.load(Ordering::Relaxed));
+        assert!(!monitor.disconnected());
+        std::mem::forget(monitor);
+    }
+
+    #[test]
+    fn reap_root_returns_the_status_of_an_exited_root() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let reaped = super::reap_root(&mut child, Duration::from_secs(5)).unwrap();
+        assert_eq!(reaped.and_then(|status| status.code()), Some(7));
+    }
+
+    #[test]
+    fn reap_root_gives_up_on_a_root_that_does_not_exit() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let reaped = super::reap_root(&mut child, Duration::from_millis(100)).unwrap();
+        assert!(reaped.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

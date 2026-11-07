@@ -1160,3 +1160,40 @@ fn cgroup_reaps_daemonizer_that_escaped_the_process_group() {
 extern "C" {
     fn getpgid(pid: i32) -> i32;
 }
+
+#[test]
+fn protocol_output_the_platform_cannot_watch_still_runs() {
+    // /dev/null stands in for a protocol output that kqueue refuses to watch
+    // (EINVAL on macOS). The shim must run without a peer monitor instead of
+    // failing before HELLO: frames go to /dev/null, so the run is observed
+    // through its exit status and stderr. Closing stdin ends the run as BEAM
+    // death would, whether or not the child has already exited.
+    let mut child = Command::new(shim_binary())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start forcola_shim");
+    let mut stdin = child.stdin.take().unwrap();
+    write_frame(
+        &mut stdin,
+        TAG_SPAWN,
+        &spawn_payload(&["true"], None, Some(200), true),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "shim failed instead of running without a peer monitor: {stderr}"
+    );
+    assert!(!stderr.contains("fatal"), "{stderr}");
+    if cfg!(target_os = "macos") {
+        assert!(
+            stderr.contains("peer hang-up monitor unavailable"),
+            "expected the fallback to be logged on macOS, got: {stderr}"
+        );
+    }
+}
