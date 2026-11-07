@@ -559,6 +559,26 @@ defmodule Forcola.Shim do
   end
 
   @doc """
+  Sends a tagged frame without suspending the caller.
+
+  Returns `:ok`, `:busy` when the port's output queue is above its high
+  watermark, or `:closed` if the port has already closed. The queue fills
+  when the shim stops reading its stdin, which happens on the tracked path
+  while a child refuses input and the shim's bounded input queue is full. A
+  plain `Port.command/2` would suspend the calling process until the port
+  drains, so a session server using it would handle no other message
+  meanwhile; `Forcola.Duplex` sends input and KILL with this variant and
+  retries instead.
+  """
+  @spec try_send_frame(port(), non_neg_integer(), iodata()) :: :ok | :busy | :closed
+  def try_send_frame(port, tag, payload \\ "") do
+    if Port.command(port, [tag, payload], [:nosuspend]), do: :ok, else: :busy
+  catch
+    :error, :badarg ->
+      if Port.info(port) == nil, do: :closed, else: :erlang.error(:badarg)
+  end
+
+  @doc """
   Encodes a CREDIT frame payload: an 8-byte big-endian byte count.
 
   Grants the pump selected by the frame tag that many more bytes of read

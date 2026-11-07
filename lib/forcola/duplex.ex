@@ -86,11 +86,19 @@ defmodule Forcola.Duplex do
   anyway.
 
   A child that has stopped reading its stdin cannot delay any of this. The
-  shim writes input from a dedicated thread; without `track_descendants`,
+  shim writes input from a dedicated thread. Without `track_descendants`,
   input the child has not read is buffered by the shim without bound, so the
-  owner controls how much it sends.
+  owner controls how much it sends. With `track_descendants`, the shim
+  applies backpressure instead: `send_line/3` and `send_eof/2` wait for the
+  shim to accept each frame, up to their timeout, and return
+  `{:error, :busy}` otherwise. The session never suspends on the port, so
+  output, owner death, `close/1` and `shutdown/1` are handled while input
+  waits. The KILL frame shares the shim's stdin with unread input, so closing
+  a tracked session whose child stopped reading waits out the cleanup budget,
+  reports `confirmation: :timeout`, and aborts the port; the shim then
+  detects the hang-up and kills the group natively.
 
-  For CLIs that exit when their stdin closes, `send_eof/1` closes the
+  For CLIs that exit when their stdin closes, `send_eof/2` closes the
   child's stdin without killing anything; the child's own exit then
   arrives as a `:forcola_exit` message.
 
@@ -117,6 +125,12 @@ defmodule Forcola.Duplex do
   @default_kill_grace_ms 5_000
   @default_max_line_bytes 64 * 1024
   @default_max_output_bytes 16 * 1024 * 1024
+  # How long send_line/3 and send_eof/2 wait for the shim to accept a frame,
+  # matching the GenServer.call bound these calls had before they were queued.
+  @default_send_timeout_ms 5_000
+  # Retry interval for frames the port did not accept; there is no port
+  # "not busy" notification, so the server polls with nosuspend.
+  @input_retry_ms 10
 
   defmodule Terminal do
     @moduledoc """
@@ -376,15 +390,26 @@ defmodule Forcola.Duplex do
   @doc """
   Write a line to the child's stdin.
 
-  A newline is appended. Returns `{:error, :closed}` once the session is
-  over or the child's stdin has been closed with `send_eof/1`. Raises
-  `ArgumentError` when `line` is not iodata; the session and the child are
-  unaffected by the rejected call.
+  A newline is appended. The call returns once the shim has accepted the
+  line. That is immediate unless the child has stopped reading under
+  `track_descendants: true`, where the shim applies backpressure: the line
+  then waits in the session, in order, until the child reads or `timeout`
+  (milliseconds or `:infinity`, default 5000) elapses. On expiry the line is
+  not sent and `{:error, :busy}` is returned; the session, the child and
+  later sends are unaffected. The session keeps handling output, owner
+  death, `close/1` and `shutdown/1` while lines wait.
+
+  Returns `{:error, :closed}` once the session is over or the child's stdin
+  has been closed with `send_eof/2`. Raises `ArgumentError` when `line` is
+  not iodata; the session and the child are unaffected by the rejected call.
   """
-  @spec send_line(session(), iodata()) :: :ok | {:error, term()}
-  def send_line(%__MODULE__{pid: pid}, line) do
+  @spec send_line(session(), iodata(), timeout()) :: :ok | {:error, :closed | :busy}
+  def send_line(session, line, timeout \\ @default_send_timeout_ms)
+
+  def send_line(%__MODULE__{pid: pid}, line, timeout)
+      when timeout == :infinity or (is_integer(timeout) and timeout >= 0) do
     validate_iodata!(line)
-    GenServer.call(pid, {:send_line, line})
+    GenServer.call(pid, {:send_line, line, timeout}, :infinity)
   catch
     :exit, _ -> {:error, :closed}
   end
@@ -396,7 +421,7 @@ defmodule Forcola.Duplex do
   defp validate_iodata!(line) do
     unless iodata?(line) do
       raise ArgumentError,
-            "Forcola.Duplex.send_line/2 expects iodata (a binary, or a list of " <>
+            "Forcola.Duplex.send_line/3 expects iodata (a binary, or a list of " <>
               "binaries and bytes), got: #{inspect(line)}"
     end
   end
@@ -412,12 +437,18 @@ defmodule Forcola.Duplex do
   Close the child's stdin without killing the group.
 
   For CLIs that finish and exit when their input ends; the child's exit
-  then arrives as a `:forcola_exit` message. Returns `{:error, :closed}`
-  if the session is already over.
+  then arrives as a `:forcola_exit` message. The EOF is queued behind lines
+  the shim has not yet accepted and waits under the same bound as
+  `send_line/3`; `{:error, :busy}` means it was not sent and the child's
+  stdin is still open. Returns `{:error, :closed}` if the session is already
+  over or stdin was already closed.
   """
-  @spec send_eof(session()) :: :ok | {:error, term()}
-  def send_eof(%__MODULE__{pid: pid}) do
-    GenServer.call(pid, :send_eof)
+  @spec send_eof(session(), timeout()) :: :ok | {:error, :closed | :busy}
+  def send_eof(session, timeout \\ @default_send_timeout_ms)
+
+  def send_eof(%__MODULE__{pid: pid}, timeout)
+      when timeout == :infinity or (is_integer(timeout) and timeout >= 0) do
+    GenServer.call(pid, {:send_eof, timeout}, :infinity)
   catch
     :exit, _ -> {:error, :closed}
   end
@@ -582,7 +613,9 @@ defmodule Forcola.Duplex do
            queue: :queue.new(),
            waiter: nil,
            output_limit: nil,
-           halt: false
+           halt: false,
+           pending: :queue.new(),
+           flush_timer: nil
          }}
 
       {:error, :not_found} ->
@@ -596,28 +629,29 @@ defmodule Forcola.Duplex do
   end
 
   @impl true
-  def handle_call({:send_line, _line}, _from, %{exit: exit} = state) when not is_nil(exit) do
+  def handle_call({:send_line, _line, _timeout}, _from, %{exit: exit} = state)
+      when not is_nil(exit) do
     {:reply, {:error, :closed}, state}
   end
 
-  def handle_call({:send_line, _line}, _from, %{stdin_open: false} = state) do
+  def handle_call({:send_line, _line, _timeout}, _from, %{stdin_open: false} = state) do
     {:reply, {:error, :closed}, state}
   end
 
-  def handle_call({:send_line, line}, _from, state) do
-    {:reply, port_command(state.port, Shim.tag_stdin(), [line, "\n"]), state}
+  def handle_call({:send_line, line, timeout}, from, state) do
+    submit_input(state, from, :line, Shim.tag_stdin(), [line, "\n"], timeout)
   end
 
-  def handle_call(:send_eof, _from, %{exit: exit} = state) when not is_nil(exit) do
+  def handle_call({:send_eof, _timeout}, _from, %{exit: exit} = state) when not is_nil(exit) do
     {:reply, {:error, :closed}, state}
   end
 
-  def handle_call(:send_eof, _from, %{stdin_open: false} = state) do
+  def handle_call({:send_eof, _timeout}, _from, %{stdin_open: false} = state) do
     {:reply, {:error, :closed}, state}
   end
 
-  def handle_call(:send_eof, _from, state) do
-    {:reply, port_command(state.port, Shim.tag_eof(), ""), %{state | stdin_open: false}}
+  def handle_call({:send_eof, timeout}, from, state) do
+    submit_input(%{state | stdin_open: false}, from, :eof, Shim.tag_eof(), "", timeout)
   end
 
   def handle_call({:recv, _timeout}, _from, %{delivery: :messages} = state) do
@@ -693,6 +727,7 @@ defmodule Forcola.Duplex do
       state
       |> finish_tracking(terminal)
       |> Map.merge(%{exit: :shim_exited, terminal: with_groups(terminal, state.tracking)})
+      |> fail_pending({:error, :closed})
       |> reply_pull_waiter()
 
     if state.delivery == :pull and not :queue.is_empty(state.queue) do
@@ -715,10 +750,19 @@ defmodule Forcola.Duplex do
 
   def handle_info({:recv_timeout, _ref}, state), do: {:noreply, state}
 
+  def handle_info(:flush_input, state) do
+    {:noreply, flush_input(%{state | flush_timer: nil})}
+  end
+
+  def handle_info({:send_timeout, ref}, state) do
+    {:noreply, expire_input(state, ref)}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
+    state = fail_pending(state, {:error, :closed})
     if state.delivery == :messages, do: flush_buffers(state)
     terminal = settle(state) |> finish_output_evidence(state)
     publish_terminal(state.session.terminal_table, terminal)
@@ -1042,12 +1086,12 @@ defmodule Forcola.Duplex do
   defp reply_pull_waiter(%{waiter: {from, _ref, timer}} = state) do
     case :queue.out(state.queue) do
       {{:value, line}, queue} ->
-        cancel_recv_timer(timer)
+        cancel_timer(timer)
         GenServer.reply(from, {:ok, line})
         %{state | queue: queue, waiter: nil}
 
       {:empty, _queue} when not is_nil(state.exit) ->
-        cancel_recv_timer(timer)
+        cancel_timer(timer)
         GenServer.reply(from, {:done, state.terminal})
         %{state | waiter: nil}
 
@@ -1056,8 +1100,8 @@ defmodule Forcola.Duplex do
     end
   end
 
-  defp cancel_recv_timer(nil), do: :ok
-  defp cancel_recv_timer(timer), do: Process.cancel_timer(timer)
+  defp cancel_timer(nil), do: :ok
+  defp cancel_timer(timer), do: Process.cancel_timer(timer)
 
   defp terminal_reply(session) do
     case await_terminal(session, 0) do
@@ -1077,13 +1121,94 @@ defmodule Forcola.Duplex do
 
   ## Port writes
 
-  # A closed port means the shim raced us shut; surface that as the
-  # session being over.
-  defp port_command(port, tag, payload) do
-    case Shim.send_frame(port, tag, payload) do
-      true -> :ok
-      false -> {:error, :closed}
+  # Input frames are sent with nosuspend. A plain port command suspends this
+  # server while the port is busy, which happens when a tracked child has
+  # stopped reading and the shim's bounded input queue is full; a suspended
+  # server handles no output, owner DOWN, close or shutdown. A frame the port
+  # does not accept waits in `pending`, in order, and is retried on a timer
+  # under the caller's bound, so the session stays responsive meanwhile.
+  defp submit_input(state, from, kind, tag, payload, timeout) do
+    if :queue.is_empty(state.pending) do
+      case Shim.try_send_frame(state.port, tag, payload) do
+        :ok ->
+          {:reply, :ok, state}
+
+        # A closed port means the shim raced us shut; surface that as the
+        # session being over.
+        :closed ->
+          {:reply, {:error, :closed}, state}
+
+        :busy ->
+          {:noreply, enqueue_input(state, from, kind, tag, payload, timeout)}
+      end
+    else
+      {:noreply, enqueue_input(state, from, kind, tag, payload, timeout)}
     end
+  end
+
+  defp enqueue_input(state, from, kind, tag, payload, timeout) do
+    ref = make_ref()
+    timer = schedule_send_timeout(ref, timeout)
+    entry = %{from: from, kind: kind, tag: tag, payload: payload, ref: ref, timer: timer}
+    schedule_flush(%{state | pending: :queue.in(entry, state.pending)})
+  end
+
+  defp schedule_send_timeout(_ref, :infinity), do: nil
+
+  defp schedule_send_timeout(ref, timeout) do
+    Process.send_after(self(), {:send_timeout, ref}, timeout)
+  end
+
+  defp schedule_flush(%{flush_timer: nil} = state) do
+    %{state | flush_timer: Process.send_after(self(), :flush_input, @input_retry_ms)}
+  end
+
+  defp schedule_flush(state), do: state
+
+  defp flush_input(state) do
+    case :queue.out(state.pending) do
+      {:empty, _queue} ->
+        state
+
+      {{:value, entry}, rest} ->
+        case Shim.try_send_frame(state.port, entry.tag, entry.payload) do
+          :ok ->
+            cancel_timer(entry.timer)
+            GenServer.reply(entry.from, :ok)
+            flush_input(%{state | pending: rest})
+
+          :busy ->
+            schedule_flush(state)
+
+          :closed ->
+            fail_pending(state, {:error, :closed})
+        end
+    end
+  end
+
+  # The caller's bound elapsed before the shim accepted the frame. It is
+  # never sent; an unsent EOF leaves stdin open for later sends.
+  defp expire_input(state, ref) do
+    {expired, pending} = Enum.split_with(:queue.to_list(state.pending), &(&1.ref == ref))
+
+    case expired do
+      [] ->
+        state
+
+      [entry] ->
+        GenServer.reply(entry.from, {:error, :busy})
+        state = %{state | pending: :queue.from_list(pending)}
+        if entry.kind == :eof, do: %{state | stdin_open: true}, else: state
+    end
+  end
+
+  defp fail_pending(state, reply) do
+    for entry <- :queue.to_list(state.pending) do
+      cancel_timer(entry.timer)
+      GenServer.reply(entry.from, reply)
+    end
+
+    %{state | pending: :queue.new()}
   end
 
   ## Kill discipline
@@ -1092,10 +1217,14 @@ defmodule Forcola.Duplex do
   # EXIT frame. Preserve its observed status separately from its cleanup
   # confirmation; a missing frame never becomes a confirmed result.
   defp settle(%{port: port, exit: nil, cleanup_timeout_ms: cleanup_timeout_ms} = state) do
+    deadline = System.monotonic_time(:millisecond) + cleanup_timeout_ms
+
     {result, state} =
       try do
-        Shim.send_frame(port, Shim.tag_kill())
-        await_exit(state, cleanup_timeout_ms)
+        case send_kill(port, deadline) do
+          :busy -> {:timeout, state}
+          _accepted_or_closed -> do_await_exit(state, deadline)
+        end
       catch
         :error, :badarg -> {:transport_lost, state}
       end
@@ -1135,9 +1264,24 @@ defmodule Forcola.Duplex do
     }
   end
 
-  defp await_exit(state, timeout_ms) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    do_await_exit(state, deadline)
+  # KILL shares the shim's stdin with child input. While the port is busy
+  # with input a tracked child has not read, the frame could not reach the
+  # shim anyway, so retry within the cleanup budget instead of suspending in
+  # terminate/2. A KILL the port never accepts reports :timeout; closing the
+  # port afterwards lets the shim's hang-up detection run cleanup natively.
+  defp send_kill(port, deadline) do
+    case Shim.try_send_frame(port, Shim.tag_kill()) do
+      :busy ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(@input_retry_ms)
+          send_kill(port, deadline)
+        else
+          :busy
+        end
+
+      accepted_or_closed ->
+        accepted_or_closed
+    end
   end
 
   defp do_await_exit(%{port: port} = state, deadline) do
