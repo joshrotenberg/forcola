@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/joshrotenberg/forcola/compare/v0.11.0...v0.11.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* follow-ups from the descendant tracking review (closes [#122](https://github.com/joshrotenberg/forcola/issues/122)) ([#134](https://github.com/joshrotenberg/forcola/issues/134)) ([58a06c8](https://github.com/joshrotenberg/forcola/commit/58a06c8be27ff3a8b4d7f62fccdb0fcb76ab6590))
+
 ## [0.11.0](https://github.com/joshrotenberg/forcola/compare/v0.10.0...v0.11.0) (2026-11-04)
 
 
