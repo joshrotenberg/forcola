@@ -69,17 +69,18 @@ of flushing it before closing the OS pipes. The shim remains responsible for
 OS process kills. This works after `kill -9` of the VM or a brutally killed port
 owner, without a BEAM callback or `after` block.
 
-A Duplex server suspended while sending input cannot yet handle a queued
-`close/1`, `shutdown/1` or owner-down message. Those operations wait until the
-send resumes. Independent hang-up detection covers actual port closure and
-BEAM death; it does not bypass that server's pending input operation.
+A Duplex session sends input and KILL without suspending on the port, so
+`close/1`, `shutdown/1` and owner death are handled while a tracked child
+refuses input. The KILL frame still shares the shim's stdin with that unread
+input: the session waits out its cleanup budget, reports
+`confirmation: :timeout`, and aborts the port, which this hang-up detection
+turns into native cleanup.
 
-The untracked path still writes child stdin synchronously. If that write blocks,
-its supervision loop cannot handle KILL, its run timer, or EOF until the write
-completes. Closing the port alone does not unblock that child-input write.
-Use tracking when cleanup must remain responsive to port closure while sending
-to a child that may stop reading. Post-EXIT linger checks hang-up in both paths,
-but the legacy supervision loop has this blocked-input limitation.
+The untracked path queues child stdin in the shim without bound, so a child
+that stops reading never blocks KILL, the run timer, or EOF handling; the owner
+controls how much it sends. The synchronous write that had this limitation is
+described in [#111](https://github.com/joshrotenberg/forcola/issues/111) and
+was removed in 0.9.0.
 
 ## Confirmation before the call returns
 
@@ -111,8 +112,8 @@ reports back at all, for example if the shim is wedged or the BEAM-to-shim pipe
 is stuck. If that deadline fires first, the result's status is
 `{:signal, :unconfirmed}`: death was requested but not confirmed. Closing the
 port is the remaining kill lever with tracking: peer hang-up starts cleanup
-independently of blocked stdin. The untracked blocked-input exception is
-described above.
+independently of blocked stdin. The untracked path never blocks on child
+stdin, as described above.
 
 `{:signal, :unconfirmed}` also appears when the shim exits without sending an
 EXIT or ERROR frame (for example it crashed, or was itself SIGKILLed). A
@@ -218,8 +219,8 @@ Every execution mode can opt in to `interrupt_signal: :int` together with a posi
 to its process group, waits that grace, and then runs the existing TERM/KILL
 sequence if the group is still alive. Timeout, explicit KILL, normal leader
 exit cleanup, and observed protocol EOF all use this single sequence. Defaults
-retain the existing behavior, including the untracked blocked-input exception
-above. Tracking detects port hang-up independently of its stdin reader, with no
+retain the existing behavior. Tracking detects port hang-up independently of
+its stdin reader, with no
 second BEAM-side process killer. The paired options
 require the same `bounded_run_v1` capability in Run, Duplex, Stream and Daemon.
 Elixir cleanup waits include both graces, and Daemon's generated child spec

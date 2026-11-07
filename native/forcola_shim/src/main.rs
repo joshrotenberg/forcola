@@ -17,8 +17,9 @@
 //!   that remain in its process group
 //! - EOF on the shim's stdin means the BEAM died; the shim kills the group
 //!   and exits. Tracked mode independently detects a closed protocol output
-//!   peer even when child input blocks the reader. The untracked synchronous
-//!   input path can delay EOF handling while its child write is blocked.
+//!   peer even when child input blocks its reader behind the bounded input
+//!   queue; the untracked path queues input without bound, so its reader
+//!   never blocks and EOF handling is never delayed.
 //!
 //! Wire protocol (BEAM <-> shim), legacy framing with optional v1 handshake:
 //!
