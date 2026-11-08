@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.2](https://github.com/joshrotenberg/forcola/compare/v0.11.1...v0.11.2) (2026-11-08)
+
+
+### Bug Fixes
+
+* **lock:** read the shim's answer before requiring its os pid ([#137](https://github.com/joshrotenberg/forcola/issues/137)) ([9a0d154](https://github.com/joshrotenberg/forcola/commit/9a0d154259a09c487e2c0c1f68c3b23dfdc116b0))
+
 ## [0.11.1](https://github.com/joshrotenberg/forcola/compare/v0.11.0...v0.11.1) (2026-11-07)
 
 
