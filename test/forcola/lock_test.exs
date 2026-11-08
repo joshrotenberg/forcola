@@ -101,6 +101,48 @@ defmodule Forcola.LockTest do
              Lock.acquire("x.lock", shim_path: "rel")
   end
 
+  # A shim that answers `held <pid>` or an error exits at once, and on Linux
+  # its port has been seen to close before an os pid lookup made right after
+  # `Port.open/2`, leaving the answer unread. These stubs answer and exit
+  # immediately; the result must not depend on whether the port is still
+  # open when the guard looks at it.
+  test "the answer of a shim that has already exited is still read", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "layer.lock")
+
+    cases = [
+      {"held 12345", 3, {:error, {:held, 12_345}}},
+      {"error open enoent", 4, {:error, {:open, :enoent}}},
+      {"error lock enolck", 5, {:error, {:lock, :enolck}}}
+    ]
+
+    for {line, status, expected} <- cases do
+      shim = stub_shim(tmp_dir, "echo '#{line}'\nexit #{status}\n")
+
+      for attempt <- 1..20 do
+        assert Lock.acquire(path, shim_path: shim) == expected,
+               "#{line} (attempt #{attempt})"
+      end
+    end
+  end
+
+  test "a shim that answers ok and exits never yields a handle without a pid",
+       %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "layer.lock")
+    shim = stub_shim(tmp_dir, "echo ok\nexit 0\n")
+
+    for _attempt <- 1..20 do
+      case Lock.acquire(path, shim_path: shim) do
+        {:error, {:shim_exited, _status}} ->
+          :ok
+
+        {:ok, %Lock{os_pid: os_pid} = lock} ->
+          assert is_integer(os_pid) and os_pid > 0
+          assert_receive {:forcola_lock_lost, ^lock, {:shim_exited, _status}}, 5_000
+          assert :ok = Lock.release(lock)
+      end
+    end
+  end
+
   defp eventually_acquire(path, attempts \\ 100) do
     case Lock.acquire(path) do
       {:error, {:held, _}} when attempts > 0 ->
@@ -124,6 +166,13 @@ defmodule Forcola.LockTest do
       true ->
         false
     end
+  end
+
+  defp stub_shim(dir, body) do
+    shim = Path.join(dir, "stub_shim_#{System.unique_integer([:positive])}")
+    File.write!(shim, "#!/bin/sh\n" <> body)
+    File.chmod!(shim, 0o755)
+    shim
   end
 
   defp os_alive?(pid) do
