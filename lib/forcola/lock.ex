@@ -97,7 +97,9 @@ defmodule Forcola.Lock do
     * `{:error, :not_found | {:invalid_shim_path, reason}}` - no usable
       shim binary, as in `Forcola.Shim.path/1`.
     * `{:error, {:shim_exited, status}}` or
-      `{:error, {:shim_start_failed, reason}}` - the shim could not run.
+      `{:error, {:shim_start_failed, reason}}` - the shim could not run, or
+      it answered that it took the lock but exited before its OS pid could
+      be read, so it is not holding the lock.
 
   ## Options
 
@@ -179,23 +181,27 @@ defmodule Forcola.Lock do
     owner_monitor = Process.monitor(owner)
 
     case open_port(bin, path) do
-      {:ok, port, os_pid} ->
+      {:ok, port} ->
         state = %{
           port: port,
+          path: path,
           owner: owner,
           owner_monitor: owner_monitor,
           ref: ref,
-          handle: %__MODULE__{path: path, os_pid: os_pid, guard: self(), ref: ref}
+          deadline: System.monotonic_time(:millisecond) + timeout_ms
         }
 
-        deadline = System.monotonic_time(:millisecond) + timeout_ms
-        await_answer(state, deadline, "")
+        await_answer(state, "")
 
       {:error, _reason} = error ->
         send(owner, {ref, error})
     end
   end
 
+  # The os pid is not read here. A shim that answers `held <pid>` or an error
+  # exits at once, and its port can close before `Port.info/2` runs; its
+  # answer is still in the mailbox and must be read. Only the `ok` answer
+  # needs the pid (see answer/2).
   defp open_port(bin, path) do
     port =
       Port.open({:spawn_executable, bin}, [
@@ -207,23 +213,20 @@ defmodule Forcola.Lock do
         args: ["lock", path]
       ])
 
-    case Port.info(port, :os_pid) do
-      {:os_pid, os_pid} -> {:ok, port, os_pid}
-      nil -> {:error, {:shim_exited, :unknown}}
-    end
+    {:ok, port}
   catch
     :error, reason -> {:error, {:shim_start_failed, reason}}
   end
 
-  defp await_answer(%{port: port} = state, deadline, partial) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+  defp await_answer(%{port: port} = state, partial) do
+    remaining = remaining_ms(state)
 
     receive do
       {^port, {:data, {:eol, line}}} ->
         answer(state, partial <> line)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        await_answer(state, deadline, partial <> chunk)
+        await_answer(state, partial <> chunk)
 
       {^port, {:exit_status, status}} ->
         reply(state, {:error, {:shim_exited, status}})
@@ -241,9 +244,18 @@ defmodule Forcola.Lock do
     end
   end
 
+  # After `ok` the shim blocks on stdin, so its port stays open unless the
+  # shim has died. A shim that is already gone is not holding the lock.
   defp answer(state, "ok") do
-    reply(state, {:ok, state.handle.os_pid})
-    hold(state)
+    case Port.info(state.port, :os_pid) do
+      {:os_pid, os_pid} ->
+        handle = %__MODULE__{path: state.path, os_pid: os_pid, guard: self(), ref: state.ref}
+        reply(state, {:ok, os_pid})
+        hold(Map.put(state, :handle, handle))
+
+      nil ->
+        reply(state, {:error, {:shim_exited, exit_status(state)}})
+    end
   end
 
   defp answer(state, "held " <> pid), do: reply(state, {:error, {:held, parse_pid(pid)}})
@@ -256,6 +268,18 @@ defmodule Forcola.Lock do
     do: reply(state, {:error, {:lock, SpawnError.reason(name)}})
 
   defp answer(state, _line), do: reply(state, {:error, :invalid_reply})
+
+  # The port has closed; its exit status may already be in the mailbox.
+  defp exit_status(%{port: port} = state) do
+    receive do
+      {^port, {:exit_status, status}} -> status
+      {:EXIT, ^port, reason} -> reason
+    after
+      remaining_ms(state) -> :unknown
+    end
+  end
+
+  defp remaining_ms(state), do: max(state.deadline - System.monotonic_time(:millisecond), 0)
 
   defp parse_pid(text) do
     case Integer.parse(text) do
