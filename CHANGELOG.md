@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/joshrotenberg/forcola/compare/v0.12.0...v0.12.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* keep a command running when a tracked descendant is unreadable (closes [#142](https://github.com/joshrotenberg/forcola/issues/142)) ([#143](https://github.com/joshrotenberg/forcola/issues/143)) ([859acf8](https://github.com/joshrotenberg/forcola/commit/859acf88583c04e2602bb205cb4f7e89605c1e29))
+
 ## [0.12.0](https://github.com/joshrotenberg/forcola/compare/v0.11.2...v0.12.0) (2026-11-09)
 
 
