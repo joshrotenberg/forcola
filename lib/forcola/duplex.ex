@@ -155,6 +155,10 @@ defmodule Forcola.Duplex do
     malformed, or dropped by the history bound or native notification queue.
     Execution continues; native cleanup confirmation is independent of history.
     See `Forcola.Result` for the identity shape and Linux/macOS scope meanings.
+    `:cleanup_trigger` is what first started tracked cleanup and
+    `:uncertain_reason` is the first recorded cause of an unconfirmed tracked
+    cleanup; either is `nil` when not reported. They are diagnostics and do not
+    affect `:confirmation`.
     A macOS descendant reparented before its first sample is outside the
     sampled guarantee. Unknown tree scope or malformed native EXIT cannot
     produce positive confirmation.
@@ -178,6 +182,8 @@ defmodule Forcola.Duplex do
       output: :complete,
       tracked_groups: [],
       tracked_groups_truncated: false,
+      cleanup_trigger: nil,
+      uncertain_reason: nil,
       contained: :unknown
     ]
 
@@ -196,6 +202,8 @@ defmodule Forcola.Duplex do
             scope: :process_group | :active_cgroup | :tree_contained | :tree_sampled | :unknown,
             tracked_groups: [Shim.identity()],
             tracked_groups_truncated: boolean(),
+            cleanup_trigger: atom() | nil,
+            uncertain_reason: atom() | nil,
             contained: boolean() | :unknown,
             spawn_error: Forcola.SpawnError.t() | String.t() | :invalid_error | nil,
             output:
@@ -1263,7 +1271,8 @@ defmodule Forcola.Duplex do
             terminal.scope,
             terminal.confirmation,
             terminal.contained,
-            terminal.tracked_groups_truncated
+            terminal.tracked_groups_truncated,
+            terminal
           )
     }
   end
@@ -1333,7 +1342,9 @@ defmodule Forcola.Duplex do
       contained: report.contained,
       output: output_evidence(report),
       tracked_groups: Tracking.groups(tracking),
-      tracked_groups_truncated: report.tracked_groups_truncated
+      tracked_groups_truncated: report.tracked_groups_truncated,
+      cleanup_trigger: Map.get(report, :cleanup_trigger),
+      uncertain_reason: Map.get(report, :uncertain_reason)
     }
   end
 
