@@ -338,9 +338,13 @@ defmodule Forcola.Run do
   defp truncation(_, _), do: :unknown
 
   defp malformed(acc, report \\ %{}) do
+    tracked = if acc.tracking.enabled, do: Tracking.report_map(acc.tracking, report)
+
     ev = %{
       evidence(acc, :malformed_exit)
       | contained: Tracking.contained(report["contained"]),
+        cleanup_trigger: tracked && tracked.cleanup_trigger,
+        uncertain_reason: tracked && tracked.uncertain_reason,
         tracked_groups_truncated:
           acc.tracking.enabled and
             (acc.tracking.truncated or report["tracked_groups_truncated"] == true)
@@ -351,7 +355,8 @@ defmodule Forcola.Run do
       :unknown,
       :unconfirmed,
       ev.contained,
-      ev.tracked_groups_truncated
+      ev.tracked_groups_truncated,
+      ev
     )
 
     # Retain a syntactically valid raw child observation even if other fields

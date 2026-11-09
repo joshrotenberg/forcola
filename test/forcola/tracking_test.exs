@@ -580,6 +580,15 @@ defmodule Forcola.TrackingTest do
              uncertain_reason: :incomplete_scans
            } = report
 
+    confirmed =
+      Forcola.Tracking.report_map(
+        tracking,
+        %{base | "confirmed" => true}
+        |> Map.put("uncertain_reason", "signal_failed")
+      )
+
+    assert %{confirmed: true, uncertain_reason: nil} = confirmed
+
     for bad <- ["not_a_reason", 7, nil, %{}] do
       report =
         Forcola.Tracking.report_map(

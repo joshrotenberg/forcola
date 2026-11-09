@@ -759,9 +759,10 @@ an unconfirmed cleanup and names the first cause, such as `:incomplete_scans`,
 the shim did not report a recognized value, including on paths with no EXIT
 report. They explain a result and never change it: `confirmation` alone says
 whether cleanup was confirmed. `Forcola.Duplex.Terminal` carries the same two
-fields. `:tracker_uncertain` means Forcola stopped the child because discovery
-could no longer be trusted, so the child received the cleanup signals while it
-was still working.
+fields.
+`:tracker_uncertain` means tracking uncertainty started cleanup before anything
+else did. It does not show that the child was still running or that a signal
+reached it.
 Native EOF cleanup still runs after brutal consumer/server or BEAM death, but
 that path cannot promise a final observer event. A Duplex session surviving
 its owner's death can still report to a surviving explicit observer. This

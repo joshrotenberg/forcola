@@ -414,11 +414,12 @@ defmodule Forcola.Tracking do
     # A tracked report is well formed only with a child status, boolean flags
     # and a known tracking scope. Nothing else may confirm cleanup.
     valid = status != nil and valid_flags and scope != :unknown
+    confirmed = valid and report["confirmed"] == true
 
     %{
       valid: valid,
       status: status,
-      confirmed: valid and report["confirmed"] == true,
+      confirmed: confirmed,
       scope: scope,
       timed_out: report["timed_out"] == true,
       contained: contained(report["contained"]),
@@ -426,7 +427,8 @@ defmodule Forcola.Tracking do
         tracking.truncated or tracking.groups == [] or report["tracked_groups_truncated"] == true,
       output_truncated: report["output_truncated"] == true,
       cleanup_trigger: known(@cleanup_triggers, report["cleanup_trigger"]),
-      uncertain_reason: known(@uncertain_reasons, report["uncertain_reason"])
+      uncertain_reason:
+        if(confirmed, do: nil, else: known(@uncertain_reasons, report["uncertain_reason"]))
     }
   end
 
