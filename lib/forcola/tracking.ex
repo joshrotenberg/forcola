@@ -49,6 +49,21 @@ defmodule Forcola.Tracking do
   @max_ms 4_294_967_295
   @confirm_window_ms 500
   @margin_ms 5_000
+  @cleanup_triggers Map.new(
+                      ~w(child_exit kill timeout peer_disconnected transport_closed tracker_uncertain)a,
+                      &{Atom.to_string(&1), &1}
+                    )
+  @uncertain_reasons Map.new(
+                       ~w(
+                         late_descendant scan_invalid root_identity_lost process_limit
+                         scan_attempts_exceeded reap_failed group_limit incomplete_scans
+                         final_scan_incomplete identity_read_failed invalid_pid signal_failed
+                         cleanup_shortened cleanup_deadline tracked_channel_closed
+                         tracked_encode_failed child_wait_failed cgroup_unconfirmed
+                         root_not_reaped cleanup_incomplete
+                       )a,
+                       &{Atom.to_string(&1), &1}
+                     )
   @known_reasons %{
     "foreign_identity" => :foreign_identity,
     "not_a_group_leader" => :not_a_group_leader,
@@ -409,9 +424,16 @@ defmodule Forcola.Tracking do
       contained: contained(report["contained"]),
       tracked_groups_truncated:
         tracking.truncated or tracking.groups == [] or report["tracked_groups_truncated"] == true,
-      output_truncated: report["output_truncated"] == true
+      output_truncated: report["output_truncated"] == true,
+      cleanup_trigger: known(@cleanup_triggers, report["cleanup_trigger"]),
+      uncertain_reason: known(@uncertain_reasons, report["uncertain_reason"])
     }
   end
+
+  # Diagnostics only. An absent or unrecognized value is nil and is never used
+  # to decide confirmation.
+  defp known(values, value) when is_binary(value), do: Map.get(values, value)
+  defp known(_values, _value), do: nil
 
   @doc false
   def contained(value) when is_boolean(value), do: value
@@ -440,15 +462,22 @@ defmodule Forcola.Tracking do
   def confirmation(_report), do: :unconfirmed
 
   @doc false
-  def finish(tracking, scope, confirmation, contained \\ :unknown, truncated \\ false)
+  def finish(
+        tracking,
+        scope,
+        confirmation,
+        contained \\ :unknown,
+        truncated \\ false,
+        diagnostics \\ %{}
+      )
 
-  def finish(%{enabled: false} = tracking, _scope, _confirmation, _contained, _truncated),
+  def finish(%{enabled: false} = tracking, _scope, _confirmation, _contained, _truncated, _diag),
     do: tracking
 
-  def finish(%{finished: true} = tracking, _scope, _confirmation, _contained, _truncated),
+  def finish(%{finished: true} = tracking, _scope, _confirmation, _contained, _truncated, _diag),
     do: tracking
 
-  def finish(tracking, scope, confirmation, contained, truncated) do
+  def finish(tracking, scope, confirmation, contained, truncated, diagnostics) do
     notify(
       tracking,
       {:tracking_exit,
@@ -456,7 +485,9 @@ defmodule Forcola.Tracking do
          scope: scope,
          confirmation: confirmation,
          contained: contained,
-         tracked_groups_truncated: tracking.truncated or truncated
+         tracked_groups_truncated: tracking.truncated or truncated,
+         cleanup_trigger: Map.get(diagnostics, :cleanup_trigger),
+         uncertain_reason: Map.get(diagnostics, :uncertain_reason)
        }}
     )
 

@@ -185,6 +185,13 @@ pub struct ExitReport {
     /// Present only with tracking; truncation prevents cleanup confirmation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracked_groups_truncated: Option<bool>,
+    /// What first started cleanup. Present only with tracking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_trigger: Option<&'static str>,
+    /// The first cause recorded for an unconfirmed tracked cleanup. Present
+    /// only with tracking and only when `confirmed` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncertain_reason: Option<&'static str>,
 }
 
 /// Payload of an outbound ERROR frame.
@@ -345,12 +352,35 @@ mod tests {
             output_truncated: false,
             scope: None,
             tracked_groups_truncated: None,
+            cleanup_trigger: None,
+            uncertain_reason: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"status\":0"));
         assert!(!json.contains("signal"));
         assert!(json.contains("\"confirmed\":true"));
         assert!(json.contains("\"contained\":false"));
+        assert!(!json.contains("cleanup_trigger"));
+        assert!(!json.contains("uncertain_reason"));
+    }
+
+    #[test]
+    fn exit_report_serializes_cleanup_diagnostics() {
+        let report = ExitReport {
+            status: Some(0),
+            signal: None,
+            timed_out: false,
+            confirmed: false,
+            contained: false,
+            output_truncated: false,
+            scope: Some("tree_sampled"),
+            tracked_groups_truncated: Some(false),
+            cleanup_trigger: Some("tracker_uncertain"),
+            uncertain_reason: Some("incomplete_scans"),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"cleanup_trigger\":\"tracker_uncertain\""));
+        assert!(json.contains("\"uncertain_reason\":\"incomplete_scans\""));
     }
 
     #[test]
@@ -364,6 +394,8 @@ mod tests {
             output_truncated: false,
             scope: None,
             tracked_groups_truncated: None,
+            cleanup_trigger: None,
+            uncertain_reason: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"signal\":9"));

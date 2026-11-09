@@ -550,7 +550,7 @@ fn abort_startup(
         // our unreaped child, so its original group number cannot be reused.
         let _ = process::kill_process_group(Pid::from_child(&child), Signal::KILL);
     }
-    tracker.begin_cleanup(Instant::now(), interrupt_grace, grace);
+    tracker.begin_cleanup(Instant::now(), interrupt_grace, grace, "spawn_aborted");
     loop {
         // No waiter thread exists on this path.
         let exited = peek_child_exit(child.id(), true).is_ok_and(|outcome| outcome.is_some());
@@ -1192,7 +1192,7 @@ fn supervise_tracked<W: Write + Send + 'static>(
             if !beam_gone && peer.is_some_and(PeerMonitor::disconnected) {
                 beam_gone = true;
                 discard_output = true;
-                tracker.begin_cleanup(now, interrupt_grace, kill_grace);
+                tracker.begin_cleanup(now, interrupt_grace, kill_grace, "peer_disconnected");
             }
             tracker.scan();
             for identity in tracker.take_new_groups() {
@@ -1202,11 +1202,11 @@ fn supervise_tracked<W: Write + Send + 'static>(
                             Ok(()) => {}
                             Err(mpsc::TrySendError::Full(_)) => history_truncated = true,
                             Err(mpsc::TrySendError::Disconnected(_)) => {
-                                tracker.fail();
+                                tracker.fail("tracked_channel_closed");
                                 beam_gone = true;
                             }
                         },
-                        Err(_) => tracker.fail(),
+                        Err(_) => tracker.fail("tracked_encode_failed"),
                     }
                 }
             }
@@ -1215,7 +1215,7 @@ fn supervise_tracked<W: Write + Send + 'static>(
             let now = Instant::now();
             if tracker.uncertain() && !tracker.cleaning() {
                 discard_output = true;
-                tracker.begin_cleanup(now, interrupt_grace, kill_grace);
+                tracker.begin_cleanup(now, interrupt_grace, kill_grace, "tracker_uncertain");
             }
             if tracker.cleaning() {
                 input.close();
@@ -1248,7 +1248,7 @@ fn supervise_tracked<W: Write + Send + 'static>(
             }
             Ok(Event::Stdin(f)) if f.tag == TAG_KILL => {
                 discard_output |= outcome.is_none();
-                tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace, "kill");
                 next_scan = Instant::now();
             }
             Ok(Event::Stdin(_)) => {}
@@ -1256,24 +1256,29 @@ fn supervise_tracked<W: Write + Send + 'static>(
             | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 beam_gone = true;
                 discard_output = true;
-                tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                tracker.begin_cleanup(
+                    Instant::now(),
+                    interrupt_grace,
+                    kill_grace,
+                    "transport_closed",
+                );
                 next_scan = Instant::now();
             }
             Ok(Event::TimedOut) => {
                 if outcome.is_none() {
                     timed_out = true;
                     discard_output = true;
-                    tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                    tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace, "timeout");
                     next_scan = Instant::now();
                 }
             }
             Ok(Event::ChildWaitFailed) => {
-                tracker.fail();
+                tracker.fail("child_wait_failed");
                 next_scan = Instant::now();
             }
             Ok(Event::ChildExited(status)) => {
                 outcome = Some(status);
-                tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace);
+                tracker.begin_cleanup(Instant::now(), interrupt_grace, kill_grace, "child_exit");
                 next_scan = Instant::now();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1342,18 +1347,26 @@ fn supervise_tracked<W: Write + Send + 'static>(
         status: None,
         signal: None,
     });
+    let root_reaped = matches!(reaped, Ok(Some(_)));
+    let confirmed = confirmed && cgroup_confirmed && final_confirmed && root_reaped;
+    let uncertain_reason = (!confirmed).then(|| {
+        tracker
+            .uncertain_reason()
+            .or((!cgroup_confirmed).then_some("cgroup_unconfirmed"))
+            .or((!root_reaped).then_some("root_not_reaped"))
+            .unwrap_or("cleanup_incomplete")
+    });
     let report = ExitReport {
         status: outcome.status,
         signal: outcome.signal,
         timed_out,
-        confirmed: confirmed
-            && cgroup_confirmed
-            && final_confirmed
-            && matches!(reaped, Ok(Some(_))),
+        confirmed,
         contained: cgroup.is_some(),
         output_truncated,
         scope: Some(tracking::scope()),
         tracked_groups_truncated: Some(history_truncated),
+        cleanup_trigger: tracker.cleanup_trigger(),
+        uncertain_reason,
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let _ = control.send(Frame::new(TAG_EXIT, payload));
@@ -1565,6 +1578,8 @@ fn supervise<W: Write + Send + 'static>(
         output_truncated,
         scope: None,
         tracked_groups_truncated: None,
+        cleanup_trigger: None,
+        uncertain_reason: None,
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();

@@ -560,6 +560,54 @@ defmodule Forcola.TrackingTest do
     end
   end
 
+  test "the EXIT report's cleanup diagnostics are decoded through allow-lists" do
+    tracking = %{truncated: false, groups: [%{}]}
+    base = %{"status" => 0, "scope" => "tree_sampled", "confirmed" => false}
+
+    report =
+      Forcola.Tracking.report_map(
+        tracking,
+        Map.merge(base, %{
+          "cleanup_trigger" => "tracker_uncertain",
+          "uncertain_reason" => "incomplete_scans"
+        })
+      )
+
+    assert %{
+             valid: true,
+             confirmed: false,
+             cleanup_trigger: :tracker_uncertain,
+             uncertain_reason: :incomplete_scans
+           } = report
+
+    for bad <- ["not_a_reason", 7, nil, %{}] do
+      report =
+        Forcola.Tracking.report_map(
+          tracking,
+          Map.merge(base, %{"cleanup_trigger" => bad, "uncertain_reason" => bad})
+        )
+
+      assert %{valid: true, cleanup_trigger: nil, uncertain_reason: nil} = report
+    end
+  end
+
+  test "a tracked run reports what started its cleanup" do
+    for mode <- @modes do
+      ref = make_ref()
+      handle = start(mode, ["/bin/sh", "-c", "exit 0"], opts(ref))
+
+      try do
+        finish(handle, :exit)
+        assert_receive {^ref, {:tracking_exit, evidence}}, 10_000
+        assert evidence.confirmation == :confirmed, inspect({mode, evidence})
+        assert evidence.cleanup_trigger == :child_exit, inspect({mode, evidence})
+        assert evidence.uncertain_reason == nil, inspect({mode, evidence})
+      after
+        stop(handle)
+      end
+    end
+  end
+
   test "missing or malformed history leaves native cleanup confirmation intact", %{tmp_dir: dir} do
     for mode <- @modes, peer <- ["malformed", "not_leader", "missing_root"] do
       ref = make_ref()
@@ -888,6 +936,12 @@ defmodule Forcola.TrackingTest do
            "unexpected tracking evidence #{inspect(evidence)} for #{inspect(context)}"
 
     assert is_boolean(contained)
+
+    if confirmation == :confirmed do
+      assert evidence.uncertain_reason == nil
+      assert evidence.cleanup_trigger != :tracker_uncertain
+    end
+
     refute_receive {^ref, {:tracking_exit, _}}, 0
   end
 

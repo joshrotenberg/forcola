@@ -267,7 +267,8 @@ defmodule Forcola.Run do
         ev.scope,
         ev.cleanup,
         ev.contained,
-        ev.tracked_groups_truncated
+        ev.tracked_groups_truncated,
+        ev
       )
 
       if report["contained"] == true,
@@ -316,6 +317,8 @@ defmodule Forcola.Run do
         scope: if(tracked, do: tracked.scope, else: scope(report["contained"])),
         contained: Tracking.contained(report["contained"]),
         tracked_groups_truncated: if(tracked, do: tracked.tracked_groups_truncated, else: false),
+        cleanup_trigger: tracked && tracked.cleanup_trigger,
+        uncertain_reason: tracked && tracked.uncertain_reason,
         reason: acc.reason || timeout_reason(report["timed_out"]),
         output_truncated: truncation(acc.truncated, report["output_truncated"])
     }
@@ -399,6 +402,8 @@ defmodule Forcola.Run do
       scope: :unknown,
       contained: :unknown,
       tracked_groups_truncated: acc.tracking.truncated,
+      cleanup_trigger: nil,
+      uncertain_reason: nil,
       guard_close: nil
     }
   end

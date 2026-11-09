@@ -751,6 +751,17 @@ When the Elixir process survives to report completion, the observer receives
 one terminal event,
 `{reference, {:tracking_exit, evidence}}`. The evidence map contains `scope`,
 `confirmation`, `contained` and `tracked_groups_truncated`.
+It also carries two diagnostics. `cleanup_trigger` is what first started
+cleanup: `:child_exit`, `:kill`, `:timeout`, `:peer_disconnected`,
+`:transport_closed` or `:tracker_uncertain`. `uncertain_reason` is set only for
+an unconfirmed cleanup and names the first cause, such as `:incomplete_scans`,
+`:signal_failed`, `:cleanup_deadline` or `:group_limit`. Either is `nil` when
+the shim did not report a recognized value, including on paths with no EXIT
+report. They explain a result and never change it: `confirmation` alone says
+whether cleanup was confirmed. `Forcola.Duplex.Terminal` carries the same two
+fields. `:tracker_uncertain` means Forcola stopped the child because discovery
+could no longer be trusted, so the child received the cleanup signals while it
+was still working.
 Native EOF cleanup still runs after brutal consumer/server or BEAM death, but
 that path cannot promise a final observer event. A Duplex session surviving
 its owner's death can still report to a surviving explicit observer. This

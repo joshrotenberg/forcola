@@ -637,11 +637,26 @@ defmodule Forcola.Stream do
     :error, :badarg -> {:shim_exited, state}
   end
 
-  defp finish_tracking(state, scope, confirmation, contained \\ :unknown, truncated \\ false),
-    do: %{
-      state
-      | tracking: Tracking.finish(state.tracking, scope, confirmation, contained, truncated)
-    }
+  defp finish_tracking(
+         state,
+         scope,
+         confirmation,
+         contained \\ :unknown,
+         truncated \\ false,
+         diagnostics \\ %{}
+       ),
+       do: %{
+         state
+         | tracking:
+             Tracking.finish(
+               state.tracking,
+               scope,
+               confirmation,
+               contained,
+               truncated,
+               diagnostics
+             )
+       }
 
   defp tracking_error(state, fields) do
     struct!(
@@ -671,7 +686,8 @@ defmodule Forcola.Stream do
        report.scope,
        confirmation,
        report.contained,
-       report.tracked_groups_truncated
+       report.tracked_groups_truncated,
+       report
      )}
   end
 
@@ -824,7 +840,8 @@ defmodule Forcola.Stream do
         report.scope,
         confirmation,
         report.contained,
-        report.tracked_groups_truncated
+        report.tracked_groups_truncated,
+        report
       )
 
     final = if state.buffer == "", do: [], else: [state.buffer]

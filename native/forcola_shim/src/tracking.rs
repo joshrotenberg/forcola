@@ -147,6 +147,7 @@ struct Cleanup {
     term: Duration,
     deadline: Instant,
     empty_scans: u8,
+    trigger: &'static str,
 }
 
 pub struct Progress {
@@ -163,7 +164,7 @@ pub struct Tracker<S = Native> {
     members: HashMap<ProcessIdentity, Sequence>,
     pending: Vec<ProcessIdentity>,
     cleanup: Option<Cleanup>,
-    uncertain: bool,
+    uncertain_reason: Option<&'static str>,
     incomplete_scans: u8,
     root_group_unresolved: bool,
     group_limit: usize,
@@ -208,7 +209,7 @@ impl<S: Source> Tracker<S> {
             members: HashMap::new(),
             pending: Vec::new(),
             cleanup: None,
-            uncertain: false,
+            uncertain_reason: None,
             incomplete_scans: 0,
             root_group_unresolved: false,
             group_limit: MAX_GROUPS,
@@ -218,13 +219,21 @@ impl<S: Source> Tracker<S> {
     }
 
     pub fn uncertain(&self) -> bool {
-        self.uncertain
+        self.uncertain_reason.is_some()
     }
     pub fn root_known(&self) -> bool {
         self.processes.contains_key(&self.root_pid)
     }
-    pub fn fail(&mut self) {
-        self.uncertain = true;
+    /// The first cause of uncertainty, kept for the EXIT report.
+    pub fn uncertain_reason(&self) -> Option<&'static str> {
+        self.uncertain_reason
+    }
+    /// Why cleanup began, once it has. The first trigger is kept.
+    pub fn cleanup_trigger(&self) -> Option<&'static str> {
+        self.cleanup.as_ref().map(|cleanup| cleanup.trigger)
+    }
+    pub fn fail(&mut self, reason: &'static str) {
+        self.uncertain_reason.get_or_insert(reason);
     }
     pub fn take_new_groups(&mut self) -> Vec<ProcessIdentity> {
         std::mem::take(&mut self.pending)
@@ -247,23 +256,33 @@ impl<S: Source> Tracker<S> {
             .map(|p| p.identity.clone())
             .collect();
         if !live.is_empty() {
-            self.fail();
+            self.fail("late_descendant");
             // A late adoption found after the final confirmation cannot be
             // reported as complete. Make a last checked kill within the bound.
             for member in live {
                 self.send_checked(&member, false, libc::SIGKILL);
             }
         }
-        !self.uncertain && self.incomplete_scans == 0
+        if self.incomplete_scans > 0 {
+            self.fail("final_scan_incomplete");
+        }
+        !self.uncertain()
     }
 
-    pub fn begin_cleanup(&mut self, now: Instant, interrupt: Option<Duration>, term: Duration) {
+    pub fn begin_cleanup(
+        &mut self,
+        now: Instant,
+        interrupt: Option<Duration>,
+        term: Duration,
+        trigger: &'static str,
+    ) {
         if self.cleanup.is_none() {
             self.cleanup = Some(Cleanup {
                 interrupt,
                 term,
                 deadline: now + interrupt.unwrap_or_default() + term + CONFIRM_GRACE,
                 empty_scans: 0,
+                trigger,
             });
         }
     }
@@ -276,7 +295,7 @@ impl<S: Source> Tracker<S> {
             error.kind(),
             io::ErrorKind::InvalidData | io::ErrorKind::Unsupported
         ) {
-            self.fail();
+            self.fail("scan_invalid");
         }
     }
 
@@ -308,7 +327,7 @@ impl<S: Source> Tracker<S> {
             Ok(_) => {
                 // An unreaped root cannot disappear or be reused. Losing this
                 // invariant means the group inventory cannot be authorized.
-                self.fail();
+                self.fail("root_identity_lost");
                 return;
             }
             Err(error) => {
@@ -328,7 +347,7 @@ impl<S: Source> Tracker<S> {
                 }
             };
             if !self.processes.contains_key(&pid) && self.processes.len() >= self.process_limit {
-                self.fail();
+                self.fail("process_limit");
                 unresolved = true;
                 break;
             }
@@ -358,7 +377,7 @@ impl<S: Source> Tracker<S> {
             }
             attempts += 1;
             if attempts > self.process_limit.saturating_mul(2) + 1 {
-                self.fail();
+                self.fail("scan_attempts_exceeded");
                 break;
             }
             let current = match self.source.read(expected.pid) {
@@ -418,7 +437,7 @@ impl<S: Source> Tracker<S> {
                 }
                 if !self.processes.contains_key(&pid) && self.processes.len() >= self.process_limit
                 {
-                    self.fail();
+                    self.fail("process_limit");
                     break;
                 }
                 queue.push_back(child.identity.clone());
@@ -438,7 +457,7 @@ impl<S: Source> Tracker<S> {
                 && record.exited
             {
                 if self.source.reap(id.pid).is_err() {
-                    self.fail();
+                    self.fail("reap_failed");
                 } else {
                     self.processes.remove(&id.pid);
                 }
@@ -464,7 +483,7 @@ impl<S: Source> Tracker<S> {
             let id = &record.identity;
             if id.pid == id.pgid && !self.groups.contains_key(id) {
                 if self.groups.len() >= self.group_limit {
-                    self.uncertain = true;
+                    self.uncertain_reason.get_or_insert("group_limit");
                 } else {
                     self.groups.insert(id.clone(), None);
                     self.pending.push(id.clone());
@@ -482,7 +501,7 @@ impl<S: Source> Tracker<S> {
             0
         };
         if self.incomplete_scans >= MAX_INCOMPLETE_SCANS {
-            self.fail();
+            self.fail("incomplete_scans");
         }
     }
 
@@ -493,7 +512,7 @@ impl<S: Source> Tracker<S> {
             Ok(Some(current)) => current,
             Ok(None) => return false,
             Err(_) => {
-                self.fail();
+                self.fail("identity_read_failed");
                 return false;
             }
         };
@@ -512,7 +531,7 @@ impl<S: Source> Tracker<S> {
             return true;
         }
         if expected.pid == 0 || expected.pid > i32::MAX as u32 {
-            self.fail();
+            self.fail("invalid_pid");
             return false;
         }
         let target = if group {
@@ -528,7 +547,7 @@ impl<S: Source> Tracker<S> {
             if cfg!(target_os = "macos") && group && error.raw_os_error() == Some(libc::EPERM) {
                 return false;
             }
-            self.fail();
+            self.fail("signal_failed");
         }
         true
     }
@@ -631,7 +650,7 @@ impl<S: Source> Tracker<S> {
                 };
                 self.groups.insert(group.clone(), Some(sequence));
                 if shortened {
-                    self.fail();
+                    self.fail("cleanup_shortened");
                 }
                 for member in live.iter().filter(|id| id.pgid == group.pgid) {
                     covered.insert(member.pid);
@@ -649,7 +668,7 @@ impl<S: Source> Tracker<S> {
                     let sequence = self.after_signal(sequence, target_now);
                     self.members.insert(member.clone(), sequence);
                     if shortened {
-                        self.fail();
+                        self.fail("cleanup_shortened");
                     }
                 }
             }
@@ -660,13 +679,13 @@ impl<S: Source> Tracker<S> {
         } else {
             0
         };
-        if force && (!live.is_empty() || self.incomplete_scans > 0) {
-            self.uncertain = true;
-        }
         let done = cleanup.empty_scans >= 2 || force;
+        if force && (!live.is_empty() || self.incomplete_scans > 0) {
+            self.fail("cleanup_deadline");
+        }
         Progress {
             done,
-            confirmed: done && live.is_empty() && !self.uncertain,
+            confirmed: done && live.is_empty() && !self.uncertain(),
         }
     }
 }
@@ -870,7 +889,32 @@ mod tests {
             now,
             Some(Duration::from_millis(100)),
             Duration::from_millis(200),
+            "kill",
         );
+    }
+
+    #[test]
+    fn the_first_uncertainty_reason_and_trigger_are_kept() {
+        let mut tracker = tracker();
+        assert_eq!(tracker.uncertain_reason(), None);
+        assert_eq!(tracker.cleanup_trigger(), None);
+        let now = Instant::now();
+        begin(&mut tracker, now);
+        tracker.begin_cleanup(now, None, Duration::from_millis(1), "child_exit");
+        assert_eq!(tracker.cleanup_trigger(), Some("kill"));
+        tracker.fail("signal_failed");
+        tracker.fail("reap_failed");
+        assert!(tracker.uncertain());
+        assert_eq!(tracker.uncertain_reason(), Some("signal_failed"));
+    }
+
+    #[test]
+    fn persistent_incomplete_scans_name_their_cause() {
+        let mut tracker = tracker();
+        tracker.source.records.get_mut(&10).unwrap().exited = true;
+        tracker.source.fail_children = true;
+        assert!(!tracker.finish_scan());
+        assert_eq!(tracker.uncertain_reason(), Some("final_scan_incomplete"));
     }
 
     #[test]

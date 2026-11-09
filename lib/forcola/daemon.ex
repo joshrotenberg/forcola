@@ -523,11 +523,26 @@ defmodule Forcola.Daemon do
     state
   end
 
-  defp finish_tracking(state, scope, confirmation, contained \\ :unknown, truncated \\ false),
-    do: %{
-      state
-      | tracking: Tracking.finish(state.tracking, scope, confirmation, contained, truncated)
-    }
+  defp finish_tracking(
+         state,
+         scope,
+         confirmation,
+         contained \\ :unknown,
+         truncated \\ false,
+         diagnostics \\ %{}
+       ),
+       do: %{
+         state
+         | tracking:
+             Tracking.finish(
+               state.tracking,
+               scope,
+               confirmation,
+               contained,
+               truncated,
+               diagnostics
+             )
+       }
 
   defp record_identity(%{identity_enabled: true, identity: nil} = state, payload) do
     case Shim.decode_identity(payload) do
@@ -558,7 +573,8 @@ defmodule Forcola.Daemon do
       report.scope,
       Tracking.confirmation(report),
       report.contained,
-      report.tracked_groups_truncated
+      report.tracked_groups_truncated,
+      report
     )
     |> Map.put(:exit, {:exit, {Tracking.status(report), report.timed_out}})
   end
@@ -644,7 +660,8 @@ defmodule Forcola.Daemon do
         report.scope,
         Tracking.confirmation(report),
         report.contained,
-        report.tracked_groups_truncated
+        report.tracked_groups_truncated,
+        report
       )
 
   defp finish_cleanup_tracking(state, confirmation),
