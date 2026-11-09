@@ -337,18 +337,24 @@ defmodule Forcola.Run do
   defp truncation(_, false), do: false
   defp truncation(_, _), do: :unknown
 
-  defp malformed(acc, report \\ %{}) do
-    tracked = if acc.tracking.enabled, do: Tracking.report_map(acc.tracking, report)
+  defp diagnostics(%{tracking: %{enabled: true}} = acc, report) do
+    acc.tracking
+    |> Tracking.report_map(report)
+    |> Map.take([:cleanup_trigger, :uncertain_reason])
+  end
 
+  defp diagnostics(_acc, _report), do: %{}
+
+  defp malformed(acc, report \\ %{}) do
     ev = %{
       evidence(acc, :malformed_exit)
       | contained: Tracking.contained(report["contained"]),
-        cleanup_trigger: tracked && tracked.cleanup_trigger,
-        uncertain_reason: tracked && tracked.uncertain_reason,
         tracked_groups_truncated:
           acc.tracking.enabled and
             (acc.tracking.truncated or report["tracked_groups_truncated"] == true)
     }
+
+    ev = Map.merge(ev, diagnostics(acc, report))
 
     Tracking.finish(
       acc.tracking,
