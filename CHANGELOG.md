@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/joshrotenberg/forcola/compare/v0.11.2...v0.12.0) (2026-11-09)
+
+
+### Features
+
+* report why tracked cleanup started and why it was uncertain (closes [#139](https://github.com/joshrotenberg/forcola/issues/139)) ([#140](https://github.com/joshrotenberg/forcola/issues/140)) ([50381d4](https://github.com/joshrotenberg/forcola/commit/50381d462d53cfe4f2429a96a566314fb3f8dd06))
+
 ## [0.11.2](https://github.com/joshrotenberg/forcola/compare/v0.11.1...v0.11.2) (2026-11-08)
 
 

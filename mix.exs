@@ -1,7 +1,7 @@
 defmodule Forcola.MixProject do
   use Mix.Project
 
-  @version "0.11.2"
+  @version "0.12.0"
   @source_url "https://github.com/joshrotenberg/forcola"
 
   def project do
