@@ -569,7 +569,7 @@ defmodule Forcola.TrackingTest do
         tracking,
         Map.merge(base, %{
           "cleanup_trigger" => "tracker_uncertain",
-          "uncertain_reason" => "incomplete_scans"
+          "uncertain_reason" => "scan_invalid"
         })
       )
 
@@ -577,7 +577,7 @@ defmodule Forcola.TrackingTest do
              valid: true,
              confirmed: false,
              cleanup_trigger: :tracker_uncertain,
-             uncertain_reason: :incomplete_scans
+             uncertain_reason: :scan_invalid
            } = report
 
     confirmed =
@@ -597,6 +597,43 @@ defmodule Forcola.TrackingTest do
         )
 
       assert %{valid: true, cleanup_trigger: nil, uncertain_reason: nil} = report
+    end
+  end
+
+  if match?({:unix, :darwin}, :os.type()) do
+    test "an unreadable setuid descendant does not stop the command" do
+      ref = make_ref()
+      script = "/usr/bin/top -l 2 -s 1 >/dev/null; echo finished"
+
+      assert {:ok, result} = Forcola.run(["/bin/sh", "-c", script], opts(ref))
+      assert result.status == 0
+      assert result.stdout == "finished\n"
+
+      assert_receive {^ref, {:tracking_exit, evidence}}, 10_000
+      assert evidence.cleanup_trigger == :child_exit, inspect(evidence)
+      refute evidence.cleanup_trigger == :tracker_uncertain
+    end
+  end
+
+  if match?({:unix, :darwin}, :os.type()) do
+    test "an unconfirmed survivor holding the output pipes does not hold a strict run" do
+      ref = make_ref()
+
+      # Sampled while readable, then setuid and unreadable, in its own group,
+      # with the output pipes still open after the root exits.
+      survivor =
+        ~S|perl -e 'setpgrp(0,0); select(undef,undef,undef,0.3); exec "/usr/bin/top","-l","25","-s","1"' &|
+
+      script = "#{survivor}\nsleep 0.8\nexit 0"
+      started = System.monotonic_time(:millisecond)
+
+      result =
+        Forcola.run(["/bin/sh", "-c", script], opts(ref, max_output_bytes: 10_000_000))
+
+      assert System.monotonic_time(:millisecond) - started < 12_000, inspect(result)
+      assert_receive {^ref, {:tracking_exit, evidence}}, 1_000
+      assert evidence.confirmation == :unconfirmed, inspect(evidence)
+      assert evidence.cleanup_trigger == :child_exit, inspect(evidence)
     end
   end
 

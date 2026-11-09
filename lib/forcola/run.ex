@@ -319,6 +319,7 @@ defmodule Forcola.Run do
         tracked_groups_truncated: if(tracked, do: tracked.tracked_groups_truncated, else: false),
         cleanup_trigger: tracked && tracked.cleanup_trigger,
         uncertain_reason: tracked && tracked.uncertain_reason,
+        scan_errno: tracked && tracked.scan_errno,
         reason: acc.reason || timeout_reason(report["timed_out"]),
         output_truncated: truncation(acc.truncated, report["output_truncated"])
     }
@@ -340,7 +341,7 @@ defmodule Forcola.Run do
   defp diagnostics(%{tracking: %{enabled: true}} = acc, report) do
     acc.tracking
     |> Tracking.report_map(report)
-    |> Map.take([:cleanup_trigger, :uncertain_reason])
+    |> Map.take([:cleanup_trigger, :uncertain_reason, :scan_errno])
   end
 
   defp diagnostics(_acc, _report), do: %{}
@@ -415,6 +416,7 @@ defmodule Forcola.Run do
       tracked_groups_truncated: acc.tracking.truncated,
       cleanup_trigger: nil,
       uncertain_reason: nil,
+      scan_errno: nil,
       guard_close: nil
     }
   end

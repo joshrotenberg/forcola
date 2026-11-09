@@ -192,6 +192,10 @@ pub struct ExitReport {
     /// only with tracking and only when `confirmed` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uncertain_reason: Option<&'static str>,
+    /// The most recent OS error from an incomplete descendant scan. Present
+    /// only with tracking and only when a scan could not read a process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_errno: Option<i32>,
 }
 
 /// Payload of an outbound ERROR frame.
@@ -354,6 +358,7 @@ mod tests {
             tracked_groups_truncated: None,
             cleanup_trigger: None,
             uncertain_reason: None,
+            scan_errno: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"status\":0"));
@@ -376,11 +381,13 @@ mod tests {
             scope: Some("tree_sampled"),
             tracked_groups_truncated: Some(false),
             cleanup_trigger: Some("tracker_uncertain"),
-            uncertain_reason: Some("incomplete_scans"),
+            uncertain_reason: Some("scan_invalid"),
+            scan_errno: Some(1),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"cleanup_trigger\":\"tracker_uncertain\""));
-        assert!(json.contains("\"uncertain_reason\":\"incomplete_scans\""));
+        assert!(json.contains("\"uncertain_reason\":\"scan_invalid\""));
+        assert!(json.contains("\"scan_errno\":1"));
     }
 
     #[test]
@@ -396,6 +403,7 @@ mod tests {
             tracked_groups_truncated: None,
             cleanup_trigger: None,
             uncertain_reason: None,
+            scan_errno: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"signal\":9"));

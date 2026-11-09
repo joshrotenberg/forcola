@@ -1318,6 +1318,10 @@ fn supervise_tracked<W: Write + Send + 'static>(
             }
         }
     }
+    // A survivor cleanup could not confirm gone can hold the pipes open for as
+    // long as it runs, and a strict drain has no bound of its own. Without
+    // confirmation the output could not be vouched for anyway.
+    discard_output |= strict_output && !(confirmed && final_confirmed);
     let (output_truncated, disappeared) = if strict_output && !discard_output {
         let (drained, cancelled, disappeared) =
             drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit, peer);
@@ -1367,6 +1371,7 @@ fn supervise_tracked<W: Write + Send + 'static>(
         tracked_groups_truncated: Some(history_truncated),
         cleanup_trigger: tracker.cleanup_trigger(),
         uncertain_reason,
+        scan_errno: tracker.last_scan_errno(),
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let _ = control.send(Frame::new(TAG_EXIT, payload));
@@ -1580,6 +1585,7 @@ fn supervise<W: Write + Send + 'static>(
         tracked_groups_truncated: None,
         cleanup_trigger: None,
         uncertain_reason: None,
+        scan_errno: None,
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();

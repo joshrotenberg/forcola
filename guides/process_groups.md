@@ -243,8 +243,8 @@ On macOS, `proc_listpids` inventories that pinned group after the root exits.
 Dead groups are pruned from the native live set. Retained Elixir history can be
 truncated without stopping the command or changing native cleanup confirmation.
 History completeness and live-set cleanup are independent facts.
-Persistent inventory failures or live capacity exhaustion still stop a tracked
-command, as detailed in the tracking guide.
+Live capacity exhaustion and invalid inventory data still stop a tracked command,
+as detailed in the tracking guide. A process that cannot be read does not.
 Before each signal, the current leader must match its recorded start time and
 group. If it does not, the numeric group is never signalled; independently
 verified retained members are signalled individually. Identity verification
