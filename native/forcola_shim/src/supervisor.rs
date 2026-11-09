@@ -1318,6 +1318,10 @@ fn supervise_tracked<W: Write + Send + 'static>(
             }
         }
     }
+    // A survivor cleanup could not confirm gone can hold the pipes open for as
+    // long as it runs, and a strict drain has no bound of its own. Without
+    // confirmation the output could not be vouched for anyway.
+    discard_output |= strict_output && !(confirmed && final_confirmed);
     let (output_truncated, disappeared) = if strict_output && !discard_output {
         let (drained, cancelled, disappeared) =
             drain_pumps_strict(pumps, pump_done, rx, credit, stderr_credit, peer);

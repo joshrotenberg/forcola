@@ -854,7 +854,9 @@ not stop the command, however long it lasts. A descendant this user cannot
 inspect, such as a setuid program, fails those reads for as long as it runs, and
 what it starts in that time can go unobserved. `scan_errno` in the evidence
 carries the most recent such error. A scan still incomplete when cleanup ends
-leaves it unconfirmed. Invalid metadata,
+leaves it unconfirmed. An unconfirmed cleanup also ends a strict output drain, so
+a survivor holding the pipes cannot hold the command open, and the output is
+reported as truncated. Invalid metadata,
 unsupported discovery, live inventory capacity exhaustion, reaping failures and
 signal failures also prevent positive confirmation and trigger cleanup where it
 has not already begun. Transport loss still triggers cleanup. History truncation
