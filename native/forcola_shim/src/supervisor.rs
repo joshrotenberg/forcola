@@ -1367,6 +1367,7 @@ fn supervise_tracked<W: Write + Send + 'static>(
         tracked_groups_truncated: Some(history_truncated),
         cleanup_trigger: tracker.cleanup_trigger(),
         uncertain_reason,
+        scan_errno: tracker.last_scan_errno(),
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let _ = control.send(Frame::new(TAG_EXIT, payload));
@@ -1580,6 +1581,7 @@ fn supervise<W: Write + Send + 'static>(
         tracked_groups_truncated: None,
         cleanup_trigger: None,
         uncertain_reason: None,
+        scan_errno: None,
     };
     if let Ok(payload) = serde_json::to_vec(&report) {
         let mut w = out.lock().unwrap();

@@ -751,15 +751,15 @@ When the Elixir process survives to report completion, the observer receives
 one terminal event,
 `{reference, {:tracking_exit, evidence}}`. The evidence map contains `scope`,
 `confirmation`, `contained` and `tracked_groups_truncated`.
-It also carries two diagnostics. `cleanup_trigger` is what first started
+It also carries three diagnostics. `cleanup_trigger` is what first started
 cleanup: `:child_exit`, `:kill`, `:timeout`, `:peer_disconnected`,
 `:transport_closed` or `:tracker_uncertain`. `uncertain_reason` is set only for
-an unconfirmed cleanup and names the first cause, such as `:incomplete_scans`,
+an unconfirmed cleanup and names the first cause, such as `:final_scan_incomplete`,
 `:signal_failed`, `:cleanup_deadline` or `:group_limit`. Either is `nil` when
 the shim did not report a recognized value, including on paths with no EXIT
 report. They explain a result and never change it: `confirmation` alone says
-whether cleanup was confirmed. `Forcola.Duplex.Terminal` carries the same two
-fields.
+whether cleanup was confirmed. `scan_errno` is the most recent OS error from a scan that could not read a
+process. `Forcola.Duplex.Terminal` carries the same three fields.
 `:tracker_uncertain` means tracking uncertainty started cleanup before anything
 else did. It does not show that the child was still running or that a signal
 reached it.
@@ -849,8 +849,12 @@ synchronous write described in
 [#111](https://github.com/joshrotenberg/forcola/issues/111) was removed in
 0.9.0.
 
-A single transient metadata or child-inventory read error is retried at the next
-scan. Three consecutive incomplete scans start bounded cleanup. Invalid metadata,
+A metadata or child-inventory read error is retried at the next scan and does
+not stop the command, however long it lasts. A descendant this user cannot
+inspect, such as a setuid program, fails those reads for as long as it runs, and
+what it starts in that time can go unobserved. `scan_errno` in the evidence
+carries the most recent such error. A scan still incomplete when cleanup ends
+leaves it unconfirmed. Invalid metadata,
 unsupported discovery, live inventory capacity exhaustion, reaping failures and
 signal failures also prevent positive confirmation and trigger cleanup where it
 has not already begun. Transport loss still triggers cleanup. History truncation

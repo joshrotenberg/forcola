@@ -56,7 +56,7 @@ defmodule Forcola.Tracking do
   @uncertain_reasons Map.new(
                        ~w(
                          late_descendant scan_invalid root_identity_lost process_limit
-                         scan_attempts_exceeded reap_failed group_limit incomplete_scans
+                         scan_attempts_exceeded reap_failed group_limit
                          final_scan_incomplete identity_read_failed invalid_pid signal_failed
                          cleanup_shortened cleanup_deadline tracked_channel_closed
                          tracked_encode_failed child_wait_failed cgroup_unconfirmed
@@ -428,7 +428,8 @@ defmodule Forcola.Tracking do
       output_truncated: report["output_truncated"] == true,
       cleanup_trigger: known(@cleanup_triggers, report["cleanup_trigger"]),
       uncertain_reason:
-        if(confirmed, do: nil, else: known(@uncertain_reasons, report["uncertain_reason"]))
+        if(confirmed, do: nil, else: known(@uncertain_reasons, report["uncertain_reason"])),
+      scan_errno: errno(report["scan_errno"])
     }
   end
 
@@ -436,6 +437,9 @@ defmodule Forcola.Tracking do
   # to decide confirmation.
   defp known(values, value) when is_binary(value), do: Map.get(values, value)
   defp known(_values, _value), do: nil
+
+  defp errno(value) when is_integer(value) and value > 0, do: value
+  defp errno(_value), do: nil
 
   @doc false
   def contained(value) when is_boolean(value), do: value
@@ -489,7 +493,8 @@ defmodule Forcola.Tracking do
          contained: contained,
          tracked_groups_truncated: tracking.truncated or truncated,
          cleanup_trigger: Map.get(diagnostics, :cleanup_trigger),
-         uncertain_reason: Map.get(diagnostics, :uncertain_reason)
+         uncertain_reason: Map.get(diagnostics, :uncertain_reason),
+         scan_errno: Map.get(diagnostics, :scan_errno)
        }}
     )
 

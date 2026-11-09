@@ -13,9 +13,6 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 pub const MAX_GROUPS: usize = 4096;
 pub const MAX_PROCESSES: usize = 65_536;
 pub const CONFIRM_GRACE: Duration = Duration::from_millis(500);
-// One failed inventory can be a transient procfs/libproc race. Three
-// consecutive incomplete scans mean discovery can no longer be trusted.
-const MAX_INCOMPLETE_SCANS: u8 = 3;
 
 pub fn scope() -> &'static str {
     if cfg!(target_os = "linux") {
@@ -166,6 +163,7 @@ pub struct Tracker<S = Native> {
     cleanup: Option<Cleanup>,
     uncertain_reason: Option<&'static str>,
     incomplete_scans: u8,
+    last_scan_errno: Option<i32>,
     root_group_unresolved: bool,
     group_limit: usize,
     process_limit: usize,
@@ -211,6 +209,7 @@ impl<S: Source> Tracker<S> {
             cleanup: None,
             uncertain_reason: None,
             incomplete_scans: 0,
+            last_scan_errno: None,
             root_group_unresolved: false,
             group_limit: MAX_GROUPS,
             process_limit: MAX_PROCESSES,
@@ -227,6 +226,10 @@ impl<S: Source> Tracker<S> {
     /// The first cause of uncertainty, kept for the EXIT report.
     pub fn uncertain_reason(&self) -> Option<&'static str> {
         self.uncertain_reason
+    }
+    /// The most recent OS error from an incomplete scan during this run.
+    pub fn last_scan_errno(&self) -> Option<i32> {
+        self.last_scan_errno
     }
     /// Why cleanup began, once it has. The first trigger is kept.
     pub fn cleanup_trigger(&self) -> Option<&'static str> {
@@ -289,6 +292,14 @@ impl<S: Source> Tracker<S> {
 
     fn scan_error(&mut self, error: &io::Error, incomplete: &mut bool) {
         *incomplete = true;
+        if let Some(errno) = error.raw_os_error() {
+            self.last_scan_errno = Some(errno);
+        }
+        // A process this user cannot inspect, such as a setuid program, fails
+        // every read for as long as it runs. That leaves a blind spot but says
+        // nothing about the child, so incomplete scans never stop it. Cleanup
+        // still needs a complete scan to confirm.
+        //
         // Invalid metadata/inventory bounds are safety failures, not transient
         // OS reads. Signal and reap errors also remain immediately sticky.
         if matches!(
@@ -357,8 +368,7 @@ impl<S: Source> Tracker<S> {
     }
 
     /// Refresh retained anchors, then traverse every verified child edge.
-    /// Incomplete scans retain anchors and retry. Persistent discovery failure
-    /// stops the child; a single transient read does not start cleanup.
+    /// Incomplete scans retain anchors and retry without stopping the child.
     pub fn scan(&mut self) {
         let mut incomplete = false;
         let mut queue: VecDeque<_> = self
@@ -500,9 +510,6 @@ impl<S: Source> Tracker<S> {
         } else {
             0
         };
-        if self.incomplete_scans >= MAX_INCOMPLETE_SCANS {
-            self.fail("incomplete_scans");
-        }
     }
 
     /// Check identity immediately before signalling. There is no portable
@@ -1128,36 +1135,59 @@ mod tests {
     }
 
     #[test]
-    fn persistent_inventory_metadata_and_signal_errors_remain_unconfirmed_after_recovery() {
-        for failure in 0..3 {
+    fn incomplete_scans_never_stop_a_running_child() {
+        for denied in [true, false] {
             let mut tracker = tracker();
-            match failure {
-                0 => {
-                    tracker.source.denied.insert(10);
-                }
-                1 => tracker.source.fail_children = true,
-                _ => tracker.source.fail_signals = true,
+            if denied {
+                tracker.source.denied.insert(10);
+            } else {
+                tracker.source.fail_children = true;
             }
-            for scan in 1..=MAX_INCOMPLETE_SCANS {
+            for _ in 0..50 {
                 tracker.scan();
-                if failure < 2 {
-                    assert_eq!(tracker.uncertain(), scan == MAX_INCOMPLETE_SCANS);
-                }
             }
-            let now = Instant::now();
-            begin(&mut tracker, now);
-            tracker.advance(now);
-            assert!(tracker.uncertain());
+            assert!(!tracker.uncertain());
+            assert!(!tracker.cleaning());
+            assert_eq!(tracker.incomplete_scans, 50);
+            assert_eq!(
+                tracker.last_scan_errno(),
+                denied.then_some(libc::EPERM),
+                "only OS errors carry a number"
+            );
+
             tracker.source.denied.clear();
             tracker.source.fail_children = false;
+            tracker.scan();
+            assert_eq!(tracker.incomplete_scans, 0);
+            let now = Instant::now();
+            begin(&mut tracker, now);
             tracker.source.records.remove(&10);
             tracker.scan();
             tracker.advance(now + SAMPLE_INTERVAL);
             tracker.scan();
             let result = tracker.advance(now + SAMPLE_INTERVAL * 2);
             assert!(result.done);
-            assert!(!result.confirmed);
+            assert!(result.confirmed);
+            assert_eq!(tracker.uncertain_reason(), None);
         }
+    }
+
+    #[test]
+    fn signal_errors_remain_unconfirmed_after_recovery() {
+        let mut tracker = tracker();
+        tracker.source.fail_signals = true;
+        tracker.scan();
+        let now = Instant::now();
+        begin(&mut tracker, now);
+        tracker.advance(now);
+        assert_eq!(tracker.uncertain_reason(), Some("signal_failed"));
+        tracker.source.records.remove(&10);
+        tracker.scan();
+        tracker.advance(now + SAMPLE_INTERVAL);
+        tracker.scan();
+        let result = tracker.advance(now + SAMPLE_INTERVAL * 2);
+        assert!(result.done);
+        assert!(!result.confirmed);
     }
 
     #[test]
@@ -1224,7 +1254,12 @@ mod tests {
                 (-10, libc::SIGKILL)
             ]
         );
-        assert!(tracker.uncertain());
+        assert!(!tracker.uncertain());
+        tracker.scan();
+        let result = tracker.advance(now + Duration::from_millis(800));
+        assert!(result.done);
+        assert!(!result.confirmed);
+        assert_eq!(tracker.uncertain_reason(), Some("cleanup_deadline"));
     }
 
     #[test]

@@ -157,8 +157,9 @@ defmodule Forcola.Duplex do
     See `Forcola.Result` for the identity shape and Linux/macOS scope meanings.
     `:cleanup_trigger` is what first started tracked cleanup and
     `:uncertain_reason` is the first recorded cause of an unconfirmed tracked
-    cleanup; either is `nil` when not reported. They are diagnostics and do not
-    affect `:confirmation`.
+    cleanup; `:scan_errno` is the most recent OS error from a descendant scan
+    that could not read a process. Each is `nil` when not reported. They are
+    diagnostics and do not affect `:confirmation`.
     A macOS descendant reparented before its first sample is outside the
     sampled guarantee. Unknown tree scope or malformed native EXIT cannot
     produce positive confirmation.
@@ -184,6 +185,7 @@ defmodule Forcola.Duplex do
       tracked_groups_truncated: false,
       cleanup_trigger: nil,
       uncertain_reason: nil,
+      scan_errno: nil,
       contained: :unknown
     ]
 
@@ -204,6 +206,7 @@ defmodule Forcola.Duplex do
             tracked_groups_truncated: boolean(),
             cleanup_trigger: atom() | nil,
             uncertain_reason: atom() | nil,
+            scan_errno: pos_integer() | nil,
             contained: boolean() | :unknown,
             spawn_error: Forcola.SpawnError.t() | String.t() | :invalid_error | nil,
             output:
@@ -1344,7 +1347,8 @@ defmodule Forcola.Duplex do
       tracked_groups: Tracking.groups(tracking),
       tracked_groups_truncated: report.tracked_groups_truncated,
       cleanup_trigger: Map.get(report, :cleanup_trigger),
-      uncertain_reason: Map.get(report, :uncertain_reason)
+      uncertain_reason: Map.get(report, :uncertain_reason),
+      scan_errno: Map.get(report, :scan_errno)
     }
   end
 
