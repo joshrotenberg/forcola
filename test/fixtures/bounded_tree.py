@@ -23,8 +23,9 @@ if child == 0:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN if mode in ("stubborn", "root_exit") else lambda *_: sys.exit(0))
     record("child", os.getpid())
+    # Not signal.pause(): see the wait in interrupt_child.py.
     while True:
-        signal.pause()
+        time.sleep(0.01)
 
 
 def interrupt(*_):
@@ -49,5 +50,6 @@ sys.stdout.flush()
 record("parent", os.getpid())
 if mode == "root_exit":
     sys.exit(0)
+# Not signal.pause(): see the wait in interrupt_child.py.
 while True:
-    signal.pause()
+    time.sleep(0.01)

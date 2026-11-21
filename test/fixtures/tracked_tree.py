@@ -30,8 +30,9 @@ def escape(label):
             os.setpgid(0, 0)
         handlers(label)
         record(label + ".pid", os.getpid())
+        # Not signal.pause(): see the wait in interrupt_child.py.
         while True:
-            signal.pause()
+            time.sleep(0.01)
     return child
 
 

@@ -31,7 +31,8 @@ if mode == "flood":
     print("x" * 1024, flush=True)
 # Not signal.pause(): a signal that lands after the interpreter's last
 # pending-signal check but before the pause() syscall leaves its Python handler
-# unrun until the next signal, which stamps INT at TERM time. A signal that
-# lands before a sleep delays its handler by at most one interval.
+# unrun until the next signal, which stamps INT at TERM time. Here such a
+# handler runs when the current sleep returns: the interval plus scheduling
+# latency.
 while True:
     time.sleep(0.01)
