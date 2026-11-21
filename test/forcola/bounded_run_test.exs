@@ -193,12 +193,14 @@ defmodule Forcola.BoundedRunTest do
                ["/bin/sh", "-c", "while :; do printf abcdefgh; printf ijklmnop >&2; done"],
                timeout_ms: 5_000,
                kill_grace_ms: 100,
-               max_output_bytes: 2_000,
+               # Each notification carries at least one retained byte, so a cap
+               # below 1,024 bounds the observer queue regardless of scheduling.
+               max_output_bytes: 1_000,
                output_observer: {observer, reference}
              )
 
-    assert byte_size(result.stdout) + byte_size(result.stderr) == 2_000
-    assert await_observer_total(observer, reference) == 2_000
+    assert byte_size(result.stdout) + byte_size(result.stderr) == 1_000
+    assert await_observer_total(observer, reference) == 1_000
     assert result.evidence.guard_close == :ok
   end
 
