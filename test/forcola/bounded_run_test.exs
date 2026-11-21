@@ -183,6 +183,10 @@ defmodule Forcola.BoundedRunTest do
 
   test "unterminated flood is bounded before accumulation and observation" do
     reference = make_ref()
+    # The collector runs in this process, so its mailbox also holds unread port
+    # frames. Observing from a separate, draining process keeps the observer
+    # queue check independent of collector lag.
+    observer = start_observer()
 
     assert {:error, {:max_output_bytes, result}} =
              Forcola.run(
@@ -190,11 +194,11 @@ defmodule Forcola.BoundedRunTest do
                timeout_ms: 5_000,
                kill_grace_ms: 100,
                max_output_bytes: 2_000,
-               output_observer: {self(), reference}
+               output_observer: {observer, reference}
              )
 
     assert byte_size(result.stdout) + byte_size(result.stderr) == 2_000
-    assert observer_bytes(reference) == 2_000
+    assert await_observer_total(observer, reference) == 2_000
     assert result.evidence.guard_close == :ok
   end
 
@@ -705,6 +709,32 @@ defmodule Forcola.BoundedRunTest do
 
   defp python!,
     do: System.find_executable("python3") || flunk("python3 fixture interpreter is required")
+
+  defp start_observer do
+    spawn_link(fn -> observer_loop(%{}) end)
+  end
+
+  defp observer_loop(totals) do
+    receive do
+      {:total, from, ref} ->
+        send(from, {:observer_total, ref, Map.get(totals, ref, 0)})
+
+      {ref, {_channel, bytes}} when is_reference(ref) ->
+        observer_loop(Map.update(totals, ref, byte_size(bytes), &(&1 + byte_size(bytes))))
+    end
+  end
+
+  # Signals from one sender arrive in order, so the request is handled after
+  # every notification the collector sent before it.
+  defp await_observer_total(observer, ref) do
+    send(observer, {:total, self(), ref})
+
+    receive do
+      {:observer_total, ^ref, total} -> total
+    after
+      5_000 -> flunk("observer did not report a total")
+    end
+  end
 
   defp observer_bytes(ref, total \\ 0) do
     receive do
