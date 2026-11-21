@@ -1,6 +1,8 @@
 defmodule Forcola.InterruptOptionsTest do
   use ExUnit.Case, async: false
 
+  import Forcola.TestSupport.ProcessProbe, only: [alive?: 1]
+
   alias Forcola.{Daemon, Duplex}
 
   @moduletag :tmp_dir
@@ -491,13 +493,6 @@ defmodule Forcola.InterruptOptionsTest do
 
   defp signal_lines(child),
     do: child.dir |> Path.join("signals") |> File.read!() |> String.split("\n", trim: true)
-
-  defp alive?(pid) do
-    {output, status} = System.cmd("ps", ["-o", "stat=", "-p", pid], stderr_to_stdout: true)
-
-    status == 0 and String.trim(output) != "" and
-      not String.starts_with?(String.trim(output), "Z")
-  end
 
   defp eventually(fun) do
     deadline = System.monotonic_time(:millisecond) + 10_000

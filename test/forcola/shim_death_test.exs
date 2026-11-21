@@ -5,6 +5,10 @@ defmodule Forcola.ShimDeathTest do
 
   @moduletag :tmp_dir
 
+  alias Forcola.TestSupport.ProcessProbe
+
+  import ProcessProbe, only: [alive?: 1]
+
   # SIGKILL of the shim itself is the one death the shim cannot clean up
   # after: it gets no chance to signal the child's process group. These
   # tests pin both the reported shape and the documented limitation that
@@ -24,10 +28,15 @@ defmodule Forcola.ShimDeathTest do
         end)
 
       child = await_pid_file(pid_file)
-      # Safety net for a failed assertion; skipped once the inline cleanup
-      # below has killed the child, so a reused pid is never signalled.
+      # Safety net for a failed assertion. Disarmed once the inline cleanup
+      # below has confirmed the child dead, so a reused pid is never signalled.
+      armed = :atomics.new(1, signed: false)
+      :atomics.put(armed, 1, 1)
+
       on_exit(fn ->
-        if alive?(child), do: System.cmd("kill", ["-KILL", child], stderr_to_stdout: true)
+        if :atomics.get(armed, 1) == 1 and alive?(child) do
+          System.cmd("kill", ["-KILL", child], stderr_to_stdout: true)
+        end
       end)
 
       shim = os_ppid(child)
@@ -45,14 +54,20 @@ defmodule Forcola.ShimDeathTest do
       # reports exactly this. If this assertion ever fails because the
       # child died, the shim grew a cleanup path this test should be
       # updated to match.
-      assert alive?(child), "child was expected to leak after SIGKILL of the shim"
+      # One snapshot, so state and ppid describe the same process instance.
+      assert {:ok, %{state: state, ppid: ppid}} = ProcessProbe.info(child),
+             "child was expected to leak after SIGKILL of the shim"
 
-      assert os_ppid(child) != shim,
+      refute String.starts_with?(state, "Z"),
+             "child was expected to leak after SIGKILL of the shim"
+
+      assert ppid != shim,
              "leaked child was expected to be reparented away from the dead shim"
 
       # The leak is ours to clean up: kill the child by pid.
       System.cmd("kill", ["-KILL", child])
       assert eventually(fn -> not alive?(child) end), "could not clean up the leaked child"
+      :atomics.put(armed, 1, 0)
     end
 
     test "Duplex delivers {:forcola_exit, session, :shim_exited}" do
@@ -111,17 +126,8 @@ defmodule Forcola.ShimDeathTest do
   # PPID identifies this run's shim without a pgrep that could collide
   # with other forcola_shim processes on the machine.
   defp os_ppid(pid) do
-    {out, 0} = System.cmd("ps", ["-o", "ppid=", "-p", pid])
-    String.trim(out)
-  end
-
-  # A zombie counts as dead: under a child-subreaper ancestor a killed
-  # orphan stays a zombie until that subreaper reaps it.
-  defp alive?(pid) do
-    {output, status} = System.cmd("ps", ["-o", "stat=", "-p", pid], stderr_to_stdout: true)
-
-    status == 0 and String.trim(output) != "" and
-      not String.starts_with?(String.trim(output), "Z")
+    {:ok, %{ppid: ppid}} = ProcessProbe.info(pid)
+    ppid
   end
 
   defp eventually(fun, deadline_ms \\ 5_000) do
