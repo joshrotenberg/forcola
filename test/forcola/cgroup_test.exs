@@ -234,11 +234,15 @@ defmodule Forcola.CgroupTest do
     end
   end
 
-  # kill -0: probes existence without signalling. Forcola.run/2 only returns
-  # after the shim confirms the group is dead, so no grace period is needed.
+  # Forcola.run/2 only returns after the shim confirms the group is dead, so
+  # no grace period is needed. A zombie counts as dead: under a
+  # child-subreaper ancestor a killed orphan stays a zombie until that
+  # subreaper reaps it.
   defp alive?(pid) do
-    {_out, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
-    status == 0
+    {output, status} = System.cmd("ps", ["-o", "stat=", "-p", pid], stderr_to_stdout: true)
+
+    status == 0 and String.trim(output) != "" and
+      not String.starts_with?(String.trim(output), "Z")
   end
 
   defp decode(json), do: :json.decode(json)
