@@ -9,6 +9,7 @@ defmodule Forcola.MixProject do
       app: :forcola,
       version: @version,
       elixir: "~> 1.18",
+      elixirc_paths: elixirc_paths(Mix.env()),
       compilers: Mix.compilers() ++ [:forcola_shim],
       start_permanent: Mix.env() == :prod,
       description:
@@ -33,6 +34,9 @@ defmodule Forcola.MixProject do
       extra_applications: [:logger, :inets, :ssl, :public_key, :crypto]
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   defp deps do
     [

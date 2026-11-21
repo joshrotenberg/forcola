@@ -4,7 +4,10 @@ defmodule Forcola.CgroupTest do
 
   @moduletag :tmp_dir
 
+  import Forcola.TestSupport.ProcessProbe, only: [alive?: 1]
+
   alias Forcola.Shim
+  alias Forcola.TestSupport.ProcessProbe
 
   describe "encode_spawn/2 cgroup wiring" do
     test "the default payload is unchanged (no cgroup key)" do
@@ -152,26 +155,74 @@ defmodule Forcola.CgroupTest do
          %{tmp_dir: tmp_dir} do
       if cgroup_contained_available?() do
         pid_file = Path.join(tmp_dir, "escapee_pid")
+        child_file = Path.join(tmp_dir, "child_pid")
 
         # `setsid` puts the sleep in its own session/pgroup, so it escapes the
         # child's process group entirely: kill(-pgid, ...) can never reach it.
-        # Only the cgroup.kill backstop can. Guard hosts without setsid.
+        # Only the cgroup.kill backstop can. The escapee reports its own pid
+        # after setsid has run. Guard hosts without setsid.
         script =
           ~S(command -v setsid >/dev/null || { echo NO_SETSID; exit 3; }; ) <>
-            ~S(setsid sleep 120 & echo "$!" > "$PID_FILE"; sleep 120)
+            ~S(setsid sh -c 'echo $$ > "$PID_FILE"; exec sleep 120' & ) <>
+            ~S(echo $$ > "$CHILD_FILE"; sleep 120)
 
-        assert {:error, {:timeout, %Forcola.Result{}}} =
-                 Forcola.run(["/bin/sh", "-c", script],
-                   timeout_ms: 400,
-                   kill_grace_ms: 200,
-                   cgroup: true,
-                   env: [{"PID_FILE", pid_file}]
-                 )
+        run_timeout_ms = 2_000
+        check_budget_ms = 1_500
+        started = System.monotonic_time(:millisecond)
 
-        escapee = pid_file |> File.read!() |> String.trim()
+        task =
+          Task.async(fn ->
+            Forcola.run(["/bin/sh", "-c", script],
+              timeout_ms: run_timeout_ms,
+              kill_grace_ms: 200,
+              cgroup: true,
+              env: [{"PID_FILE", pid_file}, {"CHILD_FILE", child_file}]
+            )
+          end)
+
+        # Both waits share one deadline that fits inside the check budget.
+        wait_deadline = started + 1_000
+        escapee = await_pid_file(pid_file, "escapee (is setsid available?)", wait_deadline)
+
+        # Safety net for a failed probe or a cgroup.kill regression. Disarmed
+        # once the escapee is confirmed dead, so a reused pid is never signalled.
+        armed = :atomics.new(1, signed: false)
+        :atomics.put(armed, 1, 1)
+
+        on_exit(fn ->
+          if :atomics.get(armed, 1) == 1 and alive?(escapee) do
+            System.cmd("kill", ["-KILL", escapee], stderr_to_stdout: true)
+          end
+        end)
+
+        run_child = await_pid_file(child_file, "run child", wait_deadline)
+
+        assert {:ok, %{state: escapee_state, pgid: escapee_pgid}} = ProcessProbe.info(escapee)
+        assert {:ok, %{state: child_state, pgid: child_pgid}} = ProcessProbe.info(run_child)
+
+        refute String.starts_with?(escapee_state, "Z"), "escapee was not running before cancel"
+        refute String.starts_with?(child_state, "Z"), "run child was not running before cancel"
+
+        assert escapee_pgid != child_pgid,
+               "escapee did not leave the run's process group before cancellation"
+
+        # Makes "checked before cancellation" an asserted fact.
+        elapsed = System.monotonic_time(:millisecond) - started
+
+        if elapsed >= check_budget_ms do
+          flunk("escape check did not complete before the run timeout (#{elapsed} ms)")
+        end
+
+        assert {:error, {:timeout, %Forcola.Result{evidence: evidence}}} =
+                 Task.await(task, 15_000)
+
+        assert %{contained: true} = evidence,
+               "run was not cgroup-contained (silent fallback): #{inspect(evidence)}"
 
         refute alive?(escapee),
                "daemonized escapee survived: cgroup.kill did not reap it (pid #{escapee})"
+
+        :atomics.put(armed, 1, 0)
       else
         if System.get_env("FORCOLA_REQUIRE_CGROUP") == "1" do
           flunk("FORCOLA_REQUIRE_CGROUP=1 but no delegated cgroup v2 subtree is available")
@@ -234,15 +285,27 @@ defmodule Forcola.CgroupTest do
     end
   end
 
-  # Forcola.run/2 only returns after the shim confirms the group is dead, so
-  # no grace period is needed. A zombie counts as dead: under a
-  # child-subreaper ancestor a killed orphan stays a zombie until that
-  # subreaper reaps it.
-  defp alive?(pid) do
-    {output, status} = System.cmd("ps", ["-o", "stat=", "-p", pid], stderr_to_stdout: true)
+  # Polls until the process has written its full pid line.
+  defp await_pid_file(path, what, deadline) do
+    do_await_pid_file(path, what, deadline)
+  end
 
-    status == 0 and String.trim(output) != "" and
-      not String.starts_with?(String.trim(output), "Z")
+  defp do_await_pid_file(path, what, deadline) do
+    case File.read(path) do
+      {:ok, contents} ->
+        if String.ends_with?(contents, "\n"),
+          do: String.trim(contents),
+          else: retry_pid_file(path, what, deadline)
+
+      _ ->
+        retry_pid_file(path, what, deadline)
+    end
+  end
+
+  defp retry_pid_file(path, what, deadline) do
+    if System.monotonic_time(:millisecond) > deadline, do: flunk("#{what} never wrote its pid")
+    Process.sleep(20)
+    do_await_pid_file(path, what, deadline)
   end
 
   defp decode(json), do: :json.decode(json)
