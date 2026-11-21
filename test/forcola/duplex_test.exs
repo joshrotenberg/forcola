@@ -684,14 +684,18 @@ defmodule Forcola.DuplexTest do
       tmp_dir: tmp_dir
     } do
       done_file = Path.join(tmp_dir, "done")
-      script = ~S(yes x | head -c 1048576 >&2; echo done > "$DONE_FILE")
+      # More than any pipe can hold: a writer may grow its pipe up to the
+      # kernel's pipe-max-size (uutils head does, to 1 MiB by default), so a
+      # fixed 1 MiB can fit and the producer would finish unread.
+      bytes = 4 * max(pipe_max_size(), 1_048_576)
+      script = "yes x | head -c #{bytes} >&2; echo done > \"$DONE_FILE\""
 
       {:ok, session} =
         Forcola.Duplex.open(["/bin/sh", "-c", script],
           delivery: :pull,
           max_line_bytes: 64,
           max_pending_bytes: 65,
-          max_output_bytes: 2_000_000,
+          max_output_bytes: 2 * bytes,
           env: [{"DONE_FILE", done_file}],
           kill_grace_ms: 100
         )
@@ -1066,6 +1070,14 @@ defmodule Forcola.DuplexTest do
       true ->
         Process.sleep(50)
         poll(fun, deadline)
+    end
+  end
+
+  # Linux lets an unprivileged process grow a pipe up to this many bytes.
+  defp pipe_max_size do
+    case File.read("/proc/sys/fs/pipe-max-size") do
+      {:ok, text} -> text |> String.trim() |> String.to_integer()
+      _ -> 0
     end
   end
 end
