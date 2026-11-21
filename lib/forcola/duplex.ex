@@ -39,6 +39,50 @@ defmodule Forcola.Duplex do
       `{:spawn_error, reason}` if it never started, or `:shim_exited` if
       the shim died without reporting. The session is over; `close/1` is
       not required (but is harmless).
+    * `{:forcola_exit, session, {:output_limit, terminal}}` - an opt-in
+      output bound was exceeded (see "Bounded message delivery"). A group
+      kill was attempted; `terminal.confirmation` tells whether it was
+      confirmed, and `terminal.output` holds the limit.
+
+  ## Bounded message delivery
+
+  Message delivery is unbounded by default: a child that writes without a
+  newline grows the session's partial-line buffer, and total output is not
+  counted. `:max_line_bytes` and `:max_output_bytes` are opt-in bounds with
+  no default in this mode. A line exceeding `:max_line_bytes`, terminated or
+  not, or cumulative output exceeding `:max_output_bytes`, starts a kill of
+  the child group.
+
+  `:max_line_bytes` counts the bytes of a line before its LF: the LF is
+  excluded and a CR is included, so a pty line ending in CRLF counts its CR.
+  `:max_output_bytes` counts every byte of stdout and stderr together, LF
+  included. Output is checked byte by byte in arrival order. Complete lines
+  that fit within both bounds are delivered; the limit crossed first is the
+  one reported, and a byte that crosses both reports the line limit; the
+  line containing the first excess byte, anything after
+  it, and any buffered partial line of either stream are discarded. For a
+  given byte sequence on one stream the delivered lines and the reported
+  limit do not depend on how the native reads split it. The relative order
+  of stdout and stderr is the order their frames arrive.
+
+  After cleanup the session sends
+  `{:forcola_exit, session, {:output_limit, terminal}}`, where `terminal` is
+  the `Forcola.Duplex.Terminal` also returned by `await_terminal/2` and sent
+  to `:terminal_recipient`: `cause: :output_limit`, `output:
+  {:limit, :line | :total, stream, bytes}`, and the child's status and
+  cleanup confirmation. The message is sent once cleanup is confirmed or its
+  deadline passes. Only `confirmation: :confirmed` means the group is known
+  to be gone; with `:timeout`, `:unconfirmed`, or `:transport_lost` the shim
+  may still be cleaning up. `stream` is `:stdout` or `:stderr`; with
+  `merge_stderr: true` or a pty all output is `:stdout`.
+
+  The line bound covers only the session's two partial-line reassembly
+  buffers, each at most `:max_line_bytes`. It does not bound frames queued
+  in the session's mailbox, which a child producing short lines faster than
+  the session reads can still grow, nor delivered lines in the owner's
+  mailbox. `:max_output_bytes` caps the bytes the session accepts over its
+  lifetime. Messages are not acknowledged; use `delivery: :pull` for
+  backpressure.
 
   ## Bounded pull delivery
 
@@ -292,16 +336,23 @@ defmodule Forcola.Duplex do
       `pty: true`.
     * `:delivery` - `:messages` (default) or opt-in `:pull`. Pull mode sends
       no line messages; call `recv/2` to demand a stdout or stderr line.
-    * `:max_line_bytes`, `:max_output_bytes`, `:max_pending_bytes` - positive
-      bounds for pull mode. Defaults are 64 KiB, 16 MiB, and one line plus
-      its newline per stream. `:max_pending_bytes` must exceed
-      `:max_line_bytes` so a missing newline can be detected without a stall.
+    * `:max_line_bytes`, `:max_output_bytes` - positive bounds on one line
+      and on cumulative output. Under `delivery: :pull` they default to
+      64 KiB and 16 MiB. Under `delivery: :messages` they are opt-in with no
+      default; exceeding one starts a group kill and sends
+      `{:forcola_exit, session, {:output_limit, terminal}}`. There the line
+      bound counts bytes before the LF (CR included) and the total bound
+      counts every byte.
+    * `:max_pending_bytes` - positive pull-mode credit bound, default one
+      line plus its newline per stream. It must exceed `:max_line_bytes` so
+      a missing newline can be detected without a stall. Rejected under
+      `delivery: :messages`.
 
   There is no `:timeout_ms`; the session is bounded by its owner process
   and `close/1`. Passing `:timeout_ms` raises `ArgumentError`.
   The one-shot option `:idle_timeout_ms` also raises `ArgumentError`
-  before a session or shim is started. The existing `:max_output_bytes`
-  option remains supported only with `delivery: :pull`.
+  before a session or shim is started. `:max_output_bytes` is supported in
+  both delivery modes.
 
   A spawn failure (e.g. a missing binary) is asynchronous: `open/2`
   still returns `{:ok, session}` and the failure arrives as
@@ -578,9 +629,7 @@ defmodule Forcola.Duplex do
 
     kill_grace_ms = Keyword.get(opts, :kill_grace_ms, @default_kill_grace_ms)
     delivery = Keyword.get(opts, :delivery, :messages)
-    max_line_bytes = Keyword.get(opts, :max_line_bytes, @default_max_line_bytes)
-    max_output_bytes = Keyword.get(opts, :max_output_bytes, @default_max_output_bytes)
-    max_pending_bytes = Keyword.get(opts, :max_pending_bytes, max_line_bytes + 1)
+    {max_line_bytes, max_output_bytes, max_pending_bytes} = output_bounds(opts, delivery)
 
     case Shim.open_with_features(opts) do
       {:ok, port} ->
@@ -637,6 +686,18 @@ defmodule Forcola.Duplex do
         Tracking.startup_failed(opts)
         {:stop, reason}
     end
+  end
+
+  # Message delivery has no default bounds; pull delivery always has them.
+  defp output_bounds(opts, :messages) do
+    {Keyword.get(opts, :max_line_bytes), Keyword.get(opts, :max_output_bytes), nil}
+  end
+
+  defp output_bounds(opts, :pull) do
+    max_line_bytes = Keyword.get(opts, :max_line_bytes, @default_max_line_bytes)
+    max_output_bytes = Keyword.get(opts, :max_output_bytes, @default_max_output_bytes)
+    max_pending_bytes = Keyword.get(opts, :max_pending_bytes, max_line_bytes + 1)
+    {max_line_bytes, max_output_bytes, max_pending_bytes}
   end
 
   @impl true
@@ -778,6 +839,11 @@ defmodule Forcola.Duplex do
     terminal = settle(state) |> finish_output_evidence(state)
     publish_terminal(state.session.terminal_table, terminal)
 
+    # Sent after cleanup so the message carries the settled evidence.
+    if state.delivery == :messages and not is_nil(state.output_limit) do
+      notify_exit(state, {:output_limit, terminal})
+    end
+
     if is_pid(state.terminal_recipient) do
       send(state.terminal_recipient, {:forcola_terminal, state.session, terminal})
     end
@@ -850,7 +916,13 @@ defmodule Forcola.Duplex do
       end
     else
       validate_pull_only_opts!(opts)
+      validate_message_bound!(opts, :max_line_bytes)
+      validate_message_bound!(opts, :max_output_bytes)
     end
+  end
+
+  defp validate_message_bound!(opts, key) do
+    if Keyword.has_key?(opts, key), do: positive_option!(opts, key, nil)
   end
 
   defp validate_internal_credit_opts!(opts) do
@@ -863,11 +935,8 @@ defmodule Forcola.Duplex do
   end
 
   defp validate_pull_only_opts!(opts) do
-    if Enum.any?(
-         [:max_line_bytes, :max_output_bytes, :max_pending_bytes],
-         &Keyword.has_key?(opts, &1)
-       ) do
-      raise ArgumentError, "output bounds require delivery: :pull"
+    if Keyword.has_key?(opts, :max_pending_bytes) do
+      raise ArgumentError, ":max_pending_bytes requires delivery: :pull"
     end
   end
 
@@ -1008,10 +1077,71 @@ defmodule Forcola.Duplex do
     end
   end
 
-  defp emit(state, stream, chunk) do
+  defp emit(%{max_line_bytes: nil, max_output_bytes: nil} = state, stream, chunk) do
     {lines, rest} = split_lines(state.buffers[stream] <> chunk)
     Enum.each(lines, &deliver(state, stream, &1))
     %{state | buffers: Map.put(state.buffers, stream, rest)}
+  end
+
+  defp emit(state, stream, chunk) do
+    emit_bounded(state, stream, state.buffers[stream], chunk)
+  end
+
+  # Consumes a frame one line segment at a time, in stream order, so the
+  # delivered lines and the reported limit depend only on the bytes and the
+  # held state, never on where the native reads split them. The line bound
+  # counts the bytes before LF (a CR is counted, the LF is not); the total
+  # bound counts every byte of both streams, LF included.
+  defp emit_bounded(state, stream, held, chunk) do
+    {segment, rest} =
+      case :binary.split(chunk, "\n") do
+        [segment, rest] -> {segment, rest}
+        [segment] -> {segment, nil}
+      end
+
+    line_bytes = byte_size(segment)
+    consumed = if is_nil(rest), do: line_bytes, else: line_bytes + 1
+
+    case first_limit(state, stream, byte_size(held), line_bytes, consumed) do
+      nil ->
+        state = %{state | total_output_bytes: state.total_output_bytes + consumed}
+        line = held <> segment
+
+        if is_nil(rest) do
+          %{state | buffers: Map.put(state.buffers, stream, line)}
+        else
+          deliver(state, stream, line)
+          emit_bounded(state, stream, "", rest)
+        end
+
+      limit ->
+        message_output_limit(state, limit)
+    end
+  end
+
+  # The limit whose first excess byte comes earliest in the segment. A byte
+  # that exceeds both bounds at once reports the line limit.
+  defp first_limit(state, stream, held_bytes, line_bytes, consumed) do
+    line_at = excess_offset(state.max_line_bytes, held_bytes, line_bytes)
+    total_at = excess_offset(state.max_output_bytes, state.total_output_bytes, consumed)
+
+    cond do
+      is_nil(line_at) and is_nil(total_at) -> nil
+      is_nil(total_at) -> {:limit, :line, stream, state.max_line_bytes}
+      is_nil(line_at) -> {:limit, :total, stream, state.max_output_bytes}
+      line_at <= total_at -> {:limit, :line, stream, state.max_line_bytes}
+      true -> {:limit, :total, stream, state.max_output_bytes}
+    end
+  end
+
+  # 1-based offset, within the bytes being added, of the first byte past `max`.
+  defp excess_offset(nil, _held, _added), do: nil
+  defp excess_offset(max, held, added) when held + added > max, do: max - held + 1
+  defp excess_offset(_max, _held, _added), do: nil
+
+  # Drop the partial lines so teardown does not deliver the offending data.
+  defp message_output_limit(state, limit) do
+    mark_output_limit(%{state | buffers: %{stdout: "", stderr: ""}}, limit)
   end
 
   defp emit_pull_within_total(state, stream, chunk, total) do

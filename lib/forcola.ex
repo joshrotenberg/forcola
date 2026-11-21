@@ -203,7 +203,7 @@ defmodule Forcola do
   interrupt pair with the same validation and negotiation. Explicit shared
   options enable the strict environment list/name checks in those modes.
   Stream and Daemon reject `:max_output_bytes`;
-  Duplex retains its existing support with `delivery: :pull`. Duplex and
+  Duplex supports it in both delivery modes. Duplex and
   Daemon reject `:idle_timeout_ms`; Stream retains its existing idle-timeout
   support. These existing mode options keep their own validation and semantics.
 

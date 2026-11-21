@@ -62,8 +62,12 @@ defmodule Forcola.BoundedRunTest do
       assert_raise ArgumentError, ~r/use Forcola.run\/2/, call
     end
 
-    assert_raise ArgumentError, ~r/output bounds require delivery: :pull/, fn ->
-      Forcola.Duplex.open(argv, max_output_bytes: 100, shim_path: shim)
+    assert_raise ArgumentError, ~r/:max_pending_bytes requires delivery: :pull/, fn ->
+      Forcola.Duplex.open(argv, max_pending_bytes: 100, shim_path: shim)
+    end
+
+    assert_raise ArgumentError, ~r/:max_output_bytes must be a positive integer/, fn ->
+      Forcola.Duplex.open(argv, max_output_bytes: 0, shim_path: shim)
     end
 
     assert_raise ArgumentError, ~r/:max_output_bytes must be a positive integer/, fn ->
