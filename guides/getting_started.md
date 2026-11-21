@@ -415,9 +415,13 @@ Options:
   useful when another process supervises the attempt.
 - `:delivery`: `:messages` (default) or `:pull`. Pull mode sends no line
   messages and requires `recv/2` calls to grant output credit.
-- `:max_line_bytes`, `:max_output_bytes`, `:max_pending_bytes`: positive
-  bounds for pull mode, defaulting to 64 KiB, 16 MiB, and one line plus its
-  newline per stream. The pending bound must exceed the line bound.
+- `:max_line_bytes`, `:max_output_bytes`: positive bounds on one line and on
+  cumulative output. Pull mode defaults them to 64 KiB and 16 MiB. Message
+  mode has no default; when given, exceeding one kills the child group and
+  sends `{:forcola_exit, session, {:output_limit, terminal}}` with
+  `terminal.output` set to `{:limit, :line | :total, stream, bytes}`.
+- `:max_pending_bytes`: pull-mode credit bound, defaulting to one line plus
+  its newline per stream. It must exceed the line bound.
 - `:pty`: run the child under a pseudo-terminal (default `false`), for CLIs
   that behave differently when they detect a tty. See
   [pseudo-terminal](#pseudo-terminal) below.
@@ -954,7 +958,7 @@ without negotiation. Stream also counts environment and interrupt negotiation
 toward its execution timeout. Duplex and Daemon use a five-second handshake
 bound and keep their existing error shapes. All capability requirements compose
 with spawn identity and structured spawn errors. Stream and Daemon reject
-`max_output_bytes`; Duplex retains its existing support with `delivery: :pull`.
+`max_output_bytes`; Duplex supports it in both delivery modes.
 Duplex and Daemon reject `idle_timeout_ms`; Stream retains its existing idle
 option. These existing mode options keep their own validation and semantics.
 Spawn errors after SPAWN with new options carry partial output in

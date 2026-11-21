@@ -282,7 +282,7 @@ before SPAWN; incompatible shims cannot silently execute with ignored options.
 Duplex, Stream and Daemon accept the same `env_mode` and interrupt pair,
 with the same `bounded_run_v1` requirement and validation. Stream and Daemon
 reject `max_output_bytes`; Duplex
-keeps its existing support with `delivery: :pull`. Duplex and Daemon reject
+supports it in both delivery modes. Duplex and Daemon reject
 `idle_timeout_ms`; Stream keeps its existing idle-timeout support. These
 existing mode options keep their own validation and semantics.
 With strict Run options or explicit environment/interrupt options, `env:` must

@@ -725,6 +725,140 @@ defmodule Forcola.DuplexTest do
     end
   end
 
+  describe "bounded message delivery" do
+    test "invalid message bounds are rejected" do
+      for {key, value} <- [max_line_bytes: 0, max_line_bytes: nil, max_output_bytes: -1] do
+        assert_raise ArgumentError, ~r/#{key} must be a positive integer/, fn ->
+          Forcola.Duplex.open(["/bin/cat"], [{key, value}])
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:max_pending_bytes requires delivery: :pull/, fn ->
+        Forcola.Duplex.open(["/bin/cat"], max_line_bytes: 8, max_pending_bytes: 9)
+      end
+    end
+
+    test "no line limit applies by default" do
+      # Larger than the 64 KiB pull-mode default.
+      script = "head -c 200000 /dev/zero | tr '\\0' x; echo; echo done"
+      {:ok, session} = Forcola.Duplex.open(["/bin/sh", "-c", script], [])
+
+      assert_receive {:forcola_line, ^session, line}, 5_000
+      assert byte_size(line) == 200_000
+      assert_receive {:forcola_line, ^session, "done"}, 5_000
+      assert_receive {:forcola_exit, ^session, 0}, 5_000
+
+      assert {:ok, %Forcola.Duplex.Terminal{cause: :child_exit, output: :complete}} =
+               Forcola.Duplex.await_terminal(session, 5_000)
+
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "an unterminated stdout line over the limit kills the child" do
+      script = "echo $$; echo ok; printf xxxxxxxxxxxxxxxxx; sleep 60"
+
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", script], max_line_bytes: 16, kill_grace_ms: 100)
+
+      assert_receive {:forcola_line, ^session, pid}, 5_000
+      assert_receive {:forcola_line, ^session, "ok"}, 5_000
+      assert_receive {:forcola_exit, ^session, {:output_limit, terminal}}, 5_000
+
+      assert %Forcola.Duplex.Terminal{cause: :output_limit, confirmation: :confirmed} = terminal
+      assert terminal.output == {:limit, :line, :stdout, 16}
+      assert terminal.status != nil
+      assert {:ok, ^terminal} = Forcola.Duplex.await_terminal(session, 5_000)
+      refute alive?(pid)
+      # The offending partial line is not delivered, and no second exit arrives.
+      refute_receive {:forcola_line, ^session, _}, 50
+      refute_receive {:forcola_exit, ^session, _}, 50
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a terminated stdout line over the limit kills the child" do
+      script = "echo ok; echo xxxxxxxxx; echo after; sleep 60"
+
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", script], max_line_bytes: 8, kill_grace_ms: 100)
+
+      assert_receive {:forcola_exit, ^session, {:output_limit, terminal}}, 5_000
+      assert terminal.output == {:limit, :line, :stdout, 8}
+      assert_received {:forcola_line, ^session, "ok"}
+      refute_received {:forcola_line, ^session, "xxxxxxxxx"}
+      refute_received {:forcola_line, ^session, "after"}
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a stderr line over the limit kills the child" do
+      script = "printf xxxxxxxxx >&2; sleep 60"
+
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", script], max_line_bytes: 8, kill_grace_ms: 100)
+
+      assert_receive {:forcola_exit, ^session, {:output_limit, terminal}}, 5_000
+      assert terminal.cause == :output_limit
+      assert terminal.output == {:limit, :line, :stderr, 8}
+      refute_received {:forcola_stderr, ^session, _}
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "merged stderr over the limit is reported as stdout" do
+      script = "printf xxxxxxxxx >&2; sleep 60"
+      opts = [max_line_bytes: 8, merge_stderr: true, kill_grace_ms: 100]
+      {:ok, session} = Forcola.Duplex.open(["/bin/sh", "-c", script], opts)
+
+      assert_receive {:forcola_exit, ^session, {:output_limit, terminal}}, 5_000
+      assert terminal.output == {:limit, :line, :stdout, 8}
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "lines at or under the limit are unaffected" do
+      script = "echo 12345678; echo err >&2; printf tail"
+      {:ok, session} = Forcola.Duplex.open(["/bin/sh", "-c", script], max_line_bytes: 8)
+
+      assert_receive {:forcola_exit, ^session, 0}, 5_000
+      assert_received {:forcola_line, ^session, "12345678"}
+      assert_received {:forcola_line, ^session, "tail"}
+      assert_received {:forcola_stderr, ^session, "err"}
+
+      assert {:ok, terminal} = Forcola.Duplex.await_terminal(session, 5_000)
+      assert %Forcola.Duplex.Terminal{status: 0, cause: :child_exit} = terminal
+      assert terminal.output == :complete
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a line bound alone leaves total output unbounded" do
+      script = "i=0; while [ $i -lt 2000 ]; do echo 1234567; i=$((i+1)); done"
+      {:ok, session} = Forcola.Duplex.open(["/bin/sh", "-c", script], max_line_bytes: 8)
+
+      assert_receive {:forcola_exit, ^session, 0}, 10_000
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "total output over an opt-in bound kills the child" do
+      script = "while :; do echo err >&2; done"
+
+      {:ok, session} =
+        Forcola.Duplex.open(["/bin/sh", "-c", script], max_output_bytes: 20, kill_grace_ms: 100)
+
+      assert_receive {:forcola_exit, ^session, {:output_limit, terminal}}, 5_000
+      assert terminal.cause == :output_limit
+      assert terminal.output == {:limit, :total, :stderr, 20}
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "the terminal recipient receives the limit evidence" do
+      script = "printf xxxxxxxxx; sleep 60"
+      opts = [max_line_bytes: 8, terminal_recipient: self(), kill_grace_ms: 100]
+      {:ok, session} = Forcola.Duplex.open(["/bin/sh", "-c", script], opts)
+
+      assert_receive {:forcola_terminal, ^session, terminal}, 5_000
+      assert terminal.output == {:limit, :line, :stdout, 8}
+      assert_receive {:forcola_exit, ^session, {:output_limit, ^terminal}}, 5_000
+      Forcola.Duplex.forget_terminal(session)
+    end
+  end
+
   describe "malformed EXIT" do
     @tag :tmp_dir
     test "ends the session unconfirmed from the frame, without a cleanup stall", %{

@@ -117,7 +117,7 @@ require `env_unset_v1`; unsupported shims fail before SPAWN. These requirements
 compose with identity and structured spawn errors. Stream counts negotiation
 toward its timeout; Duplex and Daemon use a five-second handshake bound.
 Each mode keeps its own output and error shapes. Stream and Daemon reject
-`max_output_bytes`; Duplex supports it with `delivery: :pull`. Duplex and
+`max_output_bytes`; Duplex supports it in both delivery modes. Duplex and
 Daemon reject `idle_timeout_ms`; Stream keeps its existing idle option.
 Bounded failures return `{:error, {reason, partial_result}}`, with reason
 `:timeout`, `:idle_timeout`, `:max_output_bytes`, or `:observer_overflow`.
