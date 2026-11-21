@@ -13,7 +13,7 @@ defmodule Forcola.ShimDeathTest do
   describe "the shim SIGKILLed mid-run" do
     test "run/2 reports {:shim_exited, partial} and the child leaks", %{tmp_dir: tmp_dir} do
       pid_file = Path.join(tmp_dir, "pid")
-      script = ~S(echo $$ > "$PID_FILE"; sleep 60)
+      script = ~S(echo $$ > "$PID_FILE"; exec sleep 60)
 
       task =
         Task.async(fn ->
@@ -24,7 +24,11 @@ defmodule Forcola.ShimDeathTest do
         end)
 
       child = await_pid_file(pid_file)
-      on_exit(fn -> System.cmd("kill", ["-KILL", child], stderr_to_stdout: true) end)
+      # Safety net for a failed assertion; skipped once the inline cleanup
+      # below has killed the child, so a reused pid is never signalled.
+      on_exit(fn ->
+        if alive?(child), do: System.cmd("kill", ["-KILL", child], stderr_to_stdout: true)
+      end)
 
       shim = os_ppid(child)
       {_, 0} = System.cmd("kill", ["-KILL", shim])
