@@ -24,6 +24,8 @@ defmodule Forcola.ShimDeathTest do
         end)
 
       child = await_pid_file(pid_file)
+      on_exit(fn -> System.cmd("kill", ["-KILL", child], stderr_to_stdout: true) end)
+
       shim = os_ppid(child)
       {_, 0} = System.cmd("kill", ["-KILL", shim])
 
@@ -34,11 +36,15 @@ defmodule Forcola.ShimDeathTest do
 
       # Documented limitation, pinned deliberately: SIGKILL gives the
       # shim no chance to kill the group, so the child survives,
-      # reparented to pid 1. The :unconfirmed status reports exactly
-      # this. If this assertion ever fails because the child died, the
-      # shim grew a cleanup path this test should be updated to match.
+      # reparented away from the dead shim (to pid 1, or to the nearest
+      # child-subreaper ancestor when one exists). The :unconfirmed status
+      # reports exactly this. If this assertion ever fails because the
+      # child died, the shim grew a cleanup path this test should be
+      # updated to match.
       assert alive?(child), "child was expected to leak after SIGKILL of the shim"
-      assert os_ppid(child) == "1", "leaked child was expected to be reparented to pid 1"
+
+      assert os_ppid(child) != shim,
+             "leaked child was expected to be reparented away from the dead shim"
 
       # The leak is ours to clean up: kill the child by pid.
       System.cmd("kill", ["-KILL", child])
@@ -105,10 +111,13 @@ defmodule Forcola.ShimDeathTest do
     String.trim(out)
   end
 
-  # kill -0: probes existence without signalling.
+  # A zombie counts as dead: under a child-subreaper ancestor a killed
+  # orphan stays a zombie until that subreaper reaps it.
   defp alive?(pid) do
-    {_out, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
-    status == 0
+    {output, status} = System.cmd("ps", ["-o", "stat=", "-p", pid], stderr_to_stdout: true)
+
+    status == 0 and String.trim(output) != "" and
+      not String.starts_with?(String.trim(output), "Z")
   end
 
   defp eventually(fun, deadline_ms \\ 5_000) do
