@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/joshrotenberg/forcola/compare/v0.12.1...v0.13.0) (2026-11-21)
+
+
+### Features
+
+* **duplex:** honour max_line_bytes under message delivery ([#147](https://github.com/joshrotenberg/forcola/issues/147)) ([c55b3e2](https://github.com/joshrotenberg/forcola/commit/c55b3e2361cd64022f04aa93ecdf9e1cd645ee89))
+
 ## [0.12.1](https://github.com/joshrotenberg/forcola/compare/v0.12.0...v0.12.1) (2026-11-09)
 
 
