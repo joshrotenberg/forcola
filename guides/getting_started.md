@@ -417,9 +417,12 @@ Options:
   messages and requires `recv/2` calls to grant output credit.
 - `:max_line_bytes`, `:max_output_bytes`: positive bounds on one line and on
   cumulative output. Pull mode defaults them to 64 KiB and 16 MiB. Message
-  mode has no default; when given, exceeding one kills the child group and
+  mode has no default; when given, exceeding one starts a group kill and
   sends `{:forcola_exit, session, {:output_limit, terminal}}` with
-  `terminal.output` set to `{:limit, :line | :total, stream, bytes}`.
+  `terminal.output` set to `{:limit, :line | :total, stream, bytes}` and
+  `terminal.confirmation` reporting whether the kill was confirmed. The line
+  bound counts bytes before the LF (CR included); the total bound counts
+  every byte.
 - `:max_pending_bytes`: pull-mode credit bound, defaulting to one line plus
   its newline per stream. It must exceed the line bound.
 - `:pty`: run the child under a pseudo-terminal (default `false`), for CLIs

@@ -857,6 +857,122 @@ defmodule Forcola.DuplexTest do
       assert_receive {:forcola_exit, ^session, {:output_limit, ^terminal}}, 5_000
       Forcola.Duplex.forget_terminal(session)
     end
+
+    test "an over-limit frame before a natural exit sends one exit", %{tmp_dir: tmp_dir} do
+      steps = [["out", "xxxxxxxxx"], ["exit", 0]]
+      opts = [max_line_bytes: 8, terminal_recipient: self()]
+      session = open_scripted(tmp_dir, steps, opts)
+
+      assert_receive {:forcola_exit, ^session, {:output_limit, terminal}}, 5_000
+      assert %Forcola.Duplex.Terminal{status: 0, cause: :output_limit} = terminal
+      assert terminal.confirmation == :confirmed
+      assert terminal.output == {:limit, :line, :stdout, 8}
+      assert_receive {:forcola_terminal, ^session, ^terminal}, 5_000
+      assert {:ok, ^terminal} = Forcola.Duplex.await_terminal(session, 5_000)
+      refute_receive {:forcola_exit, ^session, _}, 100
+      refute_received {:forcola_line, ^session, _}
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a line split across frames may reach the limit exactly", %{tmp_dir: tmp_dir} do
+      steps = [["out", "1234"], ["out", "5678\n"], ["out", "8bytes.."], ["exit", 0]]
+      session = open_scripted(tmp_dir, steps, max_line_bytes: 8)
+
+      assert_receive {:forcola_exit, ^session, 0}, 5_000
+      assert drain_lines(session) == [stdout: "12345678", stdout: "8bytes.."]
+      assert {:ok, terminal} = Forcola.Duplex.await_terminal(session, 5_000)
+      assert terminal.output == :complete
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a line split across frames trips the limit one byte over", %{tmp_dir: tmp_dir} do
+      for last <- ["56789", "56789\n"] do
+        steps = [["out", "ok\n1234"], ["out", last]]
+        session = open_scripted(tmp_dir, steps, max_line_bytes: 8)
+
+        assert limit_outcome(session) == {[stdout: "ok"], {:limit, :line, :stdout, 8}}
+        Forcola.Duplex.forget_terminal(session)
+      end
+    end
+
+    test "the line bound excludes LF; the total bound includes it", %{tmp_dir: tmp_dir} do
+      steps = [["out", "1234\n"], ["exit", 0]]
+      session = open_scripted(tmp_dir, steps, max_line_bytes: 4, max_output_bytes: 5)
+      assert_receive {:forcola_exit, ^session, 0}, 5_000
+      assert drain_lines(session) == [stdout: "1234"]
+      Forcola.Duplex.forget_terminal(session)
+
+      session = open_scripted(tmp_dir, [["out", "1234\n"]], max_output_bytes: 4)
+      assert limit_outcome(session) == {[], {:limit, :total, :stdout, 4}}
+      Forcola.Duplex.forget_terminal(session)
+
+      session = open_scripted(tmp_dir, [["out", "123\r\n"]], max_line_bytes: 3)
+      assert limit_outcome(session) == {[], {:limit, :line, :stdout, 3}}
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "combined stdout and stderr may reach the total cap exactly", %{tmp_dir: tmp_dir} do
+      steps = [["out", "ab\n"], ["err", "cd\n"], ["exit", 0]]
+      session = open_scripted(tmp_dir, steps, max_output_bytes: 6)
+
+      assert_receive {:forcola_exit, ^session, 0}, 5_000
+      assert drain_lines(session) == [stdout: "ab", stderr: "cd"]
+      assert {:ok, terminal} = Forcola.Duplex.await_terminal(session, 5_000)
+      assert terminal.output == :complete
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "combined stdout and stderr trip the total cap one byte over", %{tmp_dir: tmp_dir} do
+      steps = [["out", "ab\n"], ["err", "cd\n"], ["err", "x"]]
+      session = open_scripted(tmp_dir, steps, max_output_bytes: 6)
+
+      expected = {[stdout: "ab", stderr: "cd"], {:limit, :total, :stderr, 6}}
+      assert limit_outcome(session) == expected
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "the outcome does not depend on frame boundaries", %{tmp_dir: tmp_dir} do
+      line = {:limit, :line, :stdout, 2}
+      total = {:limit, :total, :stdout, 5}
+
+      cases = [
+        # A complete line that fits is delivered before a total overflow.
+        {[max_output_bytes: 5], "ok\nbad\n", {[stdout: "ok"], total}},
+        # The line bound is crossed first, whatever the total would say later.
+        {[max_line_bytes: 2, max_output_bytes: 5], "abc\nx\n", {[], line}},
+        # The total bound is crossed first, inside a line that would be too long.
+        {[max_line_bytes: 4, max_output_bytes: 5], "ab\ncdefgh\n", {[stdout: "ab"], total}}
+      ]
+
+      for {bounds, bytes, expected} <- cases, chunks <- chunkings(bytes) do
+        steps = Enum.map(chunks, &["out", &1])
+        session = open_scripted(tmp_dir, steps, bounds)
+
+        assert limit_outcome(session) == expected, "chunks: #{inspect(chunks)}"
+        Forcola.Duplex.forget_terminal(session)
+      end
+    end
+
+    test "a pty line over the limit is reported as stdout" do
+      script = ~S(stty -echo -onlcr; printf xxxxxxxxx; sleep 60)
+      opts = [pty: true, max_line_bytes: 8, kill_grace_ms: 100]
+      {:ok, session} = Forcola.Duplex.open(["/bin/sh", "-c", script], opts)
+
+      assert_receive {:forcola_exit, ^session, {:output_limit, terminal}}, 10_000
+      assert terminal.output == {:limit, :line, :stdout, 8}
+      Forcola.Duplex.forget_terminal(session)
+    end
+
+    test "a pty line counts its CR toward the line bound" do
+      # ONLCR turns each LF into CRLF: 7 bytes plus CR fit in 8, 8 plus CR do not.
+      script = ~S(stty -echo; echo 1234567; echo 12345678; sleep 60)
+      opts = [pty: true, max_line_bytes: 8, kill_grace_ms: 100]
+      {:ok, session} = Forcola.Duplex.open(["/bin/sh", "-c", script], opts)
+
+      expected = {[stdout: "1234567\r"], {:limit, :line, :stdout, 8}}
+      assert limit_outcome(session, 10_000) == expected
+      Forcola.Duplex.forget_terminal(session)
+    end
   end
 
   describe "malformed EXIT" do
@@ -895,6 +1011,37 @@ defmodule Forcola.DuplexTest do
     File.cp!(source, destination)
     File.chmod!(destination, 0o755)
     destination
+  end
+
+  # Runs the fixture's "script" mode: each output step arrives as one frame.
+  defp open_scripted(tmp_dir, steps, opts) do
+    argv = ["script", IO.iodata_to_binary(:json.encode(steps))]
+    opts = [shim_path: terminal_fixture(tmp_dir), kill_grace_ms: 100] ++ opts
+    {:ok, session} = Forcola.Duplex.open(argv, opts)
+    session
+  end
+
+  # Lines delivered before a limit exit, in order, and the reported limit.
+  defp limit_outcome(session, timeout \\ 5_000) do
+    assert_receive {:forcola_exit, ^session, {:output_limit, terminal}}, timeout
+    assert terminal.cause == :output_limit
+    {drain_lines(session), terminal.output}
+  end
+
+  defp drain_lines(session) do
+    receive do
+      {:forcola_line, ^session, line} -> [{:stdout, line} | drain_lines(session)]
+      {:forcola_stderr, ^session, line} -> [{:stderr, line} | drain_lines(session)]
+    after
+      0 -> []
+    end
+  end
+
+  # One frame, one frame per byte, and every two-frame split.
+  defp chunkings(bytes) do
+    singles = for <<byte <- bytes>>, do: <<byte>>
+    splits = for at <- 1..(byte_size(bytes) - 1), do: Tuple.to_list(String.split_at(bytes, at))
+    [[bytes], singles | splits]
   end
 
   # kill -0: probes existence without signalling.
