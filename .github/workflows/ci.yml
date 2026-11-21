@@ -60,14 +60,6 @@ jobs:
       - name: Credo
         run: mix credo --strict
 
-      - name: Probe runner (temporary, #149)
-        run: |
-          uname -a
-          cat /proc/sys/fs/pipe-max-size /proc/sys/fs/pipe-user-pages-soft || true
-          python3 -c "import fcntl,os; r,w=os.pipe(); print('default pipe size', fcntl.fcntl(w,1032))"
-          ls -l /bin/sh; (yes x | head -c 1048576 | wc -c) || true
-          MIX_ENV=test mix run scripts/probe_149.exs || true
-
       - name: Run tests
         run: mix test
 
