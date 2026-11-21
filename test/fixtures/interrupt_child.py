@@ -29,5 +29,9 @@ record("pid", os.getpid())
 print("ready", flush=True)
 if mode == "flood":
     print("x" * 1024, flush=True)
+# Not signal.pause(): a signal that lands after the interpreter's last
+# pending-signal check but before the pause() syscall leaves its Python handler
+# unrun until the next signal, which stamps INT at TERM time. A signal that
+# lands before a sleep delays its handler by at most one interval.
 while True:
-    signal.pause()
+    time.sleep(0.01)
