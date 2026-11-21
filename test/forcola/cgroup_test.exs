@@ -166,20 +166,36 @@ defmodule Forcola.CgroupTest do
             ~S(setsid sh -c 'echo $$ > "$PID_FILE"; exec sleep 120' & ) <>
             ~S(echo $$ > "$CHILD_FILE"; sleep 120)
 
-        # The timeout is long enough that the escape check below always
-        # happens before the run is cancelled.
+        run_timeout_ms = 2_000
+        check_budget_ms = 1_500
+        started = System.monotonic_time(:millisecond)
+
         task =
           Task.async(fn ->
             Forcola.run(["/bin/sh", "-c", script],
-              timeout_ms: 8_000,
+              timeout_ms: run_timeout_ms,
               kill_grace_ms: 200,
               cgroup: true,
               env: [{"PID_FILE", pid_file}, {"CHILD_FILE", child_file}]
             )
           end)
 
-        escapee = await_pid_file(pid_file, "escapee (is setsid available?)")
-        run_child = await_pid_file(child_file, "run child")
+        # Both waits share one deadline that fits inside the check budget.
+        wait_deadline = started + 1_000
+        escapee = await_pid_file(pid_file, "escapee (is setsid available?)", wait_deadline)
+
+        # Safety net for a failed probe or a cgroup.kill regression. Disarmed
+        # once the escapee is confirmed dead, so a reused pid is never signalled.
+        armed = :atomics.new(1, signed: false)
+        :atomics.put(armed, 1, 1)
+
+        on_exit(fn ->
+          if :atomics.get(armed, 1) == 1 and alive?(escapee) do
+            System.cmd("kill", ["-KILL", escapee], stderr_to_stdout: true)
+          end
+        end)
+
+        run_child = await_pid_file(child_file, "run child", wait_deadline)
 
         assert {:ok, %{state: escapee_state, pgid: escapee_pgid}} = ProcessProbe.info(escapee)
         assert {:ok, %{state: child_state, pgid: child_pgid}} = ProcessProbe.info(run_child)
@@ -190,10 +206,23 @@ defmodule Forcola.CgroupTest do
         assert escapee_pgid != child_pgid,
                "escapee did not leave the run's process group before cancellation"
 
-        assert {:error, {:timeout, %Forcola.Result{}}} = Task.await(task, 15_000)
+        # Makes "checked before cancellation" an asserted fact.
+        elapsed = System.monotonic_time(:millisecond) - started
+
+        if elapsed >= check_budget_ms do
+          flunk("escape check did not complete before the run timeout (#{elapsed} ms)")
+        end
+
+        assert {:error, {:timeout, %Forcola.Result{evidence: evidence}}} =
+                 Task.await(task, 15_000)
+
+        assert %{contained: true} = evidence,
+               "run was not cgroup-contained (silent fallback): #{inspect(evidence)}"
 
         refute alive?(escapee),
                "daemonized escapee survived: cgroup.kill did not reap it (pid #{escapee})"
+
+        :atomics.put(armed, 1, 0)
       else
         if System.get_env("FORCOLA_REQUIRE_CGROUP") == "1" do
           flunk("FORCOLA_REQUIRE_CGROUP=1 but no delegated cgroup v2 subtree is available")
@@ -257,8 +286,7 @@ defmodule Forcola.CgroupTest do
   end
 
   # Polls until the process has written its full pid line.
-  defp await_pid_file(path, what) do
-    deadline = System.monotonic_time(:millisecond) + 5_000
+  defp await_pid_file(path, what, deadline) do
     do_await_pid_file(path, what, deadline)
   end
 
